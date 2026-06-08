@@ -5,6 +5,7 @@ KMOD=	kms
 
 SRCS=	drm_connector.c \
 	drm_crtc.c \
+	drm_dp_helper.c \
 	drm_drv.c \
 	drm_edid.c \
 	drm_encoder.c \
@@ -23,6 +24,10 @@ CFLAGS+=	-I${SRCTOP}/sys/dev/kms/core
 
 EXPORT_SYMS=	M_KMS \
 		drm_display_mode_to_modeinfo \
+		drm_dp_aux_init \
+		drm_dp_aux_transfer \
+		drm_dp_dpcd_read \
+		drm_dp_dpcd_write \
 		drm_edid_add_modes \
 		drm_edid_checksum \
 		drm_edid_parse \
