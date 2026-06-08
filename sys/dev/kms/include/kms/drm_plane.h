@@ -34,11 +34,20 @@ struct drm_plane {
 	uint32_t			 possible_crtcs;
 	struct drm_crtc			*crtc;	/* current binding */
 	struct drm_framebuffer		*fb;
+	/*
+	 * Format whitelist exposed via GETPLANE.  Pointer is to
+	 * driver-owned storage that must outlive the plane.  Phase 4 just
+	 * forwards what the driver passed in; Phase 8 (atomic modeset)
+	 * will validate framebuffers against this list on commit.
+	 */
+	const uint32_t			*format_types;
+	uint32_t			 format_count;
 };
 
 int	kms_plane_init(struct drm_device *dev, struct drm_plane *plane,
 	    const struct drm_plane_funcs *funcs, enum drm_plane_type type,
-	    uint32_t possible_crtcs);
+	    uint32_t possible_crtcs, const uint32_t *format_types,
+	    uint32_t format_count);
 void	kms_plane_cleanup(struct drm_plane *plane);
 
 #endif /* _KMS_DRM_PLANE_H_ */

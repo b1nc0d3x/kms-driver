@@ -21,8 +21,19 @@ struct drm_mode_card_res;
 struct drm_mode_crtc;
 struct drm_mode_get_encoder;
 struct drm_mode_get_connector;
+struct drm_mode_get_plane;
+struct drm_mode_get_plane_res;
 
 MALLOC_DECLARE(M_KMS);
+
+/*
+ * Cap applied to user-supplied count_* fields in GETRESOURCES /
+ * GETPLANERESOURCES before we malloc.  Bigger than any realistic KMS
+ * inventory; small enough that a hostile count_ field can't drive a
+ * multi-megabyte alloc.  See feedback_kms_security_rules.md rule
+ * 4 (overflow-checked size validation).
+ */
+#define	DRM_MODE_GETRES_MAX	4096
 
 extern struct cdevsw	kms_cdevsw;
 
@@ -37,5 +48,9 @@ int	kms_ioctl_mode_getencoder(struct drm_file *file,
 	    struct drm_mode_get_encoder *r);
 int	kms_ioctl_mode_getconnector(struct drm_file *file,
 	    struct drm_mode_get_connector *r);
+int	kms_ioctl_mode_getplane_resources(struct drm_file *file,
+	    struct drm_mode_get_plane_res *r);
+int	kms_ioctl_mode_getplane(struct drm_file *file,
+	    struct drm_mode_get_plane *r);
 
 #endif /* _KMS_INTERNAL_H_ */

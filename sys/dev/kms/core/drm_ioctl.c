@@ -134,6 +134,12 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 	case DRM_IOCTL_MODE_GETCONNECTOR:
 		return (kms_ioctl_mode_getconnector(file,
 		    (struct drm_mode_get_connector *)data));
+	case DRM_IOCTL_MODE_GETPLANERESOURCES:
+		return (kms_ioctl_mode_getplane_resources(file,
+		    (struct drm_mode_get_plane_res *)data));
+	case DRM_IOCTL_MODE_GETPLANE:
+		return (kms_ioctl_mode_getplane(file,
+		    (struct drm_mode_get_plane *)data));
 	}
 	return (ENOTTY);
 }

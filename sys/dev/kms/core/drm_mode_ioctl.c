@@ -24,6 +24,7 @@
 #include <kms/drm_framebuffer.h>
 #include <kms/drm_mode_config.h>
 #include <kms/drm_mode_object.h>
+#include <kms/drm_plane.h>
 
 #include "kms_internal.h"
 
@@ -155,5 +156,116 @@ kms_ioctl_mode_getconnector(struct drm_file *file,
 
 out:
 	free(enc_ids, M_KMS);
+	return (error);
+}
+
+int
+kms_ioctl_mode_getplane_resources(struct drm_file *file,
+    struct drm_mode_get_plane_res *r)
+{
+	struct drm_mode_config *mc = &file->dev->mode_config;
+	struct drm_mode_object *obj;
+	uint32_t *ids = NULL;
+	uint32_t total, written;
+	uint32_t user_count;
+	int error = 0;
+
+	/*
+	 * Snapshot under shared lock, copyout afterward (rule 1:
+	 * sleepable copyout never runs while holding the config lock).
+	 */
+	user_count = r->count_planes;
+	written = 0;
+
+	sx_slock(&mc->mutex);
+	total = mc->num_plane;
+	if (user_count > 0) {
+		uint32_t cap;
+
+		cap = user_count;
+		if (cap > DRM_MODE_GETRES_MAX)
+			cap = DRM_MODE_GETRES_MAX;
+		ids = malloc((size_t)cap * sizeof(uint32_t), M_KMS,
+		    M_WAITOK | M_ZERO);
+		TAILQ_FOREACH(obj, &mc->planes, link) {
+			if (written >= cap)
+				break;
+			ids[written++] = obj->id;
+		}
+	}
+	sx_sunlock(&mc->mutex);
+
+	if (written > 0 && r->plane_id_ptr != 0) {
+		error = copyout(ids, (void *)(uintptr_t)r->plane_id_ptr,
+		    written * sizeof(uint32_t));
+	}
+	r->count_planes = total;
+	free(ids, M_KMS);
+	return (error);
+}
+
+#define	DRM_MODE_PLANE_FORMATS_MAX	4096
+
+int
+kms_ioctl_mode_getplane(struct drm_file *file, struct drm_mode_get_plane *r)
+{
+	struct drm_mode_object *obj;
+	struct drm_plane *plane;
+	uint32_t out_crtc_id, out_fb_id, out_possible_crtcs;
+	uint32_t out_format_count;
+	uint32_t *formats = NULL;
+	uint32_t to_copy = 0;
+	int error = 0;
+
+	obj = kms_mode_object_find(file->dev, r->plane_id,
+	    DRM_MODE_OBJECT_PLANE);
+	if (obj == NULL)
+		return (ENOENT);
+	plane = __containerof(obj, struct drm_plane, base);
+
+	out_crtc_id = (plane->crtc != NULL) ? plane->crtc->base.id : 0;
+	out_fb_id = (plane->fb != NULL) ? plane->fb->base.id : 0;
+	out_possible_crtcs = plane->possible_crtcs;
+	out_format_count = plane->format_count;
+	if (out_format_count > DRM_MODE_PLANE_FORMATS_MAX)
+		out_format_count = DRM_MODE_PLANE_FORMATS_MAX;
+
+	/*
+	 * Snapshot the format list to a kernel buffer while holding the
+	 * object ref, then drop the ref before copyout to keep the
+	 * sleepable copy outside any kept lock (rule 1).
+	 */
+	if (out_format_count > 0 && r->count_format_types > 0 &&
+	    r->format_type_ptr != 0) {
+		uint32_t cap;
+		uint32_t i;
+
+		cap = r->count_format_types;
+		if (cap > out_format_count)
+			cap = out_format_count;
+		formats = malloc((size_t)cap * sizeof(uint32_t), M_KMS,
+		    M_WAITOK);
+		for (i = 0; i < cap; i++)
+			formats[i] = plane->format_types[i];
+		to_copy = cap;
+	}
+
+	kms_mode_object_put(obj);
+
+	if (to_copy > 0) {
+		error = copyout(formats,
+		    (void *)(uintptr_t)r->format_type_ptr,
+		    to_copy * sizeof(uint32_t));
+		if (error != 0)
+			goto out;
+	}
+	r->crtc_id = out_crtc_id;
+	r->fb_id = out_fb_id;
+	r->possible_crtcs = out_possible_crtcs;
+	r->gamma_size = 0;
+	r->count_format_types = out_format_count;
+
+out:
+	free(formats, M_KMS);
 	return (error);
 }

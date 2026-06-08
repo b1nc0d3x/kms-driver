@@ -246,11 +246,75 @@ probe_mode_getconnector(int fd, uint32_t id)
 	return (0);
 }
 
+static int
+probe_mode_getplane_resources(int fd, uint32_t *plane_id)
+{
+	struct drm_mode_get_plane_res r;
+	uint32_t ids[16];
+
+	memset(&r, 0, sizeof(r));
+	if (ioctl(fd, DRM_IOCTL_MODE_GETPLANERESOURCES, &r) != 0) {
+		warn("MODE_GETPLANERESOURCES count probe");
+		return (1);
+	}
+	printf("GETPLANES cnt: count_planes=%u\n", r.count_planes);
+
+	memset(&r, 0, sizeof(r));
+	r.plane_id_ptr = (uintptr_t)ids;
+	r.count_planes = 16;
+	if (ioctl(fd, DRM_IOCTL_MODE_GETPLANERESOURCES, &r) != 0) {
+		warn("MODE_GETPLANERESOURCES fill");
+		return (1);
+	}
+	printf("GETPLANES fil: count_planes=%u\n", r.count_planes);
+	if (r.count_planes > 0)
+		printf("  plane[0]=%u\n", ids[0]);
+	*plane_id = (r.count_planes > 0) ? ids[0] : 0;
+	return (0);
+}
+
+static int
+probe_mode_getplane(int fd, uint32_t id)
+{
+	struct drm_mode_get_plane p;
+	uint32_t formats[16];
+
+	if (id == 0)
+		return (0);
+
+	memset(&p, 0, sizeof(p));
+	p.plane_id = id;
+	if (ioctl(fd, DRM_IOCTL_MODE_GETPLANE, &p) != 0) {
+		warn("MODE_GETPLANE count probe id=%u", id);
+		return (1);
+	}
+	printf("GETPLANE cnt : id=%u crtc=%u fb=%u poss_crtcs=0x%x "
+	    "count_format_types=%u\n", p.plane_id, p.crtc_id, p.fb_id,
+	    p.possible_crtcs, p.count_format_types);
+
+	memset(&p, 0, sizeof(p));
+	p.plane_id = id;
+	p.format_type_ptr = (uintptr_t)formats;
+	p.count_format_types = 16;
+	if (ioctl(fd, DRM_IOCTL_MODE_GETPLANE, &p) != 0) {
+		warn("MODE_GETPLANE fill id=%u", id);
+		return (1);
+	}
+	if (p.count_format_types > 0) {
+		uint32_t f = formats[0];
+		printf("  fmt[0]=0x%08x \"%c%c%c%c\" (of %u)\n", f,
+		    (char)(f & 0xff), (char)((f >> 8) & 0xff),
+		    (char)((f >> 16) & 0xff), (char)((f >> 24) & 0xff),
+		    p.count_format_types);
+	}
+	return (0);
+}
+
 int
 main(int argc, char **argv)
 {
 	const char *path;
-	uint32_t crtc_id, enc_id, conn_id;
+	uint32_t crtc_id, enc_id, conn_id, plane_id;
 	int fd, rc;
 
 	path = (argc > 1) ? argv[1] : default_dev;
@@ -268,6 +332,8 @@ main(int argc, char **argv)
 	rc |= probe_mode_getcrtc(fd, crtc_id);
 	rc |= probe_mode_getencoder(fd, enc_id);
 	rc |= probe_mode_getconnector(fd, conn_id);
+	rc |= probe_mode_getplane_resources(fd, &plane_id);
+	rc |= probe_mode_getplane(fd, plane_id);
 
 	close(fd);
 	return (rc);

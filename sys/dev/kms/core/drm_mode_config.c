@@ -17,15 +17,6 @@
 
 #include "kms_internal.h"
 
-/*
- * Upper bound on per-array entries we'll snapshot under the lock and
- * copy out.  Bigger than any realistic CRTC/connector count by orders
- * of magnitude; small enough that a hostile user-supplied count_*
- * field can't drive a multi-megabyte kernel alloc (see
- * feedback_kms_security_rules.md rule 4).
- */
-#define	DRM_MODE_GETRES_MAX	4096
-
 void
 drm_mode_config_init(struct drm_mode_config *mc)
 {
@@ -34,12 +25,14 @@ drm_mode_config_init(struct drm_mode_config *mc)
 	TAILQ_INIT(&mc->connectors);
 	TAILQ_INIT(&mc->encoders);
 	TAILQ_INIT(&mc->fbs);
+	TAILQ_INIT(&mc->planes);
 	TAILQ_INIT(&mc->objects);
 	mc->next_object_id = 0;
 	mc->num_crtc = 0;
 	mc->num_connector = 0;
 	mc->num_encoder = 0;
 	mc->num_fb = 0;
+	mc->num_plane = 0;
 	/*
 	 * Defaults.  A real hardware driver overrides these in its
 	 * probe path before registering connectors.  Match Linux

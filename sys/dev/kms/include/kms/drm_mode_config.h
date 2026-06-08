@@ -37,6 +37,7 @@ struct drm_mode_config {
 	uint32_t			 num_connector;
 	uint32_t			 num_encoder;
 	uint32_t			 num_fb;
+	uint32_t			 num_plane;
 
 	/* Monotonic ID counter; 0 reserved as "invalid id". */
 	uint32_t			 next_object_id;
@@ -49,6 +50,7 @@ struct drm_mode_config {
 	struct drm_mode_object_list	 connectors;
 	struct drm_mode_object_list	 encoders;
 	struct drm_mode_object_list	 fbs;
+	struct drm_mode_object_list	 planes;
 	struct drm_mode_object_list	 objects;
 };
 

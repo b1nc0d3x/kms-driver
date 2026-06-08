@@ -32,6 +32,8 @@ drm_mode_object_list_for_type(struct drm_mode_config *mc, uint32_t type)
 		return (&mc->encoders);
 	case DRM_MODE_OBJECT_FB:
 		return (&mc->fbs);
+	case DRM_MODE_OBJECT_PLANE:
+		return (&mc->planes);
 	}
 	return (NULL);
 }
@@ -48,6 +50,8 @@ drm_mode_object_count_for_type(struct drm_mode_config *mc, uint32_t type)
 		return (&mc->num_encoder);
 	case DRM_MODE_OBJECT_FB:
 		return (&mc->num_fb);
+	case DRM_MODE_OBJECT_PLANE:
+		return (&mc->num_plane);
 	}
 	return (NULL);
 }
