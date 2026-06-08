@@ -51,6 +51,15 @@ int	kms_mode_object_register(struct drm_device *dev,
 	    struct drm_mode_object *obj, uint32_t type);
 
 /*
+ * Same as kms_mode_object_register but caller already holds
+ * dev->mode_config.mutex exclusive.  Used by paths that need to do
+ * additional per-type bookkeeping (e.g. connector_type_id allocation)
+ * atomically with the register itself.
+ */
+int	kms_mode_object_register_locked(struct drm_device *dev,
+	    struct drm_mode_object *obj, uint32_t type);
+
+/*
  * Remove from both lists.  Caller must guarantee no concurrent
  * kms_mode_object_find for the same id from this point on; outstanding
  * references prevent the storage being reclaimed by the caller.

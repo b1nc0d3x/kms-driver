@@ -24,6 +24,7 @@
 #include <kms/drm_drv.h>
 #include <kms/drm_encoder.h>
 #include <kms/drm_mode_config.h>
+#include <kms/drm_modes.h>
 #include <kms/drm_plane.h>
 
 /*
@@ -35,10 +36,10 @@ MALLOC_DECLARE(M_KMS);
 
 static const struct drm_driver kms_stub_driver = {
 	.name		= "stub",
-	.desc		= "KMS phase-4 stub",
-	.date		= "20260607",
+	.desc		= "KMS phase-5 stub",
+	.date		= "20260608",
 	.major		= 0,
-	.minor		= 4,
+	.minor		= 5,
 	.patchlevel	= 0,
 	.driver_features = 0,
 };
@@ -80,6 +81,36 @@ stub_connector_destroy(struct drm_connector *connector __unused)
 {
 }
 
+/*
+ * Hand-rolled CEA-861 1920x1080@60 (148.5 MHz pixel clock).  Stub fills
+ * a single mode so userspace probes returning count_modes > 0 can be
+ * exercised end-to-end without an EDID parser.
+ */
+static int
+stub_connector_get_modes(struct drm_connector *connector)
+{
+	struct drm_display_mode *mode;
+
+	if (connector->mode_count > 0)
+		return (0);
+
+	mode = drm_mode_create();
+	mode->clock = 148500;
+	mode->hdisplay = 1920;
+	mode->hsync_start = 2008;
+	mode->hsync_end = 2052;
+	mode->htotal = 2200;
+	mode->vdisplay = 1080;
+	mode->vsync_start = 1084;
+	mode->vsync_end = 1089;
+	mode->vtotal = 1125;
+	mode->flags = KMS_MODE_FLAG_PHSYNC | KMS_MODE_FLAG_PVSYNC;
+	mode->type = KMS_MODE_TYPE_DRIVER |
+	    KMS_MODE_TYPE_PREFERRED;
+	kms_connector_add_mode(connector, mode);
+	return (1);
+}
+
 static void
 stub_plane_destroy(struct drm_plane *plane __unused)
 {
@@ -95,6 +126,7 @@ static const struct drm_encoder_funcs stub_encoder_funcs = {
 
 static const struct drm_connector_funcs stub_connector_funcs = {
 	.destroy = stub_connector_destroy,
+	.get_modes = stub_connector_get_modes,
 };
 
 static const struct drm_plane_funcs stub_plane_funcs = {

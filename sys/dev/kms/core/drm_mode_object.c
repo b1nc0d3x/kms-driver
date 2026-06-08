@@ -57,8 +57,8 @@ drm_mode_object_count_for_type(struct drm_mode_config *mc, uint32_t type)
 }
 
 int
-kms_mode_object_register(struct drm_device *dev, struct drm_mode_object *obj,
-    uint32_t type)
+kms_mode_object_register_locked(struct drm_device *dev,
+    struct drm_mode_object *obj, uint32_t type)
 {
 	struct drm_mode_config *mc;
 	struct drm_mode_object_list *list;
@@ -68,20 +68,19 @@ kms_mode_object_register(struct drm_device *dev, struct drm_mode_object *obj,
 		return (EINVAL);
 
 	mc = &dev->mode_config;
+	sx_assert(&mc->mutex, SA_XLOCKED);
+
 	obj->type = type;
 	refcount_init(&obj->refs, 1);
 
-	sx_xlock(&mc->mutex);
 	/*
 	 * Monotonic ID allocation.  0 is reserved as invalid; wrap is
 	 * impossible in any realistic session (4G register events would
 	 * exhaust the 32-bit space).  If we ever care, reuse via a
 	 * free-list goes here.
 	 */
-	if (mc->next_object_id == UINT32_MAX) {
-		sx_xunlock(&mc->mutex);
+	if (mc->next_object_id == UINT32_MAX)
 		return (ENOSPC);
-	}
 	obj->id = ++mc->next_object_id;
 
 	TAILQ_INSERT_TAIL(&mc->objects, obj, reg);
@@ -91,8 +90,21 @@ kms_mode_object_register(struct drm_device *dev, struct drm_mode_object *obj,
 		TAILQ_INSERT_TAIL(list, obj, link);
 		(*count)++;
 	}
-	sx_xunlock(&mc->mutex);
 	return (0);
+}
+
+int
+kms_mode_object_register(struct drm_device *dev,
+    struct drm_mode_object *obj, uint32_t type)
+{
+	int error;
+
+	if (dev == NULL)
+		return (EINVAL);
+	sx_xlock(&dev->mode_config.mutex);
+	error = kms_mode_object_register_locked(dev, obj, type);
+	sx_xunlock(&dev->mode_config.mutex);
+	return (error);
 }
 
 void

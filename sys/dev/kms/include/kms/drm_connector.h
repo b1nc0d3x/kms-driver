@@ -10,6 +10,7 @@
 #include <sys/types.h>
 
 #include <kms/drm_mode_object.h>
+#include <kms/drm_modes.h>
 
 struct drm_device;
 struct drm_connector;
@@ -30,6 +31,16 @@ enum drm_connector_status {
 
 struct drm_connector_funcs {
 	void	(*destroy)(struct drm_connector *connector);
+	/*
+	 * Called from GETCONNECTOR (and any future "rescan") path when
+	 * the framework wants the connector's mode list refreshed.  The
+	 * hook builds mode entries with drm_mode_create() and adds them
+	 * via kms_connector_add_mode().  Returns the number of modes
+	 * added (>= 0) or a negative errno.  If NULL, the connector keeps
+	 * whatever modes the driver populated at init time (the stub
+	 * case).
+	 */
+	int	(*get_modes)(struct drm_connector *connector);
 };
 
 struct drm_connector {
@@ -45,6 +56,15 @@ struct drm_connector {
 	uint8_t				 encoder_count;
 	uint32_t			 encoder_ids[DRM_CONNECTOR_MAX_ENCODER];
 	struct drm_encoder		*encoder;	/* current binding */
+
+	/*
+	 * Available display modes.  Populated by the driver's get_modes
+	 * hook (called from GETCONNECTOR) or by hand at init.  Storage is
+	 * malloc'd via drm_mode_create and owned by the connector — freed
+	 * in cleanup.  Protected by drm_device->mode_config.mutex.
+	 */
+	struct drm_display_mode_list	 modes;
+	uint32_t			 mode_count;
 };
 
 int	kms_connector_init(struct drm_device *dev,
@@ -59,5 +79,21 @@ void	kms_connector_cleanup(struct drm_connector *connector);
  */
 int	kms_connector_attach_encoder(struct drm_connector *connector,
 	    struct drm_encoder *encoder);
+
+/*
+ * Append a mode to the connector's mode list.  Connector takes
+ * ownership of the storage — the mode is freed during
+ * kms_connector_cleanup or kms_connector_modes_clear.
+ * If the mode has no name, drm_mode_set_name is called to generate one.
+ */
+void	kms_connector_add_mode(struct drm_connector *connector,
+	    struct drm_display_mode *mode);
+
+/*
+ * Free every mode currently on the connector's list.  Used by
+ * cleanup and by get_modes implementations that fully replace
+ * (rather than augment) the previous mode set on rescan.
+ */
+void	kms_connector_modes_clear(struct drm_connector *connector);
 
 #endif /* _KMS_DRM_CONNECTOR_H_ */

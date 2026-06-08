@@ -7,11 +7,14 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 
+#include <sys/sx.h>
+
 #include <kms/drm_connector.h>
 #include <kms/drm_device.h>
 #include <kms/drm_encoder.h>
 #include <kms/drm_mode_config.h>
 #include <kms/drm_mode_object.h>
+#include <kms/drm_modes.h>
 
 #include "kms_internal.h"
 
@@ -55,23 +58,22 @@ kms_connector_init(struct drm_device *dev, struct drm_connector *connector,
 	connector->subpixel_order = 0;
 	connector->encoder_count = 0;
 	connector->encoder = NULL;
+	TAILQ_INIT(&connector->modes);
+	connector->mode_count = 0;
 
 	/*
-	 * type_id read+register happens under mode_config.mutex
-	 * implicitly via kms_mode_object_register, which is the only
-	 * thing that adds to the connectors list.  Allocate first,
-	 * register second — register publishes the connector.
+	 * Hold mode_config.mutex across both the type_id scan AND the
+	 * register call so a second concurrent connector_init for the
+	 * same connector_type can't compute the same type_id.  The
+	 * _locked variant of register skips the inner lock acquisition.
 	 */
 	sx_xlock(&dev->mode_config.mutex);
 	connector->connector_type_id =
 	    drm_connector_next_type_id(dev, connector_type);
-	sx_xunlock(&dev->mode_config.mutex);
-
-	error = kms_mode_object_register(dev, &connector->base,
+	error = kms_mode_object_register_locked(dev, &connector->base,
 	    DRM_MODE_OBJECT_CONNECTOR);
-	if (error != 0)
-		return (error);
-	return (0);
+	sx_xunlock(&dev->mode_config.mutex);
+	return (error);
 }
 
 void
@@ -79,6 +81,7 @@ kms_connector_cleanup(struct drm_connector *connector)
 {
 	if (connector == NULL || connector->dev == NULL)
 		return;
+	kms_connector_modes_clear(connector);
 	kms_mode_object_unregister(connector->dev, &connector->base);
 	if (connector->funcs != NULL && connector->funcs->destroy != NULL)
 		connector->funcs->destroy(connector);
@@ -103,4 +106,33 @@ kms_connector_attach_encoder(struct drm_connector *connector,
 	connector->encoder_ids[connector->encoder_count++] =
 	    encoder->base.id;
 	return (0);
+}
+
+void
+kms_connector_add_mode(struct drm_connector *connector,
+    struct drm_display_mode *mode)
+{
+	if (connector == NULL || mode == NULL)
+		return;
+	drm_mode_set_name(mode);
+	sx_xlock(&connector->dev->mode_config.mutex);
+	TAILQ_INSERT_TAIL(&connector->modes, mode, link);
+	connector->mode_count++;
+	sx_xunlock(&connector->dev->mode_config.mutex);
+}
+
+void
+kms_connector_modes_clear(struct drm_connector *connector)
+{
+	struct drm_display_mode *m;
+
+	if (connector == NULL)
+		return;
+	sx_xlock(&connector->dev->mode_config.mutex);
+	while ((m = TAILQ_FIRST(&connector->modes)) != NULL) {
+		TAILQ_REMOVE(&connector->modes, m, link);
+		drm_mode_destroy(m);
+	}
+	connector->mode_count = 0;
+	sx_xunlock(&connector->dev->mode_config.mutex);
 }

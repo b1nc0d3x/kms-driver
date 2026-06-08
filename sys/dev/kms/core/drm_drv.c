@@ -11,6 +11,7 @@
 #include <sys/malloc.h>
 #include <sys/module.h>
 #include <sys/queue.h>
+#include <sys/refcount.h>
 #include <sys/sx.h>
 
 #include <kms/drm_device.h>
@@ -18,6 +19,8 @@
 #include <kms/drm_mode_config.h>
 
 #include "kms_internal.h"
+
+static void	kms_device_destroy(struct drm_device *dev);
 
 MALLOC_DEFINE(M_KMS, "kms", "DRM compatibility framework");
 
@@ -43,6 +46,7 @@ kms_dev_register(const struct drm_driver *driver, void *driver_priv,
 	dev->driver_priv = driver_priv;
 	TAILQ_INIT(&dev->files);
 	drm_mode_config_init(&dev->mode_config);
+	refcount_init(&dev->refs, 1);	/* initial: held by the registry */
 
 	make_dev_args_init(&args);
 	args.mda_flags = MAKEDEV_CHECKNAME;	/* EEXIST instead of panic */
@@ -63,9 +67,7 @@ kms_dev_register(const struct drm_driver *driver, void *driver_priv,
 	for (;;) {
 		if (kms_next_minor >= 256) {
 			sx_xunlock(&kms_registry_lock);
-			drm_mode_config_cleanup(&dev->mode_config);
-			sx_destroy(&dev->dev_lock);
-			free(dev, M_KMS);
+			kms_device_destroy(dev);
 			return (ENOSPC);
 		}
 		dev->minor = kms_next_minor++;
@@ -75,9 +77,7 @@ kms_dev_register(const struct drm_driver *driver, void *driver_priv,
 			break;
 		if (error != EEXIST) {
 			sx_xunlock(&kms_registry_lock);
-			drm_mode_config_cleanup(&dev->mode_config);
-			sx_destroy(&dev->dev_lock);
-			free(dev, M_KMS);
+			kms_device_destroy(dev);
 			return (error);
 		}
 	}
@@ -90,6 +90,36 @@ kms_dev_register(const struct drm_driver *driver, void *driver_priv,
 	return (0);
 }
 
+/*
+ * Tear down a drm_device's storage.  Called only when the refcount
+ * reaches zero — either from kms_dev_unregister (no outstanding
+ * opens) or from the last kms_file_dtor after a deferred
+ * unregister.  Cdev destruction happens earlier, in
+ * kms_dev_unregister, so no new opens can race here.
+ */
+static void
+kms_device_destroy(struct drm_device *dev)
+{
+	drm_mode_config_cleanup(&dev->mode_config);
+	sx_destroy(&dev->dev_lock);
+	free(dev, M_KMS);
+}
+
+void
+kms_device_release(struct drm_device *dev)
+{
+	if (dev == NULL)
+		return;
+	if (refcount_release(&dev->refs))
+		kms_device_destroy(dev);
+}
+
+void
+kms_device_acquire(struct drm_device *dev)
+{
+	refcount_acquire(&dev->refs);
+}
+
 void
 kms_dev_unregister(struct drm_device *dev)
 {
@@ -100,11 +130,17 @@ kms_dev_unregister(struct drm_device *dev)
 	TAILQ_REMOVE(&kms_devices, dev, link);
 	sx_xunlock(&kms_registry_lock);
 
-	if (dev->cdev != NULL)
+	/*
+	 * Drop the cdev first so no new open() can grab a fresh
+	 * reference, then release the initial registry ref.  If any
+	 * open fds remain, they each hold a ref and the final free
+	 * happens when the last one runs its file dtor.
+	 */
+	if (dev->cdev != NULL) {
 		destroy_dev(dev->cdev);
-	drm_mode_config_cleanup(&dev->mode_config);
-	sx_destroy(&dev->dev_lock);
-	free(dev, M_KMS);
+		dev->cdev = NULL;
+	}
+	kms_device_release(dev);
 }
 
 static int

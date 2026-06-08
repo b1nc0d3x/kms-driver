@@ -91,13 +91,36 @@ static int
 drm_ioctl_get_cap(struct drm_file *file __unused, struct drm_get_cap *c)
 {
 	/*
-	 * Phase 2: report nothing yet.  Capability bits get wired up as
-	 * dumb buffers (DRM_CAP_DUMB_BUFFER), atomic (CAP_ATOMIC), etc.
-	 * land in later phases.  Returning 0/value=0 is the documented
-	 * "unsupported capability" response, which libdrm handles.
+	 * Known capabilities — we recognize them, return 0 to mean
+	 * "supported but disabled / no value yet."  This is the
+	 * distinction libdrm draws between "driver says no" (return 0,
+	 * value 0) and "driver doesn't know this cap" (EINVAL).  Returning
+	 * 0 for unknown ids would mislead libdrm into thinking we
+	 * explicitly disabled features it never asked us about.
+	 *
+	 * Caps with non-zero values (cursor dimensions, prime flags, etc.)
+	 * get populated as the phases that implement them land.
 	 */
-	c->value = 0;
-	return (0);
+	switch (c->capability) {
+	case DRM_CAP_DUMB_BUFFER:
+	case DRM_CAP_VBLANK_HIGH_CRTC:
+	case DRM_CAP_DUMB_PREFERRED_DEPTH:
+	case DRM_CAP_DUMB_PREFER_SHADOW:
+	case DRM_CAP_PRIME:
+	case DRM_CAP_TIMESTAMP_MONOTONIC:
+	case DRM_CAP_ASYNC_PAGE_FLIP:
+	case DRM_CAP_CURSOR_WIDTH:
+	case DRM_CAP_CURSOR_HEIGHT:
+	case DRM_CAP_ADDFB2_MODIFIERS:
+	case DRM_CAP_PAGE_FLIP_TARGET:
+	case DRM_CAP_CRTC_IN_VBLANK_EVENT:
+	case DRM_CAP_SYNCOBJ:
+	case DRM_CAP_SYNCOBJ_TIMELINE:
+	case DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP:
+		c->value = 0;
+		return (0);
+	}
+	return (EINVAL);
 }
 
 int

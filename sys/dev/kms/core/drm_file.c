@@ -33,6 +33,12 @@ kms_file_dtor(void *data)
 	sx_xunlock(&dev->dev_lock);
 
 	free(file, M_KMS);
+	/*
+	 * Drop the device reference acquired in open.  If we're the last
+	 * holder (registry already released its initial ref via
+	 * dev_unregister), this frees the device storage.
+	 */
+	kms_device_release(dev);
 }
 
 static int
@@ -46,6 +52,14 @@ kms_open(struct cdev *cdev, int oflags __unused, int devtype __unused,
 	dev = cdev->si_drv1;
 	if (dev == NULL)
 		return (ENXIO);
+
+	/*
+	 * Pin the device for the lifetime of this open.  The matching
+	 * release runs in kms_file_dtor when the last reference to
+	 * the file descriptor goes away.  Acquired before any state is
+	 * published so the cleanup path is symmetric.
+	 */
+	kms_device_acquire(dev);
 
 	file = malloc(sizeof(*file), M_KMS, M_WAITOK | M_ZERO);
 	file->dev = dev;
@@ -66,6 +80,9 @@ kms_open(struct cdev *cdev, int oflags __unused, int devtype __unused,
 
 	error = devfs_set_cdevpriv(file, kms_file_dtor);
 	if (error != 0) {
+		/*
+		 * dtor drops the device ref; do not double-release.
+		 */
 		kms_file_dtor(file);
 		return (error);
 	}

@@ -24,6 +24,7 @@
 #include <kms/drm_framebuffer.h>
 #include <kms/drm_mode_config.h>
 #include <kms/drm_mode_object.h>
+#include <kms/drm_modes.h>
 #include <kms/drm_plane.h>
 
 #include "kms_internal.h"
@@ -83,19 +84,22 @@ int
 kms_ioctl_mode_getconnector(struct drm_file *file,
     struct drm_mode_get_connector *r)
 {
+	struct drm_mode_config *mc = &file->dev->mode_config;
 	struct drm_mode_object *obj;
 	struct drm_connector *connector;
+	struct drm_display_mode *m;
+	struct drm_mode_modeinfo *modeinfos = NULL;
 	uint32_t *enc_ids = NULL;
 	uint32_t enc_n = 0;
+	uint32_t mode_n = 0;
 	uint32_t i;
 	int error = 0;
 	/*
 	 * Snapshot the connector's local state under its dev_lock-free
 	 * find ref, then drop the ref before copyout so we don't hold
-	 * a refcount across a sleepable copy.  Phase 5 will add modes
-	 * + props here; Phase 4 only reports the encoder list.
+	 * a refcount across a sleepable copy (security rule 1).
 	 */
-	uint32_t out_encoder_type, out_encoder_id, out_connector_type;
+	uint32_t out_encoder_id, out_connector_type;
 	uint32_t out_connector_type_id, out_status, out_mm_w, out_mm_h;
 	uint32_t out_subpixel;
 
@@ -105,7 +109,18 @@ kms_ioctl_mode_getconnector(struct drm_file *file,
 		return (ENOENT);
 	connector = __containerof(obj, struct drm_connector, base);
 
-	out_encoder_type = 0;
+	/*
+	 * Lazy mode probe: first GETCONNECTOR triggers get_modes, which
+	 * populates the connector's mode list via add_mode.  Subsequent
+	 * calls reuse the cached list.  Phase 7+ will add an explicit
+	 * rescan path for hotplug.  Race window: two concurrent first
+	 * calls could both invoke get_modes; drivers are expected to
+	 * make get_modes idempotent (clear-then-add or check mode_count).
+	 */
+	if (connector->mode_count == 0 && connector->funcs != NULL &&
+	    connector->funcs->get_modes != NULL)
+		(void)connector->funcs->get_modes(connector);
+
 	out_encoder_id = (connector->encoder != NULL) ?
 	    connector->encoder->base.id : 0;
 	out_connector_type = connector->connector_type;
@@ -123,6 +138,29 @@ kms_ioctl_mode_getconnector(struct drm_file *file,
 			enc_ids[i] = connector->encoder_ids[i];
 	}
 
+	/*
+	 * Snapshot the mode list under the config lock.  Cap at
+	 * DRM_MODE_GETRES_MAX (rule 4) before sizing the alloc.  We
+	 * copy into kernel-owned modeinfo storage so the sleepable
+	 * copyout below runs outside the lock.
+	 */
+	sx_slock(&mc->mutex);
+	mode_n = connector->mode_count;
+	if (mode_n > DRM_MODE_GETRES_MAX)
+		mode_n = DRM_MODE_GETRES_MAX;
+	if (mode_n > 0) {
+		modeinfos = malloc((size_t)mode_n * sizeof(*modeinfos),
+		    M_KMS, M_WAITOK | M_ZERO);
+		i = 0;
+		TAILQ_FOREACH(m, &connector->modes, link) {
+			if (i >= mode_n)
+				break;
+			drm_display_mode_to_modeinfo(m, &modeinfos[i++]);
+		}
+		mode_n = i;
+	}
+	sx_sunlock(&mc->mutex);
+
 	kms_mode_object_put(obj);
 
 	if (r->count_encoders > 0 && r->encoders_ptr != 0 && enc_n > 0) {
@@ -135,14 +173,24 @@ kms_ioctl_mode_getconnector(struct drm_file *file,
 		if (error != 0)
 			goto out;
 	}
+	if (r->count_modes > 0 && r->modes_ptr != 0 && mode_n > 0) {
+		uint32_t to_copy;
+
+		to_copy = (r->count_modes < mode_n) ?
+		    r->count_modes : mode_n;
+		error = copyout(modeinfos, (void *)(uintptr_t)r->modes_ptr,
+		    to_copy * sizeof(struct drm_mode_modeinfo));
+		if (error != 0)
+			goto out;
+	}
 
 	/*
-	 * count_modes and count_props stay 0 until Phase 5 (EDID +
-	 * properties).  Report total encoders so userspace can size
-	 * the array correctly on retry.
+	 * Report totals so userspace can resize and retry; userspace
+	 * keys off these to allocate the right array sizes.  count_props
+	 * stays 0 until properties land (Phase 7+).
 	 */
 	r->count_encoders = enc_n;
-	r->count_modes = 0;
+	r->count_modes = mode_n;
 	r->count_props = 0;
 	r->encoder_id = out_encoder_id;
 	r->connector_type = out_connector_type;
@@ -152,10 +200,10 @@ kms_ioctl_mode_getconnector(struct drm_file *file,
 	r->mm_height = out_mm_h;
 	r->subpixel = out_subpixel;
 	r->pad = 0;
-	(void)out_encoder_type;
 
 out:
 	free(enc_ids, M_KMS);
+	free(modeinfos, M_KMS);
 	return (error);
 }
 

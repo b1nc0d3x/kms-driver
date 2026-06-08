@@ -217,6 +217,7 @@ probe_mode_getconnector(int fd, uint32_t id)
 {
 	struct drm_mode_get_connector c;
 	uint32_t enc_ids[8];
+	struct drm_mode_modeinfo modes[16];
 
 	if (id == 0)
 		return (0);
@@ -236,6 +237,8 @@ probe_mode_getconnector(int fd, uint32_t id)
 	c.connector_id = id;
 	c.encoders_ptr = (uintptr_t)enc_ids;
 	c.count_encoders = 8;
+	c.modes_ptr = (uintptr_t)modes;
+	c.count_modes = 16;
 	if (ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &c) != 0) {
 		warn("MODE_GETCONNECTOR fill id=%u", id);
 		return (1);
@@ -243,6 +246,12 @@ probe_mode_getconnector(int fd, uint32_t id)
 	if (c.count_encoders > 0)
 		printf("  enc_ids[0]=%u (of %u)\n", enc_ids[0],
 		    c.count_encoders);
+	if (c.count_modes > 0) {
+		struct drm_mode_modeinfo *m = &modes[0];
+		printf("  mode[0]: %s %ux%u@%u clock=%u flags=0x%x type=0x%x\n",
+		    m->name, m->hdisplay, m->vdisplay, m->vrefresh,
+		    m->clock, m->flags, m->type);
+	}
 	return (0);
 }
 

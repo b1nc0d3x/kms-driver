@@ -16,6 +16,7 @@
 struct cdev;
 struct cdevsw;
 struct thread;
+struct drm_device;
 struct drm_file;
 struct drm_mode_card_res;
 struct drm_mode_crtc;
@@ -39,6 +40,9 @@ extern struct cdevsw	kms_cdevsw;
 
 int	kms_ioctl(struct cdev *dev, u_long cmd, caddr_t data,
 	    int fflag, struct thread *td);
+
+void	kms_device_acquire(struct drm_device *dev);
+void	kms_device_release(struct drm_device *dev);
 
 int	kms_ioctl_mode_getresources(struct drm_file *file,
 	    struct drm_mode_card_res *r);

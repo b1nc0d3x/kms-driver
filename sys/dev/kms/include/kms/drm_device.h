@@ -29,15 +29,24 @@ struct drm_file;
 /*
  * One per registered DRM card.  Created by the driver via
  * kms_dev_register(), torn down by kms_dev_unregister().
- * Lifetime: from successful register() until last open file is closed
- * after unregister().  Closes on outstanding files block unregister.
+ *
+ * Lifetime: the device storage is refcounted independently from the
+ * cdev.  kms_dev_register holds the initial reference and creates
+ * the cdev.  kms_dev_unregister destroys the cdev (so no new
+ * opens succeed), removes the device from the registry, and drops the
+ * initial reference.  Each open file holds an additional reference,
+ * dropped in the file dtor.  The storage is freed (and the embedded
+ * mode_config / dev_lock destroyed) when the last reference falls —
+ * which may be either the unregister call itself (no opens outstanding)
+ * or the last file close after unregister.
  */
 struct drm_device {
 	struct sx			 dev_lock;
 	const struct drm_driver		*driver;
 	struct cdev			*cdev;
 	int				 minor;
-	int				 open_count;
+	u_int				 open_count;	/* live opens */
+	volatile u_int			 refs;		/* refcount(9) */
 	TAILQ_HEAD(, drm_file)		 files;
 	TAILQ_ENTRY(drm_device)		 link;
 	void				*driver_priv;
