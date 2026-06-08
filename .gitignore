@@ -1,0 +1,19 @@
+*.o
+*.ko
+*.ko.full
+*.ko.debug
+*.kld
+*.pieo
+.depend.*
+machine
+x86
+i386
+opt_global.h
+export_syms
+drm_probe
+drm_probe.full
+drm_probe.debug
+
+# obj subtree if someone runs make in-tree without MAKEOBJDIRPREFIX
+obj/
+.depend
