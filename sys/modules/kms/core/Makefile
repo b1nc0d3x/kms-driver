@@ -6,6 +6,7 @@ KMOD=	kms
 SRCS=	drm_connector.c \
 	drm_crtc.c \
 	drm_drv.c \
+	drm_edid.c \
 	drm_encoder.c \
 	drm_file.c \
 	drm_framebuffer.c \
@@ -22,6 +23,9 @@ CFLAGS+=	-I${SRCTOP}/sys/dev/kms/core
 
 EXPORT_SYMS=	M_KMS \
 		drm_display_mode_to_modeinfo \
+		drm_edid_add_modes \
+		drm_edid_checksum \
+		drm_edid_parse \
 		drm_mode_create \
 		drm_mode_destroy \
 		drm_mode_set_name \
@@ -42,6 +46,7 @@ EXPORT_SYMS=	M_KMS \
 		kms_mode_object_find \
 		kms_mode_object_put \
 		kms_mode_object_register \
+		kms_mode_object_register_locked \
 		kms_mode_object_unregister \
 		kms_plane_cleanup \
 		kms_plane_init
