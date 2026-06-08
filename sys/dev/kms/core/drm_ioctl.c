@@ -163,6 +163,15 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 	case DRM_IOCTL_MODE_GETPLANE:
 		return (kms_ioctl_mode_getplane(file,
 		    (struct drm_mode_get_plane *)data));
+	case DRM_IOCTL_MODE_CREATE_DUMB:
+		return (kms_ioctl_mode_create_dumb(file,
+		    (struct drm_mode_create_dumb *)data));
+	case DRM_IOCTL_MODE_MAP_DUMB:
+		return (kms_ioctl_mode_map_dumb(file,
+		    (struct drm_mode_map_dumb *)data));
+	case DRM_IOCTL_MODE_DESTROY_DUMB:
+		return (kms_ioctl_mode_destroy_dumb(file,
+		    (struct drm_mode_destroy_dumb *)data));
 	}
 	return (ENOTTY);
 }

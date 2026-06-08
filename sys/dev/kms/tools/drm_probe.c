@@ -13,6 +13,8 @@
 #include <sys/ioctl.h>
 #include <sys/types.h>
 
+#include <sys/mman.h>
+
 #include <err.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -319,6 +321,66 @@ probe_mode_getplane(int fd, uint32_t id)
 	return (0);
 }
 
+static int
+probe_dumb_buffer(int fd)
+{
+	struct drm_mode_create_dumb c;
+	struct drm_mode_map_dumb m;
+	struct drm_mode_destroy_dumb d;
+	uint32_t *map;
+	const uint32_t pattern = 0xc0ffee42;
+	int error = 0;
+
+	memset(&c, 0, sizeof(c));
+	c.width = 128;
+	c.height = 64;
+	c.bpp = 32;
+	if (ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &c) != 0) {
+		warn("CREATE_DUMB");
+		return (1);
+	}
+	printf("CREATE_DUMB  : handle=%u pitch=%u size=%llu\n",
+	    c.handle, c.pitch, (unsigned long long)c.size);
+
+	memset(&m, 0, sizeof(m));
+	m.handle = c.handle;
+	if (ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &m) != 0) {
+		warn("MAP_DUMB");
+		error = 1;
+		goto out;
+	}
+	printf("MAP_DUMB     : offset=0x%llx\n",
+	    (unsigned long long)m.offset);
+
+	map = mmap(NULL, c.size, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
+	    m.offset);
+	if (map == MAP_FAILED) {
+		warn("mmap");
+		error = 1;
+		goto out;
+	}
+	map[0] = pattern;
+	map[(c.size / sizeof(*map)) - 1] = ~pattern;
+	if (map[0] != pattern || map[(c.size / sizeof(*map)) - 1] != ~pattern) {
+		fprintf(stderr, "mmap readback mismatch\n");
+		error = 1;
+	}
+	printf("MMAP         : %u bytes; first=0x%x last=0x%x (write/read OK)\n",
+	    (unsigned)c.size, map[0], map[(c.size / sizeof(*map)) - 1]);
+	munmap(map, c.size);
+
+out:
+	memset(&d, 0, sizeof(d));
+	d.handle = c.handle;
+	if (ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &d) != 0) {
+		warn("DESTROY_DUMB");
+		error = 1;
+	} else {
+		printf("DESTROY_DUMB : handle=%u\n", c.handle);
+	}
+	return (error);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -343,6 +405,7 @@ main(int argc, char **argv)
 	rc |= probe_mode_getconnector(fd, conn_id);
 	rc |= probe_mode_getplane_resources(fd, &plane_id);
 	rc |= probe_mode_getplane(fd, plane_id);
+	rc |= probe_dumb_buffer(fd);
 
 	close(fd);
 	return (rc);

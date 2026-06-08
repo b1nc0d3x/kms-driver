@@ -1,5 +1,6 @@
 .PATH: ${SRCTOP}/sys/dev/kms/core
 .PATH: ${SRCTOP}/sys/dev/kms/display
+.PATH: ${SRCTOP}/sys/dev/kms/gem
 
 KMOD=	kms
 
@@ -11,6 +12,8 @@ SRCS=	drm_connector.c \
 	drm_encoder.c \
 	drm_file.c \
 	drm_framebuffer.c \
+	drm_gem.c \
+	drm_gem_dumb.c \
 	drm_ioctl.c \
 	drm_mode_config.c \
 	drm_mode_ioctl.c \
@@ -24,6 +27,14 @@ CFLAGS+=	-I${SRCTOP}/sys/dev/kms/core
 
 EXPORT_SYMS=	M_KMS \
 		drm_display_mode_to_modeinfo \
+		kms_gem_handle_create \
+		kms_gem_handle_delete \
+		kms_gem_handle_lookup \
+		kms_gem_object_create \
+		kms_gem_object_get \
+		kms_gem_object_lookup_offset \
+		kms_gem_object_put \
+		kms_gem_release_all \
 		drm_dp_aux_init \
 		drm_dp_aux_transfer \
 		drm_dp_dpcd_read \

@@ -1,0 +1,352 @@
+/*-
+ * SPDX-License-Identifier: BSD-2-Clause
+ *
+ * Copyright (c) 2026 Kyle Crenshaw <b1nc0d3x@gmail.com>
+ *
+ * GEM object lifecycle + per-file handle table + cdev_pager backing.
+ *
+ * Pages are allocated contiguous + wired via vm_page_alloc_noobj_contig
+ * and pre-inserted into a cdev_pager (OBJT_MGTDEVICE).  Userspace mmap
+ * on the cdev re-acquires the same pager via cdev_pager_allocate
+ * keyed on the GEM object pointer, so the user mapping shares pages
+ * with whatever kernel KVA mapping the driver established.  Same
+ * pattern as tegra, virtio_drm, and vmsvga_drm Phase C.2.
+ */
+
+#include <sys/param.h>
+#include <sys/systm.h>
+#include <sys/malloc.h>
+#include <sys/queue.h>
+#include <sys/refcount.h>
+#include <sys/rwlock.h>
+#include <sys/sx.h>
+
+#include <vm/vm.h>
+#include <vm/vm_extern.h>
+#include <vm/vm_object.h>
+#include <vm/vm_page.h>
+#include <vm/vm_pageout.h>
+#include <vm/vm_param.h>
+#include <vm/vm_pager.h>
+#include <vm/vm_radix.h>
+
+#include <kms/drm_device.h>
+#include <kms/drm_file.h>
+#include <kms/drm_gem.h>
+
+#include "kms_internal.h"
+
+/*
+ * Per-file handle entry.  GEM objects live on the device-side list
+ * (drm_device->gem_objects); the handle table just maps a 32-bit
+ * user-visible id to the same object so userspace ioctls can look it
+ * up by handle without seeing the kernel pointer.
+ */
+struct drm_gem_handle {
+	uint32_t			 id;
+	struct drm_gem_object		*obj;
+	TAILQ_ENTRY(drm_gem_handle)	 link;
+};
+
+/* ----- pager callbacks ----- */
+
+/*
+ * Pages are inserted at create time, so the fault path should never
+ * fire — if it does, something is asking for an offset we never
+ * populated and the right answer is to fail rather than allocate
+ * silently.
+ */
+static int
+drm_gem_pager_fault(vm_object_t vm_obj __unused, vm_ooffset_t offset __unused,
+    int prot __unused, vm_page_t *mres __unused)
+{
+	return (VM_PAGER_FAIL);
+}
+
+static int
+drm_gem_pager_ctor(void *handle __unused, vm_ooffset_t size __unused,
+    vm_prot_t prot __unused, vm_ooffset_t foff __unused,
+    struct ucred *cred __unused, u_short *color)
+{
+	if (color != NULL)
+		*color = 0;
+	return (0);
+}
+
+/*
+ * Pager destructor: invoked by the VM subsystem when the pager's
+ * last reference drops.  This is the canonical free path for the
+ * GEM object's pages and storage — it fires either from
+ * drm_gem_object_release (no outstanding mmaps) or from the last
+ * munmap (mappings outlived the handle table entry).  Either way,
+ * by the time we get here nothing references this BO.
+ */
+static void
+drm_gem_pager_dtor(void *handle)
+{
+	struct drm_gem_object *obj = handle;
+	size_t i;
+
+	for (i = 0; i < obj->npages; i++) {
+		if (obj->pages[i] == NULL)
+			continue;
+		obj->pages[i]->flags &= ~PG_FICTITIOUS;
+		obj->pages[i]->oflags |= VPO_UNMANAGED;
+		vm_page_unwire_noq(obj->pages[i]);
+		vm_page_free(obj->pages[i]);
+	}
+	free(obj->pages, M_KMS);
+	free(obj, M_KMS);
+}
+
+static struct cdev_pager_ops drm_gem_pager_ops = {
+	.cdev_pg_fault	= drm_gem_pager_fault,
+	.cdev_pg_ctor	= drm_gem_pager_ctor,
+	.cdev_pg_dtor	= drm_gem_pager_dtor,
+};
+
+/* ----- object lifecycle ----- */
+
+struct drm_gem_object *
+kms_gem_object_create(struct drm_device *dev, size_t size)
+{
+	struct drm_gem_object *obj;
+	struct pctrie_iter pages_iter;
+	vm_page_t m;
+	size_t npages;
+	size_t i;
+	int tries;
+
+	if (dev == NULL)
+		return (NULL);
+	size = round_page(size);
+	if (size == 0)
+		return (NULL);
+	npages = atop(size);
+
+	obj = malloc(sizeof(*obj), M_KMS, M_WAITOK | M_ZERO);
+	obj->dev = dev;
+	obj->size = size;
+	obj->npages = npages;
+	obj->pages = malloc(sizeof(*obj->pages) * npages, M_KMS,
+	    M_WAITOK | M_ZERO);
+	refcount_init(&obj->refs, 1);
+
+	tries = 0;
+retry_alloc:
+	/*
+	 * Contiguous wired allocation — DRM scanout needs the buffer
+	 * physically linear, and Phase 6's stub-validation path doesn't
+	 * need IOMMU scatter-gather.  Zeroed so userspace doesn't see
+	 * old kernel data.
+	 */
+	m = vm_page_alloc_noobj_contig(VM_ALLOC_WIRED | VM_ALLOC_ZERO,
+	    npages, 0, ~0UL, PAGE_SIZE, 0, VM_MEMATTR_DEFAULT);
+	if (m == NULL) {
+		if (tries++ < 3) {
+			vm_page_reclaim_contig(0, npages, 0, ~0UL,
+			    PAGE_SIZE, 0);
+			goto retry_alloc;
+		}
+		free(obj->pages, M_KMS);
+		free(obj, M_KMS);
+		return (NULL);
+	}
+	for (i = 0; i < npages; i++, m++) {
+		m->valid = VM_PAGE_BITS_ALL;
+		obj->pages[i] = m;
+	}
+
+	/*
+	 * Pre-insert pages into the cdev_pager keyed on the GEM object
+	 * pointer.  cdev_pager_allocate is idempotent on (handle, ops),
+	 * so the userspace mmap path that calls it again with the same
+	 * key gets back this same pager.
+	 */
+	obj->pager = cdev_pager_allocate(obj, OBJT_MGTDEVICE,
+	    &drm_gem_pager_ops, size, 0, 0, NULL);
+	if (obj->pager == NULL) {
+		for (i = 0; i < npages; i++) {
+			vm_page_unwire_noq(obj->pages[i]);
+			vm_page_free(obj->pages[i]);
+		}
+		free(obj->pages, M_KMS);
+		free(obj, M_KMS);
+		return (NULL);
+	}
+
+	vm_page_iter_init(&pages_iter, obj->pager);
+	VM_OBJECT_WLOCK(obj->pager);
+	for (i = 0; i < npages; i++) {
+		obj->pages[i]->oflags &= ~VPO_UNMANAGED;
+		obj->pages[i]->flags |= PG_FICTITIOUS;
+		if (vm_page_iter_insert(obj->pages[i], obj->pager, i,
+		    &pages_iter) != 0) {
+			VM_OBJECT_WUNLOCK(obj->pager);
+			vm_object_deallocate(obj->pager);
+			for (; i > 0; i--) {
+				vm_page_unwire_noq(obj->pages[i - 1]);
+				vm_page_free(obj->pages[i - 1]);
+			}
+			free(obj->pages, M_KMS);
+			free(obj, M_KMS);
+			return (NULL);
+		}
+	}
+	VM_OBJECT_WUNLOCK(obj->pager);
+
+	sx_xlock(&dev->gem_lock);
+	obj->mmap_offset = dev->mmap_offset_counter;
+	dev->mmap_offset_counter += size;
+	TAILQ_INSERT_TAIL(&dev->gem_objects, obj, device_link);
+	sx_xunlock(&dev->gem_lock);
+
+	return (obj);
+}
+
+void
+kms_gem_object_get(struct drm_gem_object *obj)
+{
+	refcount_acquire(&obj->refs);
+}
+
+/*
+ * obj->refs hit zero.  Remove from the device list (so no further
+ * lookups can race the teardown), then drop the pager's creation
+ * reference.  If no mmaps are outstanding, that's the last pager
+ * ref and drm_gem_pager_dtor fires synchronously below, freeing
+ * pages + the obj storage.  If userspace still has the BO mmap'd,
+ * the dtor fires on the last munmap instead — userspace can read
+ * the buffer past destroy_dumb, which is the documented Linux
+ * behavior.  After vm_object_deallocate we must not touch obj.
+ */
+static void
+drm_gem_object_release(struct drm_gem_object *obj)
+{
+	sx_xlock(&obj->dev->gem_lock);
+	TAILQ_REMOVE(&obj->dev->gem_objects, obj, device_link);
+	sx_xunlock(&obj->dev->gem_lock);
+
+	vm_object_deallocate(obj->pager);
+}
+
+void
+kms_gem_object_put(struct drm_gem_object *obj)
+{
+	if (obj == NULL)
+		return;
+	if (refcount_release(&obj->refs))
+		drm_gem_object_release(obj);
+}
+
+struct drm_gem_object *
+kms_gem_object_lookup_offset(struct drm_device *dev, uint64_t offset)
+{
+	struct drm_gem_object *obj;
+
+	sx_slock(&dev->gem_lock);
+	TAILQ_FOREACH(obj, &dev->gem_objects, device_link) {
+		if (obj->mmap_offset == offset) {
+			refcount_acquire(&obj->refs);
+			sx_sunlock(&dev->gem_lock);
+			return (obj);
+		}
+	}
+	sx_sunlock(&dev->gem_lock);
+	return (NULL);
+}
+
+/* ----- handle table ----- */
+
+int
+kms_gem_handle_create(struct drm_file *file, struct drm_gem_object *obj,
+    uint32_t *handle_out)
+{
+	struct drm_gem_handle *h;
+
+	if (file == NULL || obj == NULL || handle_out == NULL)
+		return (EINVAL);
+
+	h = malloc(sizeof(*h), M_KMS, M_WAITOK | M_ZERO);
+	kms_gem_object_get(obj);
+	h->obj = obj;
+
+	sx_xlock(&file->handle_lock);
+	if (file->next_handle == UINT32_MAX) {
+		sx_xunlock(&file->handle_lock);
+		kms_gem_object_put(obj);
+		free(h, M_KMS);
+		return (ENOSPC);
+	}
+	h->id = ++file->next_handle;
+	TAILQ_INSERT_TAIL(&file->handles, h, link);
+	sx_xunlock(&file->handle_lock);
+
+	*handle_out = h->id;
+	return (0);
+}
+
+int
+kms_gem_handle_delete(struct drm_file *file, uint32_t handle)
+{
+	struct drm_gem_handle *h;
+
+	sx_xlock(&file->handle_lock);
+	TAILQ_FOREACH(h, &file->handles, link) {
+		if (h->id == handle) {
+			TAILQ_REMOVE(&file->handles, h, link);
+			sx_xunlock(&file->handle_lock);
+			kms_gem_object_put(h->obj);
+			free(h, M_KMS);
+			return (0);
+		}
+	}
+	sx_xunlock(&file->handle_lock);
+	return (ENOENT);
+}
+
+struct drm_gem_object *
+kms_gem_handle_lookup(struct drm_file *file, uint32_t handle)
+{
+	struct drm_gem_handle *h;
+	struct drm_gem_object *obj = NULL;
+
+	sx_slock(&file->handle_lock);
+	TAILQ_FOREACH(h, &file->handles, link) {
+		if (h->id == handle) {
+			obj = h->obj;
+			kms_gem_object_get(obj);
+			break;
+		}
+	}
+	sx_sunlock(&file->handle_lock);
+	return (obj);
+}
+
+void
+kms_gem_release_all(struct drm_file *file)
+{
+	struct drm_gem_handle *h;
+
+	if (file == NULL)
+		return;
+	/*
+	 * Pull entries out one at a time under the lock, drop the lock,
+	 * then put the ref — the put may recurse into the device-side
+	 * gem_lock (drm_gem_object_free), and holding handle_lock during
+	 * that would create an unnecessary dependency.
+	 */
+	for (;;) {
+		sx_xlock(&file->handle_lock);
+		h = TAILQ_FIRST(&file->handles);
+		if (h == NULL) {
+			sx_xunlock(&file->handle_lock);
+			break;
+		}
+		TAILQ_REMOVE(&file->handles, h, link);
+		sx_xunlock(&file->handle_lock);
+
+		kms_gem_object_put(h->obj);
+		free(h, M_KMS);
+	}
+}

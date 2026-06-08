@@ -24,6 +24,9 @@ struct drm_mode_get_encoder;
 struct drm_mode_get_connector;
 struct drm_mode_get_plane;
 struct drm_mode_get_plane_res;
+struct drm_mode_create_dumb;
+struct drm_mode_map_dumb;
+struct drm_mode_destroy_dumb;
 
 MALLOC_DECLARE(M_KMS);
 
@@ -56,5 +59,11 @@ int	kms_ioctl_mode_getplane_resources(struct drm_file *file,
 	    struct drm_mode_get_plane_res *r);
 int	kms_ioctl_mode_getplane(struct drm_file *file,
 	    struct drm_mode_get_plane *r);
+int	kms_ioctl_mode_create_dumb(struct drm_file *file,
+	    struct drm_mode_create_dumb *args);
+int	kms_ioctl_mode_map_dumb(struct drm_file *file,
+	    struct drm_mode_map_dumb *args);
+int	kms_ioctl_mode_destroy_dumb(struct drm_file *file,
+	    struct drm_mode_destroy_dumb *args);
 
 #endif /* _KMS_INTERNAL_H_ */

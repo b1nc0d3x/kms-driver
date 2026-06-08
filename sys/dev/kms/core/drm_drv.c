@@ -42,9 +42,12 @@ kms_dev_register(const struct drm_driver *driver, void *driver_priv,
 
 	dev = malloc(sizeof(*dev), M_KMS, M_WAITOK | M_ZERO);
 	sx_init(&dev->dev_lock, "drmdev");
+	sx_init(&dev->gem_lock, "drmgem_dev");
 	dev->driver = driver;
 	dev->driver_priv = driver_priv;
 	TAILQ_INIT(&dev->files);
+	TAILQ_INIT(&dev->gem_objects);
+	dev->mmap_offset_counter = PAGE_SIZE;	/* keep 0 reserved */
 	drm_mode_config_init(&dev->mode_config);
 	refcount_init(&dev->refs, 1);	/* initial: held by the registry */
 
@@ -101,6 +104,7 @@ static void
 kms_device_destroy(struct drm_device *dev)
 {
 	drm_mode_config_cleanup(&dev->mode_config);
+	sx_destroy(&dev->gem_lock);
 	sx_destroy(&dev->dev_lock);
 	free(dev, M_KMS);
 }

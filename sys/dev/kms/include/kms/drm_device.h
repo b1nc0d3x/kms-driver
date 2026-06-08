@@ -40,6 +40,9 @@ struct drm_file;
  * which may be either the unregister call itself (no opens outstanding)
  * or the last file close after unregister.
  */
+struct drm_gem_object;
+TAILQ_HEAD(drm_gem_object_list, drm_gem_object);
+
 struct drm_device {
 	struct sx			 dev_lock;
 	const struct drm_driver		*driver;
@@ -51,6 +54,17 @@ struct drm_device {
 	TAILQ_ENTRY(drm_device)		 link;
 	void				*driver_priv;
 	struct drm_mode_config		 mode_config;
+
+	/*
+	 * GEM bookkeeping.  gem_lock protects the gem_objects list and
+	 * the mmap_offset_counter; held briefly during create / lookup /
+	 * destroy.  Counter monotonically advances by one PAGE_SIZE-
+	 * aligned slot per BO so cdev d_mmap_single can map an offset
+	 * back to a single object via list scan.
+	 */
+	struct sx			 gem_lock;
+	struct drm_gem_object_list	 gem_objects;
+	uint64_t			 mmap_offset_counter;
 };
 
 #endif /* _KMS_DRM_DEVICE_H_ */
