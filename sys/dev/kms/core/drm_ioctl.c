@@ -172,6 +172,17 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 	case DRM_IOCTL_MODE_DESTROY_DUMB:
 		return (kms_ioctl_mode_destroy_dumb(file,
 		    (struct drm_mode_destroy_dumb *)data));
+	case DRM_IOCTL_MODE_ADDFB2:
+		return (kms_ioctl_mode_addfb2(file,
+		    (struct drm_mode_fb_cmd2 *)data));
+	case DRM_IOCTL_MODE_RMFB:
+		return (kms_ioctl_mode_rmfb(file, (uint32_t *)data));
+	case DRM_IOCTL_MODE_SETCRTC:
+		return (kms_ioctl_mode_setcrtc(file,
+		    (struct drm_mode_crtc *)data));
+	case DRM_IOCTL_MODE_PAGE_FLIP:
+		return (kms_ioctl_mode_page_flip(file,
+		    (struct drm_mode_crtc_page_flip *)data));
 	}
 	return (ENOTTY);
 }

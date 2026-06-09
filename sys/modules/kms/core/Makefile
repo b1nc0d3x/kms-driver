@@ -19,6 +19,7 @@ SRCS=	drm_connector.c \
 	drm_mode_ioctl.c \
 	drm_mode_object.c \
 	drm_modes.c \
+	drm_modeset.c \
 	drm_plane.c
 
 CFLAGS+=	-I${SRCTOP}/sys/dev/kms/include

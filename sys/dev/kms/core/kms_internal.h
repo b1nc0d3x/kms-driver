@@ -27,6 +27,8 @@ struct drm_mode_get_plane_res;
 struct drm_mode_create_dumb;
 struct drm_mode_map_dumb;
 struct drm_mode_destroy_dumb;
+struct drm_mode_fb_cmd2;
+struct drm_mode_crtc_page_flip;
 
 MALLOC_DECLARE(M_KMS);
 
@@ -65,5 +67,12 @@ int	kms_ioctl_mode_map_dumb(struct drm_file *file,
 	    struct drm_mode_map_dumb *args);
 int	kms_ioctl_mode_destroy_dumb(struct drm_file *file,
 	    struct drm_mode_destroy_dumb *args);
+int	kms_ioctl_mode_addfb2(struct drm_file *file,
+	    struct drm_mode_fb_cmd2 *cmd);
+int	kms_ioctl_mode_rmfb(struct drm_file *file, uint32_t *fb_id);
+int	kms_ioctl_mode_setcrtc(struct drm_file *file,
+	    struct drm_mode_crtc *r);
+int	kms_ioctl_mode_page_flip(struct drm_file *file,
+	    struct drm_mode_crtc_page_flip *r);
 
 #endif /* _KMS_INTERNAL_H_ */

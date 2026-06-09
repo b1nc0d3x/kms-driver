@@ -381,6 +381,159 @@ out:
 	return (error);
 }
 
+static int
+probe_modeset(int fd, uint32_t crtc_id, uint32_t conn_id)
+{
+	struct drm_mode_create_dumb c1, c2;
+	struct drm_mode_fb_cmd2 fbcmd;
+	struct drm_mode_crtc setcrtc;
+	struct drm_mode_crtc getcrtc;
+	struct drm_mode_crtc_page_flip flip;
+	struct drm_mode_get_connector conn;
+	struct drm_mode_modeinfo modes[1];
+	struct drm_mode_destroy_dumb d;
+	uint32_t fb1 = 0, fb2 = 0;
+	uint32_t conn_array[1];
+	int error = 0;
+
+	if (crtc_id == 0 || conn_id == 0) {
+		printf("MODESET      : skipped (no crtc/conn)\n");
+		return (0);
+	}
+
+	/* Pull the first mode off the connector to feed SETCRTC. */
+	memset(&conn, 0, sizeof(conn));
+	conn.connector_id = conn_id;
+	conn.modes_ptr = (uintptr_t)modes;
+	conn.count_modes = 1;
+	if (ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &conn) != 0 ||
+	    conn.count_modes == 0) {
+		printf("MODESET      : skipped (no modes)\n");
+		return (0);
+	}
+
+	/* Buffer #1. */
+	memset(&c1, 0, sizeof(c1));
+	c1.width = modes[0].hdisplay;
+	c1.height = modes[0].vdisplay;
+	c1.bpp = 32;
+	if (ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &c1) != 0) {
+		warn("CREATE_DUMB fb1");
+		return (1);
+	}
+
+	memset(&fbcmd, 0, sizeof(fbcmd));
+	fbcmd.width = c1.width;
+	fbcmd.height = c1.height;
+	fbcmd.pixel_format = 0x34325258;	/* DRM_FORMAT_XRGB8888 */
+	fbcmd.handles[0] = c1.handle;
+	fbcmd.pitches[0] = c1.pitch;
+	if (ioctl(fd, DRM_IOCTL_MODE_ADDFB2, &fbcmd) != 0) {
+		warn("ADDFB2 fb1");
+		error = 1;
+		goto cleanup;
+	}
+	fb1 = fbcmd.fb_id;
+	printf("ADDFB2       : fb1=%u (%ux%u XR24 pitch=%u)\n",
+	    fb1, fbcmd.width, fbcmd.height, fbcmd.pitches[0]);
+
+	/* Drive SETCRTC. */
+	memset(&setcrtc, 0, sizeof(setcrtc));
+	conn_array[0] = conn_id;
+	setcrtc.set_connectors_ptr = (uintptr_t)conn_array;
+	setcrtc.count_connectors = 1;
+	setcrtc.crtc_id = crtc_id;
+	setcrtc.fb_id = fb1;
+	setcrtc.mode_valid = 1;
+	setcrtc.mode = modes[0];
+	if (ioctl(fd, DRM_IOCTL_MODE_SETCRTC, &setcrtc) != 0) {
+		warn("SETCRTC");
+		error = 1;
+		goto cleanup;
+	}
+	printf("SETCRTC      : crtc=%u fb=%u mode=%s\n", crtc_id, fb1,
+	    modes[0].name);
+
+	memset(&getcrtc, 0, sizeof(getcrtc));
+	getcrtc.crtc_id = crtc_id;
+	if (ioctl(fd, DRM_IOCTL_MODE_GETCRTC, &getcrtc) != 0) {
+		warn("GETCRTC after SETCRTC");
+		error = 1;
+		goto cleanup;
+	}
+	printf("  GETCRTC    : fb=%u mode_valid=%u %ux%u\n",
+	    getcrtc.fb_id, getcrtc.mode_valid, getcrtc.mode.hdisplay,
+	    getcrtc.mode.vdisplay);
+	if (getcrtc.fb_id != fb1 || !getcrtc.mode_valid)
+		error = 1;
+
+	/* Buffer #2 + PAGE_FLIP. */
+	memset(&c2, 0, sizeof(c2));
+	c2.width = c1.width;
+	c2.height = c1.height;
+	c2.bpp = 32;
+	if (ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &c2) != 0) {
+		warn("CREATE_DUMB fb2");
+		error = 1;
+		goto cleanup;
+	}
+	memset(&fbcmd, 0, sizeof(fbcmd));
+	fbcmd.width = c2.width;
+	fbcmd.height = c2.height;
+	fbcmd.pixel_format = 0x34325258;
+	fbcmd.handles[0] = c2.handle;
+	fbcmd.pitches[0] = c2.pitch;
+	if (ioctl(fd, DRM_IOCTL_MODE_ADDFB2, &fbcmd) != 0) {
+		warn("ADDFB2 fb2");
+		error = 1;
+		goto cleanup_c2;
+	}
+	fb2 = fbcmd.fb_id;
+
+	memset(&flip, 0, sizeof(flip));
+	flip.crtc_id = crtc_id;
+	flip.fb_id = fb2;
+	if (ioctl(fd, DRM_IOCTL_MODE_PAGE_FLIP, &flip) != 0) {
+		warn("PAGE_FLIP");
+		error = 1;
+	} else {
+		printf("PAGE_FLIP    : crtc=%u fb=%u\n", crtc_id, fb2);
+	}
+
+	memset(&getcrtc, 0, sizeof(getcrtc));
+	getcrtc.crtc_id = crtc_id;
+	if (ioctl(fd, DRM_IOCTL_MODE_GETCRTC, &getcrtc) == 0) {
+		printf("  GETCRTC    : fb=%u (expect %u)\n", getcrtc.fb_id,
+		    fb2);
+		if (getcrtc.fb_id != fb2)
+			error = 1;
+	}
+
+cleanup_c2:
+	if (fb2 != 0) {
+		if (ioctl(fd, DRM_IOCTL_MODE_RMFB, &fb2) != 0)
+			warn("RMFB fb2");
+	}
+	memset(&d, 0, sizeof(d));
+	d.handle = c2.handle;
+	(void)ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &d);
+
+cleanup:
+	if (fb1 != 0) {
+		/* Blank the CRTC first to drop the fb1 ref. */
+		memset(&setcrtc, 0, sizeof(setcrtc));
+		setcrtc.crtc_id = crtc_id;
+		setcrtc.mode_valid = 0;
+		(void)ioctl(fd, DRM_IOCTL_MODE_SETCRTC, &setcrtc);
+		if (ioctl(fd, DRM_IOCTL_MODE_RMFB, &fb1) != 0)
+			warn("RMFB fb1");
+	}
+	memset(&d, 0, sizeof(d));
+	d.handle = c1.handle;
+	(void)ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &d);
+	return (error);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -406,6 +559,7 @@ main(int argc, char **argv)
 	rc |= probe_mode_getplane_resources(fd, &plane_id);
 	rc |= probe_mode_getplane(fd, plane_id);
 	rc |= probe_dumb_buffer(fd);
+	rc |= probe_modeset(fd, crtc_id, conn_id);
 
 	close(fd);
 	return (rc);

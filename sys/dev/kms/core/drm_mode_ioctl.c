@@ -32,6 +32,7 @@
 int
 kms_ioctl_mode_getcrtc(struct drm_file *file, struct drm_mode_crtc *r)
 {
+	struct drm_mode_config *mc = &file->dev->mode_config;
 	struct drm_mode_object *obj;
 	struct drm_crtc *crtc;
 	struct drm_framebuffer *fb;
@@ -41,13 +42,23 @@ kms_ioctl_mode_getcrtc(struct drm_file *file, struct drm_mode_crtc *r)
 		return (ENOENT);
 	crtc = __containerof(obj, struct drm_crtc, base);
 
+	/*
+	 * Snapshot under the config lock so we don't read a half-applied
+	 * SETCRTC state.  Phase 7 cached mode_valid + mode + x + y on
+	 * the CRTC; report them back.
+	 */
+	sx_slock(&mc->mutex);
 	fb = crtc->primary_fb;
 	r->fb_id = (fb != NULL) ? fb->base.id : 0;
-	r->x = 0;
-	r->y = 0;
+	r->x = crtc->x;
+	r->y = crtc->y;
 	r->gamma_size = 0;
-	r->mode_valid = 0;
-	memset(&r->mode, 0, sizeof(r->mode));
+	r->mode_valid = crtc->mode_valid;
+	if (crtc->mode_valid)
+		drm_display_mode_to_modeinfo(&crtc->mode, &r->mode);
+	else
+		memset(&r->mode, 0, sizeof(r->mode));
+	sx_sunlock(&mc->mutex);
 	/*
 	 * set_connectors_ptr / count_connectors are input-only fields
 	 * for SETCRTC; GETCRTC leaves them untouched per the Linux
