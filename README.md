@@ -23,7 +23,7 @@ kernel API lives in `sys/dev/kms/include/kms/`.
 | 6     | Dumb buffers + cdev_pager mmap                   | done   |
 | 7     | Legacy modeset (SETCRTC / ADDFB / PAGEFLIP)      | done   |
 | 8     | Atomic modeset                                   | done   |
-| 9     | Port `rk_drm` onto kms                     | -      |
+| 9     | Port `rk_drm` onto kms                     | wip (9a) |
 
 Phase 2 validated live on FreeBSD/arm64 (RockPro64 / `rk3399`).
 `drm_probe` against `/dev/dri/card1` returns:
