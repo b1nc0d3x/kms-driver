@@ -55,6 +55,17 @@
 #define	RK_KMS_DESC	"Rockchip RK3399 display (kms)"
 
 /*
+ * Same DPRINTF idiom rk_cdn_dp uses: gated on the softc's debug
+ * counter so the cold path is one branch.  Set
+ * dev.rk_kms.0.debug=1 to enable.
+ */
+#define	DPRINTF(sc, ...)						\
+	do {								\
+		if ((sc)->debug > 0)					\
+			device_printf((sc)->dev, __VA_ARGS__);		\
+	} while (0)
+
+/*
  * RK3399 hardware-block physical addresses.  Lifted verbatim from
  * sys/arm64/rockchip/rk_drm_hw.c (rk_drm.c reference) — the same
  * SoC, the same map.  Phase 9b owns these mappings; Phase 9c writes
@@ -139,6 +150,12 @@ struct rk_kms_softc {
 	 * dev.rk_kms.0.commit_modeset=1 to enable real writes.
 	 */
 	int				 commit_modeset;
+
+	/*
+	 * Debug verbosity (0 = quiet, 1 = trace MMIO + set_config).
+	 * Controlled by dev.rk_kms.0.debug.
+	 */
+	int				 debug;
 };
 
 static const struct ofw_compat_data rk_kms_compat_data[] = {
@@ -278,8 +295,7 @@ rk_kms_set_config(struct drm_mode_set *set)
 
 	sc = set->crtc->dev->driver_priv;
 	if (set->mode != NULL) {
-		device_printf(sc->dev,
-		    "set_config: %ux%u clock=%u fb=%u commit=%d\n",
+		DPRINTF(sc, "set_config: %ux%u clock=%u fb=%u commit=%d\n",
 		    set->mode->hdisplay, set->mode->vdisplay,
 		    set->mode->clock,
 		    set->fb != NULL ? set->fb->base.id : 0,
@@ -287,7 +303,7 @@ rk_kms_set_config(struct drm_mode_set *set)
 		if (sc->commit_modeset != 0 && sc->hw_attached)
 			rk_kms_vop_program_timing(sc, set->mode);
 	} else {
-		device_printf(sc->dev, "set_config: blank (commit=%d)\n",
+		DPRINTF(sc, "set_config: blank (commit=%d)\n",
 		    sc->commit_modeset);
 		if (sc->commit_modeset != 0 && sc->hw_attached) {
 			uint32_t sys_ctrl;
@@ -400,9 +416,8 @@ rk_kms_hw_attach(struct rk_kms_softc *sc)
 		return (error);
 
 	sc->hw_attached = true;
-	device_printf(sc->dev,
-	    "MMIO mapped: VOP_BIG/LIT @ 0xff9{0,8f}0000 GRF @ 0xff770000 "
-	    "CRU @ 0xff760000\n");
+	DPRINTF(sc, "MMIO mapped: VOP_BIG/LIT @ 0xff9{0,8f}0000 "
+	    "GRF @ 0xff770000 CRU @ 0xff760000\n");
 	return (0);
 }
 
@@ -475,6 +490,10 @@ rk_kms_attach(device_t dev)
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 	    "commit_modeset", CTLFLAG_RW, &sc->commit_modeset, 0,
 	    "Actually program VOP registers on set_config (0 = log only)");
+	SYSCTL_ADD_INT(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "debug", CTLFLAG_RW, &sc->debug, 0,
+	    "Debug verbosity (0 = quiet, 1 = trace attach + set_config)");
 
 	device_printf(dev, "registered (Phase 9c: VOP code wired behind "
 	    "commit_modeset sysctl, default off)\n");
