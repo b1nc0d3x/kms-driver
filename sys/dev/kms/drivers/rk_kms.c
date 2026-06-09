@@ -199,6 +199,114 @@
 #define	RK_KMS_OUT_DP	1
 
 /*
+ * Designware HDMI controller register offsets (subset).  Names match
+ * the rk_drm reference; numbers are word-indexed (each "1-byte"
+ * register lives at off << 2 in MMIO because the bridge widens the
+ * 8-bit DW interface to AXI).
+ */
+#define	HDMI_IH_I2CMPHY_STAT0	0x0108
+#define	HDMI_TX_INVID0		0x0200
+#define	HDMI_VP_PR_CD		0x0801
+#define	HDMI_VP_STUFF		0x0802
+#define	HDMI_VP_REMAP		0x0803
+#define	HDMI_VP_CONF		0x0804
+#define	HDMI_FC_VSYNCINWIDTH	0x100d
+#define	HDMI_MC_CLKDIS		0x4001
+#define	HDMI_MC_SWRSTZREQ	0x4002
+#define	HDMI_MC_FLOWCTRL	0x4004
+#define	HDMI_MC_PHYRSTZ		0x4005
+#define	HDMI_MC_LOCKONCLOCK	0x4006
+#define	HDMI_MC_HEACPHY_RST	0x4007
+#define	HDMI_BASE_SFRDIVLOW	0x4015
+#define	HDMI_BASE_SFRDIVHIGH	0x4016
+#define	HDMI_PHY_CONF0		0x3000
+#define	HDMI_PHY_STAT0		0x3004
+#define	HDMI_PHY_JTAG_CFG	0x300a
+#define	HDMI_PHY_I2CM_SLAVE	0x3020
+#define	HDMI_PHY_I2CM_ADDRESS	0x3021
+#define	HDMI_PHY_I2CM_DATAO_1	0x3022
+#define	HDMI_PHY_I2CM_DATAO_0	0x3023
+#define	HDMI_PHY_I2CM_OPERATION	0x3026
+#define	HDMI_PHY_I2CM_CTLINT	0x3028
+#define	HDMI_PHY_I2CM_DIV	0x3029
+#define	HDMI_PHY_I2CM_SOFTRSTZ	0x302a
+#define	HDMI_PHY_I2CM_SS_HCNT1	0x302b
+#define	HDMI_PHY_I2CM_SS_HCNT0	0x302c
+#define	HDMI_PHY_I2CM_SS_LCNT1	0x302d
+#define	HDMI_PHY_I2CM_SS_LCNT0	0x302e
+#define	HDMI_PHY_I2CM_FS_HCNT1	0x302f
+#define	HDMI_PHY_I2CM_FS_HCNT0	0x3030
+#define	HDMI_PHY_I2CM_FS_LCNT1	0x3031
+#define	HDMI_PHY_I2CM_FS_LCNT0	0x3032
+#define	HDMI_PHY_I2CM_SDA_HOLD	0x3033
+
+#define	HDMI_PHY_I2C_CKCALCTRL	0x05
+#define	HDMI_PHY_I2C_CPCE_CTRL	0x06
+#define	HDMI_PHY_I2C_GMPCTRL	0x10
+#define	HDMI_PHY_I2C_PLLPHBYCTRL 0x13
+#define	HDMI_PHY_I2C_CURRCTRL	0x0b
+#define	HDMI_PHY_I2C_VLEVCTRL	0x0e
+#define	HDMI_PHY_I2C_TXTERM	0x19
+#define	HDMI_PHY_I2C_CKSYMTXCTRL 0x09
+#define	HDMI_PHY_I2C_MSM_CTRL	0x12
+
+#define	HDMI_PHY_I2C_ADDR	0x69
+#define	HDMI_PHY_I2CM_DIV_DEFAULT  0x0a
+#define	HDMI_PHY_I2CM_SS_HCNT0_DEFAULT 0x4f
+#define	HDMI_PHY_I2CM_SS_LCNT0_DEFAULT 0x91
+#define	HDMI_PHY_I2CM_FS_HCNT0_DEFAULT 0x0f
+#define	HDMI_PHY_I2CM_FS_LCNT0_DEFAULT 0x21
+#define	HDMI_PHY_I2CM_SDA_HOLD_DEFAULT 0x08
+#define	HDMI_BASE_SFRDIVLOW_DEFAULT   0xff
+#define	HDMI_BASE_SFRDIVHIGH_DEFAULT  0x00
+#define	HDMI_PHY_JTAG_CFG_I2C	0x80
+#define	HDMI_PHY_MSM_CTRL_FB_CLK 0x0006
+#define	HDMI_PHY_I2C_CKCALCTRL_OVERRIDE 0x0000
+
+#define	HDMI_PHY_CONF0_PDDQ	(1u << 1)
+#define	HDMI_PHY_CONF0_PDZ	(1u << 2)
+#define	HDMI_PHY_CONF0_ENTMDS	(1u << 3)
+#define	HDMI_PHY_CONF0_SVSRET	(1u << 4)
+#define	HDMI_PHY_CONF0_TXPWRON	(1u << 6)
+#define	HDMI_PHY_CONF0_SELDIPIF	(1u << 5)
+#define	HDMI_PHY_CONF0_SELDATAENPOL (1u << 7)
+
+#define	HDMI_MC_SWRST_PIXEL	(1u << 0)
+#define	HDMI_MC_SWRST_TMDS	(1u << 1)
+#define	HDMI_MC_CLKDIS_CECCLK_DISABLE (1u << 6)
+
+/*
+ * Synopsys MPLL + PHY coefficient tables — three pixel clocks for the
+ * Phase 9f bring-up bracket.  Full rk_drm tables get back-ported as
+ * more sinks/modes need them.
+ */
+struct rk_kms_mpll_config {
+	uint32_t	pixel_clock;
+	uint16_t	cpce;
+	uint16_t	gmp;
+	uint16_t	curr;
+};
+
+struct rk_kms_phy_config {
+	uint32_t	pixel_clock;
+	uint16_t	sym;
+	uint16_t	term;
+	uint16_t	vlev;
+};
+
+static const struct rk_kms_mpll_config rk_kms_mpll_configs[] = {
+	{  74250, 0x0072, 0x0001, 0x0028 },
+	{ 148500, 0x0051, 0x0003, 0x0000 },
+	{      0, 0x0051, 0x0003, 0x0000 }, /* sentinel: clamps to 148500 */
+};
+
+static const struct rk_kms_phy_config rk_kms_phy_configs[] = {
+	{  74250, 0x8009, 0x0004, 0x0272 },
+	{ 148500, 0x802b, 0x0004, 0x028d },
+	{      0, 0x0000, 0x0000, 0x0000 },
+};
+
+/*
  * Pixel-clock → VPLL coefficient table.  Lifted verbatim from
  * rk_drm_hw.c (which itself derives the values from Rockchip's BSP
  * + measurement on rp64dbg / armbsd).  Phase 9d ships the most-used
@@ -271,6 +379,14 @@ struct rk_kms_softc {
 	 * a ported rk_cdn_dp for the DP side.
 	 */
 	int				 output;
+
+	/*
+	 * Gate for DW HDMI bring-up (PHY init + TMDS framer).  Defaults
+	 * to 0.  Independent from commit_modeset so the VOP-only path
+	 * can be exercised on hardware without touching the PHY (e.g.
+	 * to validate vsync/hsync timing on a logic analyzer).
+	 */
+	int				 hdmi_enable;
 
 	/*
 	 * Debug verbosity (0 = quiet, 1 = trace MMIO + set_config).
@@ -363,6 +479,284 @@ grf_write(struct rk_kms_softc *sc, bus_size_t off, uint32_t val)
 	bus_space_write_4(sc->bst, sc->grf_bsh, off, val);
 	bus_space_barrier(sc->bst, sc->grf_bsh, off, 4,
 	    BUS_SPACE_BARRIER_WRITE);
+}
+
+/*
+ * HDMI controller register accessors.  The Designware IP exposes
+ * 8-bit registers, but the RK3399 bridge widens them to 32-bit AXI
+ * with the byte position kept in the low 8 bits and the register
+ * offset multiplied by 4.  Read/write 1 byte at a time exactly the
+ * way the rk_drm reference does — same dsb/isb fence on writes.
+ */
+static inline uint8_t
+hdmi_read1(struct rk_kms_softc *sc, size_t off)
+{
+	volatile uint32_t *reg;
+
+	reg = (volatile uint32_t *)(sc->hdmi_va + (off << 2));
+	return ((uint8_t)(*reg & 0xff));
+}
+
+static inline void
+hdmi_write1(struct rk_kms_softc *sc, size_t off, uint8_t val)
+{
+	volatile uint32_t *reg;
+
+	reg = (volatile uint32_t *)(sc->hdmi_va + (off << 2));
+	*reg = val;
+	__asm volatile("dsb sy" ::: "memory");
+	__asm volatile("isb" ::: "memory");
+}
+
+/*
+ * Pick the MPLL / PHY rows for a given pixel clock.  Both tables
+ * terminate with a sentinel whose pixel_clock = 0; if the requested
+ * clock exceeds every defined entry, the sentinel's coefficients
+ * (the 148.5 MHz set) are returned so callers always get usable
+ * values for the bracket Phase 9f covers.  Below 74.25 MHz the
+ * 74.25 row applies — coarser than rk_drm's full table but enough
+ * for the standard 1080p/720p bring-up.
+ */
+static const struct rk_kms_mpll_config *
+rk_kms_find_mpll(uint32_t clock_khz)
+{
+	const struct rk_kms_mpll_config *r;
+	size_t i;
+
+	for (i = 0; i < nitems(rk_kms_mpll_configs); i++) {
+		r = &rk_kms_mpll_configs[i];
+		if (r->pixel_clock == 0 || r->pixel_clock >= clock_khz)
+			return (r);
+	}
+	return (&rk_kms_mpll_configs[nitems(rk_kms_mpll_configs) - 1]);
+}
+
+static const struct rk_kms_phy_config *
+rk_kms_find_phy(uint32_t clock_khz)
+{
+	const struct rk_kms_phy_config *r;
+	size_t i;
+
+	for (i = 0; i < nitems(rk_kms_phy_configs); i++) {
+		r = &rk_kms_phy_configs[i];
+		if (r->pixel_clock == 0 || r->pixel_clock >= clock_khz)
+			return (r);
+	}
+	return (&rk_kms_phy_configs[nitems(rk_kms_phy_configs) - 1]);
+}
+
+/*
+ * PHY I2C engine reset.  The DW HDMI's PHY config is reached through
+ * an internal I2C master that talks to the Synopsys PHY.  The bus
+ * sometimes wedges between modesets, so the reset returns ETIMEDOUT
+ * if the SOFTRSTZ doesn't latch.
+ */
+static int
+rk_kms_hdmi_phy_i2c_reset(struct rk_kms_softc *sc)
+{
+	int t;
+
+	hdmi_write1(sc, HDMI_PHY_I2CM_SOFTRSTZ, 0x00);
+	for (t = 100; t > 0; t--) {
+		if ((hdmi_read1(sc, HDMI_PHY_I2CM_SOFTRSTZ) & 0x01) != 0)
+			return (0);
+		DELAY(10);
+	}
+	return (ETIMEDOUT);
+}
+
+/*
+ * Write one 16-bit value into a PHY register through the I2C master.
+ * Big-endian on the wire.  Polls IH_I2CMPHY_STAT0 + CTLINT for the
+ * done flag or an error.  200 ms max timeout.
+ */
+static int
+rk_kms_hdmi_phy_i2c_write(struct rk_kms_softc *sc, uint8_t reg,
+    uint16_t val)
+{
+	uint8_t err, sticky;
+	int t;
+
+	if (rk_kms_hdmi_phy_i2c_reset(sc) != 0)
+		return (ETIMEDOUT);
+
+	hdmi_write1(sc, HDMI_IH_I2CMPHY_STAT0, 0x03);
+	hdmi_write1(sc, HDMI_PHY_I2CM_SLAVE, HDMI_PHY_I2C_ADDR);
+	hdmi_write1(sc, HDMI_PHY_I2CM_ADDRESS, reg);
+	hdmi_write1(sc, HDMI_PHY_I2CM_DATAO_1, (val >> 8) & 0xff);
+	hdmi_write1(sc, HDMI_PHY_I2CM_DATAO_0, val & 0xff);
+	hdmi_write1(sc, HDMI_PHY_I2CM_OPERATION, 0x10);
+
+	for (t = 200; t > 0; t--) {
+		DELAY(1000);
+		err = hdmi_read1(sc, HDMI_PHY_I2CM_CTLINT);
+		sticky = hdmi_read1(sc, HDMI_IH_I2CMPHY_STAT0);
+		if ((sticky & 0x01) != 0)
+			return (0);
+		if ((err & 0x10) != 0 || (err & 0x01) != 0) {
+			DPRINTF(sc, "phy i2c write reg=0x%02x val=0x%04x "
+			    "err=0x%02x sticky=0x%02x\n", reg, val, err,
+			    sticky);
+			return (EIO);
+		}
+	}
+	return (ETIMEDOUT);
+}
+
+/*
+ * Toggle the DW HDMI main reset bits.  Used to force the TMDS + pixel
+ * domains to re-init after a PHY swap.
+ */
+static void
+rk_kms_hdmi_toggle_main_reset(struct rk_kms_softc *sc, uint8_t bits)
+{
+	hdmi_write1(sc, HDMI_MC_SWRSTZREQ, (uint8_t)~bits);
+	DELAY(100);
+	hdmi_write1(sc, HDMI_MC_SWRSTZREQ, 0xff);
+}
+
+/*
+ * DW HDMI PHY init.  Lifted from rk_drm_hdmi_phy_init: gates four CRU
+ * lanes, then runs the PHY soft-reset + MPLL coefficient write + PHY
+ * power-up sequence twice (Rockchip's BSP says the first pass is
+ * unreliable when the PHY was previously off, the second always
+ * locks).  Returns ETIMEDOUT if PHY_STAT0[0] (TX_READY) never goes
+ * high within 100 ms after the TMDS reset.
+ *
+ * Gated behind dev.rk_kms.0.hdmi_enable so the .ko is safe to
+ * load on a live-display kernel without smashing the panel.  Phase
+ * 9f part 2 lands the TMDS framer + AVI infoframe path.
+ */
+static int
+rk_kms_hdmi_phy_init(struct rk_kms_softc *sc,
+    const struct drm_display_mode *mode)
+{
+	const struct rk_kms_mpll_config *mpll;
+	const struct rk_kms_phy_config *phy;
+	uint16_t vsync_len;
+	uint8_t cfg0;
+	int iter, timeout;
+
+	mpll = rk_kms_find_mpll(mode->clock);
+	phy = rk_kms_find_phy(mode->clock);
+
+	/*
+	 * CRU CLKSEL_CON gates feeding the HDMI lanes.  The values below
+	 * mirror rk_drm: each pair clears the disable bits in the high
+	 * 16 (mask) half and sets the enable value in the low half.
+	 */
+	cru_write(sc, 0x0240, (1u << 25) | (1u << 26));
+	cru_write(sc, 0x0244, (1u << 18));
+	cru_write(sc, 0x0250, (1u << 28));
+	cru_write(sc, 0x0254, (1u << 24));
+	DELAY(10000);
+
+	vsync_len = (uint16_t)(mode->vsync_end - mode->vsync_start);
+
+	for (iter = 0; iter < 2; iter++) {
+		hdmi_write1(sc, HDMI_MC_FLOWCTRL, 0x00);
+		hdmi_write1(sc, HDMI_MC_PHYRSTZ, 0x01);
+		hdmi_write1(sc, HDMI_VP_PR_CD, 0x40);
+		DELAY(5000);
+		hdmi_write1(sc, HDMI_MC_PHYRSTZ, 0x00);
+		DELAY(5000);
+		hdmi_write1(sc, HDMI_MC_HEACPHY_RST, 0x01);
+
+		hdmi_write1(sc, HDMI_BASE_SFRDIVLOW,
+		    HDMI_BASE_SFRDIVLOW_DEFAULT);
+		hdmi_write1(sc, HDMI_BASE_SFRDIVHIGH,
+		    HDMI_BASE_SFRDIVHIGH_DEFAULT);
+		hdmi_write1(sc, HDMI_PHY_JTAG_CFG, HDMI_PHY_JTAG_CFG_I2C);
+
+		if (rk_kms_hdmi_phy_i2c_reset(sc) != 0) {
+			DPRINTF(sc, "phy i2c reset timed out\n");
+			return (ETIMEDOUT);
+		}
+
+		hdmi_write1(sc, HDMI_PHY_I2CM_SLAVE, HDMI_PHY_I2C_ADDR);
+		hdmi_write1(sc, HDMI_PHY_I2CM_DIV, HDMI_PHY_I2CM_DIV_DEFAULT);
+		hdmi_write1(sc, HDMI_PHY_I2CM_SS_HCNT1, 0x00);
+		hdmi_write1(sc, HDMI_PHY_I2CM_SS_HCNT0,
+		    HDMI_PHY_I2CM_SS_HCNT0_DEFAULT);
+		hdmi_write1(sc, HDMI_PHY_I2CM_SS_LCNT1, 0x00);
+		hdmi_write1(sc, HDMI_PHY_I2CM_SS_LCNT0,
+		    HDMI_PHY_I2CM_SS_LCNT0_DEFAULT);
+		hdmi_write1(sc, HDMI_PHY_I2CM_FS_HCNT1, 0x00);
+		hdmi_write1(sc, HDMI_PHY_I2CM_FS_HCNT0,
+		    HDMI_PHY_I2CM_FS_HCNT0_DEFAULT);
+		hdmi_write1(sc, HDMI_PHY_I2CM_FS_LCNT1, 0x00);
+		hdmi_write1(sc, HDMI_PHY_I2CM_FS_LCNT0,
+		    HDMI_PHY_I2CM_FS_LCNT0_DEFAULT);
+		hdmi_write1(sc, HDMI_PHY_I2CM_SDA_HOLD,
+		    HDMI_PHY_I2CM_SDA_HOLD_DEFAULT);
+
+		cfg0 = hdmi_read1(sc, HDMI_PHY_CONF0);
+		cfg0 |= HDMI_PHY_CONF0_SELDATAENPOL | HDMI_PHY_CONF0_PDDQ;
+		cfg0 &= ~(HDMI_PHY_CONF0_SELDIPIF | HDMI_PHY_CONF0_ENTMDS |
+		    HDMI_PHY_CONF0_PDZ | HDMI_PHY_CONF0_TXPWRON |
+		    HDMI_PHY_CONF0_SVSRET);
+		hdmi_write1(sc, HDMI_PHY_CONF0, cfg0);
+		DELAY(1000);
+
+		if (rk_kms_hdmi_phy_i2c_write(sc,
+		    HDMI_PHY_I2C_CPCE_CTRL, mpll->cpce) != 0 ||
+		    rk_kms_hdmi_phy_i2c_write(sc,
+		    HDMI_PHY_I2C_GMPCTRL, mpll->gmp) != 0 ||
+		    rk_kms_hdmi_phy_i2c_write(sc,
+		    HDMI_PHY_I2C_CURRCTRL, mpll->curr) != 0 ||
+		    rk_kms_hdmi_phy_i2c_write(sc,
+		    HDMI_PHY_I2C_PLLPHBYCTRL, 0x0000) != 0 ||
+		    rk_kms_hdmi_phy_i2c_write(sc,
+		    HDMI_PHY_I2C_MSM_CTRL, HDMI_PHY_MSM_CTRL_FB_CLK) != 0 ||
+		    rk_kms_hdmi_phy_i2c_write(sc,
+		    HDMI_PHY_I2C_TXTERM, phy->term) != 0 ||
+		    rk_kms_hdmi_phy_i2c_write(sc,
+		    HDMI_PHY_I2C_CKSYMTXCTRL, phy->sym) != 0 ||
+		    rk_kms_hdmi_phy_i2c_write(sc,
+		    HDMI_PHY_I2C_VLEVCTRL, phy->vlev) != 0 ||
+		    rk_kms_hdmi_phy_i2c_write(sc,
+		    HDMI_PHY_I2C_CKCALCTRL,
+		    HDMI_PHY_I2C_CKCALCTRL_OVERRIDE) != 0)
+			return (EIO);
+
+		cfg0 = hdmi_read1(sc, HDMI_PHY_CONF0);
+		cfg0 |= HDMI_PHY_CONF0_PDZ;
+		hdmi_write1(sc, HDMI_PHY_CONF0, cfg0);
+		DELAY(1000);
+
+		cfg0 &= ~HDMI_PHY_CONF0_ENTMDS;
+		hdmi_write1(sc, HDMI_PHY_CONF0, cfg0);
+		DELAY(1000);
+		cfg0 |= HDMI_PHY_CONF0_ENTMDS;
+		hdmi_write1(sc, HDMI_PHY_CONF0, cfg0);
+		DELAY(1000);
+
+		cfg0 |= HDMI_PHY_CONF0_TXPWRON | HDMI_PHY_CONF0_SVSRET;
+		cfg0 &= ~HDMI_PHY_CONF0_PDDQ;
+		hdmi_write1(sc, HDMI_PHY_CONF0, cfg0);
+		DELAY(5000);
+	}
+
+	hdmi_write1(sc, HDMI_MC_CLKDIS, 0x00);
+	hdmi_write1(sc, HDMI_FC_VSYNCINWIDTH, (uint8_t)vsync_len);
+	rk_kms_hdmi_toggle_main_reset(sc,
+	    HDMI_MC_SWRST_TMDS | HDMI_MC_SWRST_PIXEL);
+
+	for (timeout = 20; timeout > 0; timeout--) {
+		DELAY(5000);
+		if ((hdmi_read1(sc, HDMI_PHY_STAT0) & 0x01) != 0) {
+			DPRINTF(sc, "PHY locked at %u kHz "
+			    "(mpll=%04x phy_sym=%04x)\n", mode->clock,
+			    mpll->cpce, phy->sym);
+			return (0);
+		}
+	}
+	DPRINTF(sc, "PHY pll lock timeout stat0=0x%02x lock=0x%02x "
+	    "conf0=0x%02x\n",
+	    hdmi_read1(sc, HDMI_PHY_STAT0),
+	    hdmi_read1(sc, HDMI_MC_LOCKONCLOCK),
+	    hdmi_read1(sc, HDMI_PHY_CONF0));
+	return (ETIMEDOUT);
 }
 
 /*
@@ -616,6 +1010,18 @@ rk_kms_vop_program_timing(struct rk_kms_softc *sc,
 
 	rk_kms_vop_program_win0(sc, mode, fb, hact_start, vact_start);
 
+	/*
+	 * HDMI bring-up — PHY only in 9f part 1.  TMDS framer + AVI
+	 * infoframes land in 9f part 2; until then the panel won't see
+	 * a clean signal even with hdmi_enable=1, but the PHY locking
+	 * to the requested clock is itself the diagnostic value.
+	 */
+	if (sc->hdmi_enable != 0 && sc->output == RK_KMS_OUT_HDMI) {
+		error = rk_kms_hdmi_phy_init(sc, mode);
+		if (error != 0)
+			DPRINTF(sc, "HDMI PHY init failed: %d\n", error);
+	}
+
 	/* Shadow-register commit.  Same value-of-1 the rk_drm reference
 	 * uses to latch the timing block in one shot. */
 	vop_big_write(sc, VOP_REG_CFG_DONE, 0x00010001);
@@ -847,6 +1253,11 @@ rk_kms_attach(device_t dev)
 	    "output", CTLFLAG_RW, &sc->output, 0,
 	    "Output selector: 0 = HDMI, 1 = USB-C DP (Phase 9e: GRF mux "
 	    "only; DP bring-up TBD)");
+	SYSCTL_ADD_INT(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "hdmi_enable", CTLFLAG_RW, &sc->hdmi_enable, 0,
+	    "Enable DW HDMI PHY bring-up on set_config "
+	    "(Phase 9f part 1: PHY only)");
 
 	device_printf(dev, "registered (Phase 9c: VOP code wired behind "
 	    "commit_modeset sysctl, default off)\n");
