@@ -32,6 +32,7 @@
 #include <sys/module.h>
 #include <sys/rman.h>
 
+#include <arm/include/fdt.h>
 #include <machine/bus.h>
 
 #include <dev/ofw/ofw_bus.h>
@@ -45,11 +46,41 @@
 #include <kms/drm_device.h>
 #include <kms/drm_drv.h>
 #include <kms/drm_encoder.h>
+#include <kms/drm_framebuffer.h>
 #include <kms/drm_mode_config.h>
 #include <kms/drm_modes.h>
 #include <kms/drm_plane.h>
 
 #define	RK_KMS_DESC	"Rockchip RK3399 display (kms)"
+
+/*
+ * RK3399 hardware-block physical addresses.  Lifted verbatim from
+ * sys/arm64/rockchip/rk_drm_hw.c (rk_drm.c reference) — the same
+ * SoC, the same map.  Phase 9b owns these mappings; Phase 9c writes
+ * registers through them.
+ *
+ * VOP_BIG  : 4K-capable big VOP, primary scanout for the HDMI path.
+ * VOP_LIT  : Secondary VOP used for dual-VOP coexistence (HDMI on
+ *            VOP_LIT, USB-C DP on VOP_BIG) — mapped but unused until
+ *            Phase 9e.
+ * GRF      : General Register Files, holds SOC_CON6 (output mux) and
+ *            related bridge-routing knobs.
+ * CRU      : Clock & Reset Unit, gates DCLK lanes.
+ * PMU      : Power Management Unit (display power domain).
+ * PMUCRU   : PMU's CRU.
+ */
+#define	RK3399_VOP_BIG_PA	0xff900000UL
+#define	RK3399_VOP_BIG_SIZE	0x10000UL
+#define	RK3399_VOP_LIT_PA	0xff8f0000UL
+#define	RK3399_VOP_LIT_SIZE	0x10000UL
+#define	RK3399_GRF_PA		0xff770000UL
+#define	RK3399_GRF_SIZE		0x10000UL
+#define	RK3399_CRU_PA		0xff760000UL
+#define	RK3399_CRU_SIZE		0x1000UL
+#define	RK3399_PMU_PA		0xff310000UL
+#define	RK3399_PMU_SIZE		0x1000UL
+#define	RK3399_PMUCRU_PA	0xff750000UL
+#define	RK3399_PMUCRU_SIZE	0x1000UL
 
 struct rk_kms_softc {
 	device_t			 dev;
@@ -61,6 +92,21 @@ struct rk_kms_softc {
 	struct drm_plane		 primary;
 	struct drm_encoder		 encoder;
 	struct drm_connector		 connector;
+
+	/*
+	 * MMIO mappings.  bsh / size pairs follow the rk_drm reference.
+	 * Phase 9b maps them; Phase 9c starts writing.  Unmapped on
+	 * detach.  hw_attached gates writes against a half-attached
+	 * driver.
+	 */
+	bus_space_tag_t			 bst;
+	bus_space_handle_t		 vop_big_bsh;
+	bus_space_handle_t		 vop_lit_bsh;
+	bus_space_handle_t		 grf_bsh;
+	bus_space_handle_t		 cru_bsh;
+	bus_space_handle_t		 pmu_bsh;
+	bus_space_handle_t		 pmucru_bsh;
+	bool				 hw_attached;
 };
 
 static const struct ofw_compat_data rk_kms_compat_data[] = {
@@ -113,7 +159,36 @@ rk_kms_get_modes(struct drm_connector *connector)
 	return (1);
 }
 
-static const struct drm_crtc_funcs rk_kms_crtc_funcs = { 0 };
+/*
+ * Phase 9b set_config: log the proposed modeline + framebuffer so
+ * userspace verification (drm_probe / xrandr) shows the framework
+ * accepted the request.  No register writes yet — Phase 9c lifts
+ * vop_init_mode / vop_enable_overlay from rk_drm into a real
+ * modeset.  Storing nothing on the CRTC is intentional: the framework
+ * already records mode_valid / x / y / primary_fb after this returns.
+ */
+static int
+rk_kms_set_config(struct drm_mode_set *set)
+{
+	struct rk_kms_softc *sc;
+
+	sc = set->crtc->dev->driver_priv;
+	if (set->mode != NULL) {
+		device_printf(sc->dev,
+		    "set_config: %ux%u clock=%u fb=%u (Phase 9b: log only)\n",
+		    set->mode->hdisplay, set->mode->vdisplay,
+		    set->mode->clock,
+		    set->fb != NULL ? set->fb->base.id : 0);
+	} else {
+		device_printf(sc->dev,
+		    "set_config: blank (Phase 9b: log only)\n");
+	}
+	return (0);
+}
+
+static const struct drm_crtc_funcs rk_kms_crtc_funcs = {
+	.set_config = rk_kms_set_config,
+};
 static const struct drm_plane_funcs rk_kms_plane_funcs = { 0 };
 static const struct drm_encoder_funcs rk_kms_encoder_funcs = { 0 };
 static const struct drm_connector_funcs rk_kms_connector_funcs = {
@@ -170,6 +245,74 @@ rk_kms_topology_teardown(struct rk_kms_softc *sc)
 	kms_crtc_cleanup(&sc->crtc);
 }
 
+/*
+ * MMIO map / unmap helpers.  Both VOPs + GRF + CRU + PMU + PMUCRU
+ * are mapped at attach time — total ~84 KiB of kernel virtual.  The
+ * memory cost is trivial and pre-mapping keeps the modeset path
+ * (Phase 9c) free of failable allocations.  Unmapped symmetrically
+ * on detach.
+ */
+static int
+rk_kms_hw_attach(struct rk_kms_softc *sc)
+{
+	int error = 0;
+
+	sc->bst = fdtbus_bs_tag;
+
+	error = bus_space_map(sc->bst, RK3399_VOP_BIG_PA,
+	    RK3399_VOP_BIG_SIZE, 0, &sc->vop_big_bsh);
+	if (error != 0)
+		return (error);
+	error = bus_space_map(sc->bst, RK3399_VOP_LIT_PA,
+	    RK3399_VOP_LIT_SIZE, 0, &sc->vop_lit_bsh);
+	if (error != 0)
+		return (error);
+	error = bus_space_map(sc->bst, RK3399_GRF_PA, RK3399_GRF_SIZE, 0,
+	    &sc->grf_bsh);
+	if (error != 0)
+		return (error);
+	error = bus_space_map(sc->bst, RK3399_CRU_PA, RK3399_CRU_SIZE, 0,
+	    &sc->cru_bsh);
+	if (error != 0)
+		return (error);
+	error = bus_space_map(sc->bst, RK3399_PMU_PA, RK3399_PMU_SIZE, 0,
+	    &sc->pmu_bsh);
+	if (error != 0)
+		return (error);
+	error = bus_space_map(sc->bst, RK3399_PMUCRU_PA, RK3399_PMUCRU_SIZE,
+	    0, &sc->pmucru_bsh);
+	if (error != 0)
+		return (error);
+
+	sc->hw_attached = true;
+	device_printf(sc->dev,
+	    "MMIO mapped: VOP_BIG/LIT @ 0xff9{0,8f}0000 GRF @ 0xff770000 "
+	    "CRU @ 0xff760000\n");
+	return (0);
+}
+
+static void
+rk_kms_hw_detach(struct rk_kms_softc *sc)
+{
+	if (!sc->hw_attached)
+		return;
+	if (sc->vop_big_bsh != 0)
+		bus_space_unmap(sc->bst, sc->vop_big_bsh,
+		    RK3399_VOP_BIG_SIZE);
+	if (sc->vop_lit_bsh != 0)
+		bus_space_unmap(sc->bst, sc->vop_lit_bsh,
+		    RK3399_VOP_LIT_SIZE);
+	if (sc->grf_bsh != 0)
+		bus_space_unmap(sc->bst, sc->grf_bsh, RK3399_GRF_SIZE);
+	if (sc->cru_bsh != 0)
+		bus_space_unmap(sc->bst, sc->cru_bsh, RK3399_CRU_SIZE);
+	if (sc->pmu_bsh != 0)
+		bus_space_unmap(sc->bst, sc->pmu_bsh, RK3399_PMU_SIZE);
+	if (sc->pmucru_bsh != 0)
+		bus_space_unmap(sc->bst, sc->pmucru_bsh, RK3399_PMUCRU_SIZE);
+	sc->hw_attached = false;
+}
+
 static int
 rk_kms_probe(device_t dev)
 {
@@ -191,9 +334,16 @@ rk_kms_attach(device_t dev)
 	sc = device_get_softc(dev);
 	sc->dev = dev;
 
+	error = rk_kms_hw_attach(sc);
+	if (error != 0) {
+		device_printf(dev, "hw_attach: %d\n", error);
+		return (error);
+	}
+
 	error = kms_dev_register(&rk_kms_driver, sc, &sc->drm_dev);
 	if (error != 0) {
 		device_printf(dev, "kms_dev_register: %d\n", error);
+		rk_kms_hw_detach(sc);
 		return (error);
 	}
 
@@ -202,10 +352,12 @@ rk_kms_attach(device_t dev)
 		device_printf(dev, "topology init: %d\n", error);
 		kms_dev_unregister(sc->drm_dev);
 		sc->drm_dev = NULL;
+		rk_kms_hw_detach(sc);
 		return (error);
 	}
 
-	device_printf(dev, "registered (Phase 9a skeleton; no VOP yet)\n");
+	device_printf(dev, "registered (Phase 9b: MMIO mapped, set_config "
+	    "logs only — no VOP writes yet)\n");
 	return (0);
 }
 
@@ -220,6 +372,7 @@ rk_kms_detach(device_t dev)
 		kms_dev_unregister(sc->drm_dev);
 		sc->drm_dev = NULL;
 	}
+	rk_kms_hw_detach(sc);
 	return (0);
 }
 
