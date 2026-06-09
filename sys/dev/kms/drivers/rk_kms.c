@@ -31,6 +31,7 @@
 #include <sys/malloc.h>
 #include <sys/module.h>
 #include <sys/rman.h>
+#include <sys/sysctl.h>
 
 #include <arm/include/fdt.h>
 #include <machine/bus.h>
@@ -82,6 +83,29 @@
 #define	RK3399_PMUCRU_PA	0xff750000UL
 #define	RK3399_PMUCRU_SIZE	0x1000UL
 
+/*
+ * VOP register offsets (subset).  Names match Rockchip's RK3399 TRM
+ * §22 (Video Output Processor) and the in-tree rk_drm_hw.c symbols
+ * the existing driver uses.  Phase 9c writes only the timing block
+ * (HTOTAL / HACT / VTOTAL / VACT) plus the SYS_CTRL enable bit; that's
+ * enough to validate the addressing path without touching VPLL,
+ * win0 framebuffer setup, or the trigger register.
+ */
+#define	VOP_REG_CFG_DONE	0x0000
+#define	VOP_REG_SYS_CTRL	0x0008
+#define	VOP_REG_DSP_CTRL0	0x0010
+#define	VOP_REG_DSP_CTRL1	0x0014
+#define	VOP_REG_DSP_HTOTAL	0x0188
+#define	VOP_REG_DSP_HACT	0x018c
+#define	VOP_REG_DSP_VTOTAL	0x0190
+#define	VOP_REG_DSP_VACT	0x0194
+
+#define	VOP_SYS_CTRL_STANDBY	(1u << 22)
+#define	VOP_SYS_CTRL_MMU_EN	(1u << 20)
+#define	VOP_SYS_CTRL_ENABLE	(1u << 11)
+#define	VOP_SYS_CTRL_RGB_EN	(1u << 12)
+#define	VOP_SYS_CTRL_HDMI_EN	(1u << 13)
+
 struct rk_kms_softc {
 	device_t			 dev;
 	struct drm_device		*drm_dev;
@@ -107,6 +131,14 @@ struct rk_kms_softc {
 	bus_space_handle_t		 pmu_bsh;
 	bus_space_handle_t		 pmucru_bsh;
 	bool				 hw_attached;
+
+	/*
+	 * Sysctl gate for actual VOP register programming.  Defaults to
+	 * 0 (log-only) so the .ko is safe to kldload on a system whose
+	 * display is already live under rk_drm or vt.  Set
+	 * dev.rk_kms.0.commit_modeset=1 to enable real writes.
+	 */
+	int				 commit_modeset;
 };
 
 static const struct ofw_compat_data rk_kms_compat_data[] = {
@@ -160,13 +192,85 @@ rk_kms_get_modes(struct drm_connector *connector)
 }
 
 /*
- * Phase 9b set_config: log the proposed modeline + framebuffer so
- * userspace verification (drm_probe / xrandr) shows the framework
- * accepted the request.  No register writes yet — Phase 9c lifts
- * vop_init_mode / vop_enable_overlay from rk_drm into a real
- * modeset.  Storing nothing on the CRTC is intentional: the framework
- * already records mode_valid / x / y / primary_fb after this returns.
+ * VOP MMIO accessors.  Phase 9c uses VOP_BIG only; Phase 9e wires
+ * VOP_LIT for the HDMI side of the dual-VOP coexistence path.
  */
+static inline uint32_t
+vop_big_read(struct rk_kms_softc *sc, bus_size_t off)
+{
+	return (bus_space_read_4(sc->bst, sc->vop_big_bsh, off));
+}
+
+static inline void
+vop_big_write(struct rk_kms_softc *sc, bus_size_t off, uint32_t val)
+{
+	bus_space_write_4(sc->bst, sc->vop_big_bsh, off, val);
+}
+
+/*
+ * Compute VOP DSP timing field values from a drm_display_mode.  Same
+ * arithmetic the in-tree rk_drm uses: HACT_ST is the offset from the
+ * sync-start to the active area, formed as (htotal - hsync_start +
+ * hskew).  The trailing END value is start + display extent.
+ */
+static uint32_t
+rk_kms_hact_start(const struct drm_display_mode *m)
+{
+	return ((uint32_t)(m->htotal - m->hsync_start) + m->hskew);
+}
+
+static uint32_t
+rk_kms_vact_start(const struct drm_display_mode *m)
+{
+	return ((uint32_t)(m->vtotal - m->vsync_start));
+}
+
+/*
+ * Phase 9c "real" modeset.  Programs the VOP_BIG timing block + flips
+ * SYS_CTRL out of standby and into HDMI-driven RGB mode.  Does NOT
+ * touch:
+ *   - VPLL (DCLK frequency) — Phase 9c assumes whatever U-Boot or the
+ *     previous driver left in place is close enough to the requested
+ *     pixel clock for the validation pattern to be readable.  Phase
+ *     9d wires the CRU CLKSEL_CON47/49 dance from the rk_drm reference.
+ *   - WIN0 framebuffer setup — that needs the scanout buffer's
+ *     physical base, which arrives in Phase 9d alongside the page-
+ *     flip path.
+ *   - HDMI PHY / EDID / TMDS — Phase 9e.
+ * What we DO program is exactly the surface that lets a logic analyzer
+ * see the VOP emitting the right vsync rate, which is the cheapest way
+ * to validate the addressing chain on real silicon.
+ */
+static void
+rk_kms_vop_program_timing(struct rk_kms_softc *sc,
+    const struct drm_display_mode *mode)
+{
+	uint32_t hact_start = rk_kms_hact_start(mode);
+	uint32_t vact_start = rk_kms_vact_start(mode);
+	uint32_t hsync_len = mode->hsync_end - mode->hsync_start;
+	uint32_t vsync_len = mode->vsync_end - mode->vsync_start;
+	uint32_t sys_ctrl;
+
+	sys_ctrl = vop_big_read(sc, VOP_REG_SYS_CTRL);
+	sys_ctrl &= ~(VOP_SYS_CTRL_STANDBY | VOP_SYS_CTRL_MMU_EN);
+	sys_ctrl |= VOP_SYS_CTRL_ENABLE | VOP_SYS_CTRL_RGB_EN |
+	    VOP_SYS_CTRL_HDMI_EN;
+	vop_big_write(sc, VOP_REG_SYS_CTRL, sys_ctrl);
+
+	vop_big_write(sc, VOP_REG_DSP_HTOTAL,
+	    ((uint32_t)mode->htotal << 16) | hsync_len);
+	vop_big_write(sc, VOP_REG_DSP_HACT,
+	    (hact_start << 16) | (hact_start + mode->hdisplay));
+	vop_big_write(sc, VOP_REG_DSP_VTOTAL,
+	    ((uint32_t)mode->vtotal << 16) | vsync_len);
+	vop_big_write(sc, VOP_REG_DSP_VACT,
+	    (vact_start << 16) | (vact_start + mode->vdisplay));
+
+	/* Shadow-register commit.  Same value-of-1 the rk_drm reference
+	 * uses to latch the timing block in one shot. */
+	vop_big_write(sc, VOP_REG_CFG_DONE, 0x00010001);
+}
+
 static int
 rk_kms_set_config(struct drm_mode_set *set)
 {
@@ -175,13 +279,24 @@ rk_kms_set_config(struct drm_mode_set *set)
 	sc = set->crtc->dev->driver_priv;
 	if (set->mode != NULL) {
 		device_printf(sc->dev,
-		    "set_config: %ux%u clock=%u fb=%u (Phase 9b: log only)\n",
+		    "set_config: %ux%u clock=%u fb=%u commit=%d\n",
 		    set->mode->hdisplay, set->mode->vdisplay,
 		    set->mode->clock,
-		    set->fb != NULL ? set->fb->base.id : 0);
+		    set->fb != NULL ? set->fb->base.id : 0,
+		    sc->commit_modeset);
+		if (sc->commit_modeset != 0 && sc->hw_attached)
+			rk_kms_vop_program_timing(sc, set->mode);
 	} else {
-		device_printf(sc->dev,
-		    "set_config: blank (Phase 9b: log only)\n");
+		device_printf(sc->dev, "set_config: blank (commit=%d)\n",
+		    sc->commit_modeset);
+		if (sc->commit_modeset != 0 && sc->hw_attached) {
+			uint32_t sys_ctrl;
+
+			sys_ctrl = vop_big_read(sc, VOP_REG_SYS_CTRL);
+			sys_ctrl |= VOP_SYS_CTRL_STANDBY;
+			vop_big_write(sc, VOP_REG_SYS_CTRL, sys_ctrl);
+			vop_big_write(sc, VOP_REG_CFG_DONE, 0x00010001);
+		}
 	}
 	return (0);
 }
@@ -356,8 +471,13 @@ rk_kms_attach(device_t dev)
 		return (error);
 	}
 
-	device_printf(dev, "registered (Phase 9b: MMIO mapped, set_config "
-	    "logs only — no VOP writes yet)\n");
+	SYSCTL_ADD_INT(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "commit_modeset", CTLFLAG_RW, &sc->commit_modeset, 0,
+	    "Actually program VOP registers on set_config (0 = log only)");
+
+	device_printf(dev, "registered (Phase 9c: VOP code wired behind "
+	    "commit_modeset sysctl, default off)\n");
 	return (0);
 }
 
