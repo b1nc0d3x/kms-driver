@@ -59,6 +59,26 @@
 #include <kms/drm_plane.h>
 #include <kms/drm_vblank.h>
 
+/*
+ * Cadence MHDP (USB-C DP) entry points.  rk_cdn_dp.c declares these
+ * as exported; we MODULE_DEPEND on rk_cdn_dp so the kernel linker
+ * resolves them at load time (no runtime symbol lookup — see the
+ * mhorne review feedback rule that cost a previous PR a round-trip).
+ * auto_bringup_default runs the full 19-stage bring-up the user
+ * already validated under rk_drm.  enable_mode programs the framer
+ * timing.  set_video_active drives the framer enable bit.
+ */
+int	rk_cdn_dp_auto_bringup_default(void);
+int	rk_cdn_dp_enable_mode(uint32_t clock, uint16_t hdisplay,
+	    uint16_t hsync_start, uint16_t hsync_end, uint16_t htotal,
+	    uint16_t vdisplay, uint16_t vsync_start, uint16_t vsync_end,
+	    uint16_t vtotal, uint32_t flags);
+int	rk_cdn_dp_set_video_active_first(bool active);
+
+struct rk_kms_softc;
+static int rk_kms_dp_modeset(struct rk_kms_softc *sc,
+    const struct drm_display_mode *mode);
+
 #define	RK_KMS_DESC	"Rockchip RK3399 display (kms)"
 
 /*
@@ -442,6 +462,15 @@ struct rk_kms_softc {
 	 * to validate vsync/hsync timing on a logic analyzer).
 	 */
 	int				 hdmi_enable;
+
+	/*
+	 * Gate for USB-C DP bring-up.  Defaults 0.  With output=DP and
+	 * dp_enable=1, set_config calls rk_cdn_dp_auto_bringup_default
+	 * (idempotent — succeeds quickly if the user already brought
+	 * the link up via sysctl), then rk_cdn_dp_enable_mode, then
+	 * rk_cdn_dp_set_video_active_first(true).
+	 */
+	int				 dp_enable;
 
 	/*
 	 * VBLANK ticker: a self-rearming timeout_task on
@@ -1242,9 +1271,85 @@ rk_kms_vop_program_timing(struct rk_kms_softc *sc,
 		}
 	}
 
+	if (sc->dp_enable != 0 && sc->output == RK_KMS_OUT_DP)
+		(void)rk_kms_dp_modeset(sc, mode);
+
 	/* Shadow-register commit.  Same value-of-1 the rk_drm reference
 	 * uses to latch the timing block in one shot. */
 	vop_big_write(sc, VOP_REG_CFG_DONE, 0x00010001);
+}
+
+/*
+ * Translate kms mode flags to the bit set rk_cdn_dp_enable_mode
+ * expects.  rk_cdn_dp's "flags" argument carries the DRM_MODE_FLAG_*
+ * polarity bits (PHSYNC / NHSYNC / PVSYNC / NVSYNC) plus the
+ * interlace bit, in the same encoding the Linux uapi uses.  The
+ * kms-side constants match the uapi by design (Phase 5), so
+ * the conversion is a 1:1 copy with a narrow type cast.
+ */
+static uint32_t
+rk_kms_dp_mode_flags(const struct drm_display_mode *m)
+{
+	uint32_t f = 0;
+
+	if (m->flags & KMS_MODE_FLAG_PHSYNC)
+		f |= 0x0001u;
+	if (m->flags & KMS_MODE_FLAG_NHSYNC)
+		f |= 0x0002u;
+	if (m->flags & KMS_MODE_FLAG_PVSYNC)
+		f |= 0x0004u;
+	if (m->flags & KMS_MODE_FLAG_NVSYNC)
+		f |= 0x0008u;
+	if (m->flags & KMS_MODE_FLAG_INTERLACE)
+		f |= 0x0010u;
+	return (f);
+}
+
+/*
+ * Drive the Cadence MHDP DP TX through a modeset.  Three calls in
+ * order: auto-bringup (idempotent — fast no-op once link is up),
+ * enable_mode (programs framer timing from the modeline), and
+ * set_video_active(true) (flips the video-on enable bit).  All three
+ * are exported by rk_cdn_dp; MODULE_DEPEND below pulls them in at
+ * load time.
+ *
+ * Logs the bring-up + enable_mode results via DPRINTF.  A failure in
+ * auto-bringup typically means the USB-C cable orientation or PD
+ * altmode hasn't latched yet; that's recoverable by retrying the
+ * modeset once the user wiggles the cable or the fusb302 stack
+ * completes its altmode handshake.  rk_cdn_dp owns the retry loop;
+ * we just call it.
+ */
+static int
+rk_kms_dp_modeset(struct rk_kms_softc *sc,
+    const struct drm_display_mode *mode)
+{
+	int error;
+
+	error = rk_cdn_dp_auto_bringup_default();
+	if (error != 0) {
+		DPRINTF(sc, "DP auto-bringup failed: %d\n", error);
+		return (error);
+	}
+
+	error = rk_cdn_dp_enable_mode(mode->clock,
+	    mode->hdisplay, mode->hsync_start, mode->hsync_end,
+	    mode->htotal, mode->vdisplay, mode->vsync_start,
+	    mode->vsync_end, mode->vtotal,
+	    rk_kms_dp_mode_flags(mode));
+	if (error != 0) {
+		DPRINTF(sc, "DP enable_mode failed: %d\n", error);
+		return (error);
+	}
+
+	error = rk_cdn_dp_set_video_active_first(true);
+	if (error != 0) {
+		DPRINTF(sc, "DP set_video_active failed: %d\n", error);
+		return (error);
+	}
+	DPRINTF(sc, "DP modeset %ux%u clock=%u: video active\n",
+	    mode->hdisplay, mode->vdisplay, mode->clock);
+	return (0);
 }
 
 /*
@@ -1538,6 +1643,11 @@ rk_kms_attach(device_t dev)
 	    "vblank_enable", CTLFLAG_RW, &sc->vblank_enable, 0,
 	    "Run a software vblank ticker at the active mode's "
 	    "refresh rate (Phase 9g part 2)");
+	SYSCTL_ADD_INT(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "dp_enable", CTLFLAG_RW, &sc->dp_enable, 0,
+	    "Drive Cadence MHDP DP TX through set_config "
+	    "(Phase 9h: requires output=1)");
 
 	device_printf(dev, "registered (Phase 9c: VOP code wired behind "
 	    "commit_modeset sysctl, default off)\n");
@@ -1576,3 +1686,12 @@ static driver_t rk_kms_driver_kdrv = {
 DRIVER_MODULE(rk_kms, simplebus, rk_kms_driver_kdrv, 0, 0);
 MODULE_VERSION(rk_kms, 1);
 MODULE_DEPEND(rk_kms, kms, 1, 1, 1);
+/*
+ * Phase 9h: hard dependency on rk_cdn_dp so the DP-side externs
+ * (auto_bringup_default, enable_mode, set_video_active_first)
+ * resolve at load time.  Matches the in-tree rkdev kernel where
+ * rk_cdn_dp is statically linked; on a stripped kernel without it,
+ * kldload rk_kms would (correctly) fail with "missing symbol"
+ * rather than crash later from a NULL function pointer.
+ */
+MODULE_DEPEND(rk_kms, rk_cdn_dp, 1, 1, 1);
