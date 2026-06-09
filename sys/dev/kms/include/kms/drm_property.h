@@ -77,7 +77,7 @@ struct drm_property {
 
 /*
  * Property blob.  Immutable byte array indexed by id.  Allocated from
- * drm_property_blob_create, freed when its refcount hits zero
+ * kms_property_blob_create, freed when its refcount hits zero
  * (released by destroy ioctl, or when no longer referenced as a
  * property value — Phase 8 conservative model is "blobs are
  * userspace-managed, destroyed when userspace says so").
@@ -104,34 +104,34 @@ TAILQ_HEAD(drm_object_property_list, drm_object_property);
 
 /* --- property registration --- */
 
-struct drm_property *drm_property_create_range(struct drm_device *dev,
+struct drm_property *kms_property_create_range(struct drm_device *dev,
 	    uint32_t flags, const char *name, uint64_t min, uint64_t max);
-struct drm_property *drm_property_create_object(struct drm_device *dev,
+struct drm_property *kms_property_create_object(struct drm_device *dev,
 	    uint32_t flags, const char *name, uint32_t obj_type);
-struct drm_property *drm_property_create_enum(struct drm_device *dev,
+struct drm_property *kms_property_create_enum(struct drm_device *dev,
 	    uint32_t flags, const char *name);
-int	drm_property_add_enum(struct drm_property *prop, uint64_t value,
+int	kms_property_add_enum(struct drm_property *prop, uint64_t value,
 	    const char *name);
-struct drm_property *drm_property_create_blob_prop(struct drm_device *dev,
+struct drm_property *kms_property_create_blob_prop(struct drm_device *dev,
 	    uint32_t flags, const char *name);
-void	drm_property_destroy(struct drm_property *prop);
+void	kms_property_destroy(struct drm_property *prop);
 
 /* --- per-object attachment + lookup --- */
 
-int	drm_object_attach_property(struct drm_mode_object *obj,
+int	kms_object_attach_property(struct drm_mode_object *obj,
 	    struct drm_property *prop, uint64_t default_value);
-int	drm_object_property_set_value(struct drm_mode_object *obj,
+int	kms_object_property_set_value(struct drm_mode_object *obj,
 	    struct drm_property *prop, uint64_t value);
-int	drm_object_property_get_value(struct drm_mode_object *obj,
+int	kms_object_property_get_value(struct drm_mode_object *obj,
 	    struct drm_property *prop, uint64_t *value_out);
-void	drm_object_properties_cleanup(struct drm_mode_object *obj);
+void	kms_object_properties_cleanup(struct drm_mode_object *obj);
 
 /* --- blob lifecycle --- */
 
-struct drm_property_blob *drm_property_blob_create(struct drm_device *dev,
+struct drm_property_blob *kms_property_blob_create(struct drm_device *dev,
 	    const void *data, size_t length);
-struct drm_property_blob *drm_property_blob_find(struct drm_device *dev,
+struct drm_property_blob *kms_property_blob_find(struct drm_device *dev,
 	    uint32_t id);
-void	drm_property_blob_destroy(struct drm_property_blob *blob);
+void	kms_property_blob_destroy(struct drm_property_blob *blob);
 
 #endif /* _KMS_DRM_PROPERTY_H_ */

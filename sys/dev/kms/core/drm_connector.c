@@ -77,7 +77,7 @@ kms_connector_init(struct drm_device *dev, struct drm_connector *connector,
 	if (error != 0)
 		return (error);
 	if (dev->mode_config.prop_connector_crtc_id != NULL)
-		drm_object_attach_property(&connector->base,
+		kms_object_attach_property(&connector->base,
 		    dev->mode_config.prop_connector_crtc_id, 0);
 	return (0);
 }
@@ -120,7 +120,7 @@ kms_connector_add_mode(struct drm_connector *connector,
 {
 	if (connector == NULL || mode == NULL)
 		return;
-	drm_mode_set_name(mode);
+	kms_mode_set_name(mode);
 	sx_xlock(&connector->dev->mode_config.mutex);
 	TAILQ_INSERT_TAIL(&connector->modes, mode, link);
 	connector->mode_count++;
@@ -137,7 +137,7 @@ kms_connector_modes_clear(struct drm_connector *connector)
 	sx_xlock(&connector->dev->mode_config.mutex);
 	while ((m = TAILQ_FIRST(&connector->modes)) != NULL) {
 		TAILQ_REMOVE(&connector->modes, m, link);
-		drm_mode_destroy(m);
+		kms_mode_destroy(m);
 	}
 	connector->mode_count = 0;
 	sx_xunlock(&connector->dev->mode_config.mutex);

@@ -57,7 +57,7 @@ struct drm_mode_config {
 	 * Standard properties registered at mode_config_init time and
 	 * attached to objects on their init paths.  Drivers may add more
 	 * properties via drm_property_create_* and attach via
-	 * drm_object_attach_property.  Phase 8 surface is the minimum
+	 * kms_object_attach_property.  Phase 8 surface is the minimum
 	 * an atomic-aware userspace (modesetting DDX, xf86-video-amdgpu-
 	 * style ports) actually queries.
 	 */
@@ -79,8 +79,8 @@ struct drm_mode_config {
 
 struct drm_device;
 
-void	drm_mode_config_init(struct drm_mode_config *mc);
-void	drm_mode_config_cleanup(struct drm_mode_config *mc);
-void	drm_mode_config_standard_properties_init(struct drm_device *dev);
+void	kms_mode_config_init(struct drm_mode_config *mc);
+void	kms_mode_config_cleanup(struct drm_mode_config *mc);
+void	kms_mode_config_standard_properties_init(struct drm_device *dev);
 
 #endif /* _KMS_DRM_MODE_CONFIG_H_ */

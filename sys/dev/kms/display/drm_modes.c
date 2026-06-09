@@ -17,20 +17,20 @@
 #include "kms_internal.h"
 
 struct drm_display_mode *
-drm_mode_create(void)
+kms_mode_create(void)
 {
 	return (malloc(sizeof(struct drm_display_mode), M_KMS,
 	    M_WAITOK | M_ZERO));
 }
 
 void
-drm_mode_destroy(struct drm_display_mode *mode)
+kms_mode_destroy(struct drm_display_mode *mode)
 {
 	free(mode, M_KMS);
 }
 
 uint32_t
-drm_mode_vrefresh(const struct drm_display_mode *mode)
+kms_mode_vrefresh(const struct drm_display_mode *mode)
 {
 	uint64_t num, den;
 
@@ -58,7 +58,7 @@ drm_mode_vrefresh(const struct drm_display_mode *mode)
 }
 
 void
-drm_mode_set_name(struct drm_display_mode *mode)
+kms_mode_set_name(struct drm_display_mode *mode)
 {
 	bool interlaced;
 
@@ -70,7 +70,7 @@ drm_mode_set_name(struct drm_display_mode *mode)
 }
 
 void
-drm_display_mode_to_modeinfo(const struct drm_display_mode *mode,
+kms_display_mode_to_modeinfo(const struct drm_display_mode *mode,
     struct drm_mode_modeinfo *info)
 {
 	size_t n;
@@ -87,7 +87,7 @@ drm_display_mode_to_modeinfo(const struct drm_display_mode *mode,
 	info->vsync_end = mode->vsync_end;
 	info->vtotal = mode->vtotal;
 	info->vscan = mode->vscan;
-	info->vrefresh = drm_mode_vrefresh(mode);
+	info->vrefresh = kms_mode_vrefresh(mode);
 	info->flags = mode->flags;
 	info->type = mode->type;
 	n = strnlen(mode->name, sizeof(mode->name));

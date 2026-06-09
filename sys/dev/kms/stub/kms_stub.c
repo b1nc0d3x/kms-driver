@@ -94,7 +94,7 @@ stub_connector_get_modes(struct drm_connector *connector)
 	if (connector->mode_count > 0)
 		return (0);
 
-	mode = drm_mode_create();
+	mode = kms_mode_create();
 	mode->clock = 148500;
 	mode->hdisplay = 1920;
 	mode->hsync_start = 2008;

@@ -50,7 +50,7 @@ drm_property_alloc(struct drm_device *dev, uint32_t flags, const char *name)
 }
 
 struct drm_property *
-drm_property_create_range(struct drm_device *dev, uint32_t flags,
+kms_property_create_range(struct drm_device *dev, uint32_t flags,
     const char *name, uint64_t min, uint64_t max)
 {
 	struct drm_property *prop;
@@ -70,7 +70,7 @@ drm_property_create_range(struct drm_device *dev, uint32_t flags,
 }
 
 struct drm_property *
-drm_property_create_object(struct drm_device *dev, uint32_t flags,
+kms_property_create_object(struct drm_device *dev, uint32_t flags,
     const char *name, uint32_t obj_type)
 {
 	struct drm_property *prop;
@@ -89,7 +89,7 @@ drm_property_create_object(struct drm_device *dev, uint32_t flags,
 }
 
 struct drm_property *
-drm_property_create_enum(struct drm_device *dev, uint32_t flags,
+kms_property_create_enum(struct drm_device *dev, uint32_t flags,
     const char *name)
 {
 	struct drm_property *prop;
@@ -106,7 +106,7 @@ drm_property_create_enum(struct drm_device *dev, uint32_t flags,
 }
 
 int
-drm_property_add_enum(struct drm_property *prop, uint64_t value,
+kms_property_add_enum(struct drm_property *prop, uint64_t value,
     const char *name)
 {
 	struct drm_property_enum *e;
@@ -128,7 +128,7 @@ drm_property_add_enum(struct drm_property *prop, uint64_t value,
 }
 
 struct drm_property *
-drm_property_create_blob_prop(struct drm_device *dev, uint32_t flags,
+kms_property_create_blob_prop(struct drm_device *dev, uint32_t flags,
     const char *name)
 {
 	struct drm_property *prop;
@@ -145,7 +145,7 @@ drm_property_create_blob_prop(struct drm_device *dev, uint32_t flags,
 }
 
 void
-drm_property_destroy(struct drm_property *prop)
+kms_property_destroy(struct drm_property *prop)
 {
 	struct drm_property_enum *e;
 
@@ -162,7 +162,7 @@ drm_property_destroy(struct drm_property *prop)
 /* --- per-object attach + set + get --- */
 
 int
-drm_object_attach_property(struct drm_mode_object *obj,
+kms_object_attach_property(struct drm_mode_object *obj,
     struct drm_property *prop, uint64_t default_value)
 {
 	struct drm_object_property *op;
@@ -190,7 +190,7 @@ drm_object_attach_property(struct drm_mode_object *obj,
 }
 
 int
-drm_object_property_set_value(struct drm_mode_object *obj,
+kms_object_property_set_value(struct drm_mode_object *obj,
     struct drm_property *prop, uint64_t value)
 {
 	struct drm_object_property *op;
@@ -205,7 +205,7 @@ drm_object_property_set_value(struct drm_mode_object *obj,
 }
 
 int
-drm_object_property_get_value(struct drm_mode_object *obj,
+kms_object_property_get_value(struct drm_mode_object *obj,
     struct drm_property *prop, uint64_t *value_out)
 {
 	struct drm_object_property *op;
@@ -220,7 +220,7 @@ drm_object_property_get_value(struct drm_mode_object *obj,
 }
 
 void
-drm_object_properties_cleanup(struct drm_mode_object *obj)
+kms_object_properties_cleanup(struct drm_mode_object *obj)
 {
 	struct drm_object_property *op;
 
@@ -234,7 +234,7 @@ drm_object_properties_cleanup(struct drm_mode_object *obj)
 /* --- blobs --- */
 
 struct drm_property_blob *
-drm_property_blob_create(struct drm_device *dev, const void *data,
+kms_property_blob_create(struct drm_device *dev, const void *data,
     size_t length)
 {
 	struct drm_property_blob *blob;
@@ -265,7 +265,7 @@ drm_property_blob_create(struct drm_device *dev, const void *data,
 }
 
 struct drm_property_blob *
-drm_property_blob_find(struct drm_device *dev, uint32_t id)
+kms_property_blob_find(struct drm_device *dev, uint32_t id)
 {
 	struct drm_mode_object *obj;
 
@@ -276,7 +276,7 @@ drm_property_blob_find(struct drm_device *dev, uint32_t id)
 }
 
 void
-drm_property_blob_destroy(struct drm_property_blob *blob)
+kms_property_blob_destroy(struct drm_property_blob *blob)
 {
 	if (blob == NULL)
 		return;

@@ -75,35 +75,35 @@ TAILQ_HEAD(drm_display_mode_list, drm_display_mode);
 
 /*
  * Allocate a zeroed display mode in M_KMS.  Caller is the framework
- * (connector-side helpers) or driver code.  Free with drm_mode_destroy.
+ * (connector-side helpers) or driver code.  Free with kms_mode_destroy.
  */
-struct drm_display_mode *drm_mode_create(void);
+struct drm_display_mode *kms_mode_create(void);
 
 /*
- * Free a mode allocated by drm_mode_create.  The mode must not be on
+ * Free a mode allocated by kms_mode_create.  The mode must not be on
  * any connector's modes list when this is called.
  */
-void	drm_mode_destroy(struct drm_display_mode *mode);
+void	kms_mode_destroy(struct drm_display_mode *mode);
 
 /*
  * Compute a refresh rate (Hz) from the timing fields.  Used when a
  * driver provides hdisplay/htotal/vdisplay/vtotal/clock but doesn't
  * fill vrefresh.
  */
-uint32_t drm_mode_vrefresh(const struct drm_display_mode *mode);
+uint32_t kms_mode_vrefresh(const struct drm_display_mode *mode);
 
 /*
  * Auto-generate a name like "1920x1080" if the mode has no name set,
  * with an "i" suffix for interlaced.  Idempotent: called multiple
  * times produces the same string.
  */
-void	drm_mode_set_name(struct drm_display_mode *mode);
+void	kms_mode_set_name(struct drm_display_mode *mode);
 
 /*
  * Convert a kernel drm_display_mode into the uapi drm_mode_modeinfo
  * userspace receives in GETCONNECTOR.  Fills *info in place.
  */
-void	drm_display_mode_to_modeinfo(const struct drm_display_mode *mode,
+void	kms_display_mode_to_modeinfo(const struct drm_display_mode *mode,
 	    struct drm_mode_modeinfo *info);
 
 #endif /* _KMS_DRM_MODES_H_ */

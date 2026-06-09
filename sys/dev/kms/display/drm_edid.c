@@ -70,7 +70,7 @@ static const uint8_t drm_edid_header[8] = KMS_EDID_MAGIC;
 #define	EDID_OFFSET_VIMG_CM	22
 
 bool
-drm_edid_checksum(const uint8_t *data)
+kms_edid_checksum(const uint8_t *data)
 {
 	uint8_t sum = 0;
 	size_t i;
@@ -102,7 +102,7 @@ drm_edid_decode_pnp(uint16_t mfg, char out[4])
 }
 
 int
-drm_edid_parse(const uint8_t *data, size_t len, struct drm_edid_info *info)
+kms_edid_parse(const uint8_t *data, size_t len, struct drm_edid_info *info)
 {
 	uint16_t mfg_be;
 	uint8_t week, year_raw;
@@ -111,7 +111,7 @@ drm_edid_parse(const uint8_t *data, size_t len, struct drm_edid_info *info)
 		return (EINVAL);
 	if (memcmp(data, drm_edid_header, sizeof(drm_edid_header)) != 0)
 		return (EINVAL);
-	if (!drm_edid_checksum(data))
+	if (!kms_edid_checksum(data))
 		return (EINVAL);
 	if (info == NULL)
 		return (0);
@@ -184,7 +184,7 @@ drm_edid_dtd_to_mode(const uint8_t *dtd)
 	vimg = dtd[EDID_DTD_VIMG_LO] |
 	    ((uint16_t)(dtd[EDID_DTD_IMG_MSB] & 0x0f) << 8);
 
-	mode = drm_mode_create();
+	mode = kms_mode_create();
 	mode->clock = pixel_clock * 10;	/* DTD stores 10-kHz units */
 	mode->hdisplay = hactive;
 	mode->hsync_start = hactive + hsync_off;
@@ -217,7 +217,7 @@ drm_edid_dtd_to_mode(const uint8_t *dtd)
 }
 
 int
-drm_edid_add_modes(struct drm_connector *connector, const uint8_t *data,
+kms_edid_add_modes(struct drm_connector *connector, const uint8_t *data,
     size_t len)
 {
 	struct drm_edid_info info;
@@ -226,7 +226,7 @@ drm_edid_add_modes(struct drm_connector *connector, const uint8_t *data,
 	int error;
 	int i;
 
-	error = drm_edid_parse(data, len, &info);
+	error = kms_edid_parse(data, len, &info);
 	if (error != 0)
 		return (-error);
 

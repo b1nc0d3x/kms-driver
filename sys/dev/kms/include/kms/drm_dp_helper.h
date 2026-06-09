@@ -71,7 +71,7 @@ struct drm_dp_aux;
 
 /*
  * One AUX transaction.  Drivers populate the wire fields and pass to
- * their own .transfer callback (or to drm_dp_dpcd_read/write which
+ * their own .transfer callback (or to kms_dp_dpcd_read/write which
  * does it for them).  size carries the requested byte count; the
  * transfer's return value is the number of bytes actually exchanged
  * (which may be smaller on a partial reply — see DP 1.4 §2.7.5.5).
@@ -86,7 +86,7 @@ struct drm_dp_aux_msg {
 
 /*
  * Per-connector AUX channel.  Driver allocates, fills name +
- * .transfer, registers via drm_dp_aux_init.  drm_dp_aux is reused
+ * .transfer, registers via kms_dp_aux_init.  drm_dp_aux is reused
  * (no allocation) across multiple link-training cycles for the
  * same DP source.
  */
@@ -101,7 +101,7 @@ struct drm_dp_aux {
  * Initialize a drm_dp_aux struct in place.  Driver supplies its
  * transfer callback before calling.  No allocation.
  */
-void	drm_dp_aux_init(struct drm_dp_aux *aux);
+void	kms_dp_aux_init(struct drm_dp_aux *aux);
 
 /*
  * Submit a single native-AUX request.  Retries on DEFER per DP
@@ -109,17 +109,17 @@ void	drm_dp_aux_init(struct drm_dp_aux *aux);
  * byte count exchanged on success, or a negative errno on hard NACK,
  * transport failure, or exhausted retries.
  */
-ssize_t	drm_dp_aux_transfer(struct drm_dp_aux *aux,
+ssize_t	kms_dp_aux_transfer(struct drm_dp_aux *aux,
 	    struct drm_dp_aux_msg *msg);
 
 /*
  * Convenience: read or write `size` bytes from/to the DPCD at
- * `offset`.  Wraps drm_dp_aux_transfer and handles the size argument.
+ * `offset`.  Wraps kms_dp_aux_transfer and handles the size argument.
  * Returns bytes actually read/written, or a negative errno.
  */
-ssize_t	drm_dp_dpcd_read(struct drm_dp_aux *aux, uint32_t offset,
+ssize_t	kms_dp_dpcd_read(struct drm_dp_aux *aux, uint32_t offset,
 	    void *buffer, size_t size);
-ssize_t	drm_dp_dpcd_write(struct drm_dp_aux *aux, uint32_t offset,
+ssize_t	kms_dp_dpcd_write(struct drm_dp_aux *aux, uint32_t offset,
 	    const void *buffer, size_t size);
 
 #endif /* _KMS_DRM_DP_HELPER_H_ */

@@ -22,28 +22,28 @@ drm_plane_attach_standard_properties(struct drm_plane *plane)
 	struct drm_mode_object *o = &plane->base;
 
 	if (mc->prop_plane_type != NULL)
-		drm_object_attach_property(o, mc->prop_plane_type,
+		kms_object_attach_property(o, mc->prop_plane_type,
 		    (uint64_t)plane->type);
 	if (mc->prop_plane_fb_id != NULL)
-		drm_object_attach_property(o, mc->prop_plane_fb_id, 0);
+		kms_object_attach_property(o, mc->prop_plane_fb_id, 0);
 	if (mc->prop_plane_crtc_id != NULL)
-		drm_object_attach_property(o, mc->prop_plane_crtc_id, 0);
+		kms_object_attach_property(o, mc->prop_plane_crtc_id, 0);
 	if (mc->prop_plane_crtc_x != NULL)
-		drm_object_attach_property(o, mc->prop_plane_crtc_x, 0);
+		kms_object_attach_property(o, mc->prop_plane_crtc_x, 0);
 	if (mc->prop_plane_crtc_y != NULL)
-		drm_object_attach_property(o, mc->prop_plane_crtc_y, 0);
+		kms_object_attach_property(o, mc->prop_plane_crtc_y, 0);
 	if (mc->prop_plane_crtc_w != NULL)
-		drm_object_attach_property(o, mc->prop_plane_crtc_w, 0);
+		kms_object_attach_property(o, mc->prop_plane_crtc_w, 0);
 	if (mc->prop_plane_crtc_h != NULL)
-		drm_object_attach_property(o, mc->prop_plane_crtc_h, 0);
+		kms_object_attach_property(o, mc->prop_plane_crtc_h, 0);
 	if (mc->prop_plane_src_x != NULL)
-		drm_object_attach_property(o, mc->prop_plane_src_x, 0);
+		kms_object_attach_property(o, mc->prop_plane_src_x, 0);
 	if (mc->prop_plane_src_y != NULL)
-		drm_object_attach_property(o, mc->prop_plane_src_y, 0);
+		kms_object_attach_property(o, mc->prop_plane_src_y, 0);
 	if (mc->prop_plane_src_w != NULL)
-		drm_object_attach_property(o, mc->prop_plane_src_w, 0);
+		kms_object_attach_property(o, mc->prop_plane_src_w, 0);
 	if (mc->prop_plane_src_h != NULL)
-		drm_object_attach_property(o, mc->prop_plane_src_h, 0);
+		kms_object_attach_property(o, mc->prop_plane_src_h, 0);
 }
 
 int

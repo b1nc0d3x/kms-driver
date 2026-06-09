@@ -49,10 +49,10 @@ kms_crtc_init(struct drm_device *dev, struct drm_crtc *crtc,
 	 * blob bound).
 	 */
 	if (dev->mode_config.prop_crtc_active != NULL)
-		drm_object_attach_property(&crtc->base,
+		kms_object_attach_property(&crtc->base,
 		    dev->mode_config.prop_crtc_active, 0);
 	if (dev->mode_config.prop_crtc_mode_id != NULL)
-		drm_object_attach_property(&crtc->base,
+		kms_object_attach_property(&crtc->base,
 		    dev->mode_config.prop_crtc_mode_id, 0);
 	return (0);
 }

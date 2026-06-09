@@ -29,7 +29,7 @@ CFLAGS+=	-I${SRCTOP}/sys/dev/kms/uapi
 CFLAGS+=	-I${SRCTOP}/sys/dev/kms/core
 
 EXPORT_SYMS=	M_KMS \
-		drm_display_mode_to_modeinfo \
+		kms_display_mode_to_modeinfo \
 		kms_gem_handle_create \
 		kms_gem_handle_delete \
 		kms_gem_handle_lookup \
@@ -38,17 +38,17 @@ EXPORT_SYMS=	M_KMS \
 		kms_gem_object_lookup_offset \
 		kms_gem_object_put \
 		kms_gem_release_all \
-		drm_dp_aux_init \
-		drm_dp_aux_transfer \
-		drm_dp_dpcd_read \
-		drm_dp_dpcd_write \
-		drm_edid_add_modes \
-		drm_edid_checksum \
-		drm_edid_parse \
-		drm_mode_create \
-		drm_mode_destroy \
-		drm_mode_set_name \
-		drm_mode_vrefresh \
+		kms_dp_aux_init \
+		kms_dp_aux_transfer \
+		kms_dp_dpcd_read \
+		kms_dp_dpcd_write \
+		kms_edid_add_modes \
+		kms_edid_checksum \
+		kms_edid_parse \
+		kms_mode_create \
+		kms_mode_destroy \
+		kms_mode_set_name \
+		kms_mode_vrefresh \
 		kms_connector_add_mode \
 		kms_connector_attach_encoder \
 		kms_connector_cleanup \

@@ -55,7 +55,7 @@ kms_ioctl_mode_getcrtc(struct drm_file *file, struct drm_mode_crtc *r)
 	r->gamma_size = 0;
 	r->mode_valid = crtc->mode_valid;
 	if (crtc->mode_valid)
-		drm_display_mode_to_modeinfo(&crtc->mode, &r->mode);
+		kms_display_mode_to_modeinfo(&crtc->mode, &r->mode);
 	else
 		memset(&r->mode, 0, sizeof(r->mode));
 	sx_sunlock(&mc->mutex);
@@ -166,7 +166,7 @@ kms_ioctl_mode_getconnector(struct drm_file *file,
 		TAILQ_FOREACH(m, &connector->modes, link) {
 			if (i >= mode_n)
 				break;
-			drm_display_mode_to_modeinfo(m, &modeinfos[i++]);
+			kms_display_mode_to_modeinfo(m, &modeinfos[i++]);
 		}
 		mode_n = i;
 	}

@@ -254,7 +254,7 @@ kms_ioctl_mode_obj_setproperty(struct drm_file *file,
 	}
 
 	sx_xlock(&mc->mutex);
-	error = drm_object_property_set_value(obj, prop, r->value);
+	error = kms_object_property_set_value(obj, prop, r->value);
 	sx_xunlock(&mc->mutex);
 
 	kms_mode_object_put(prop_obj);
@@ -282,7 +282,7 @@ kms_ioctl_mode_createpropblob(struct drm_file *file,
 		free(buf, M_KMS);
 		return (error);
 	}
-	blob = drm_property_blob_create(file->dev, buf, r->length);
+	blob = kms_property_blob_create(file->dev, buf, r->length);
 	free(buf, M_KMS);
 	if (blob == NULL)
 		return (ENOMEM);
@@ -305,7 +305,7 @@ kms_ioctl_mode_destroypropblob(struct drm_file *file,
 		return (ENOENT);
 	blob = __containerof(obj, struct drm_property_blob, base);
 	kms_mode_object_put(obj);
-	drm_property_blob_destroy(blob);
+	kms_property_blob_destroy(blob);
 	return (0);
 }
 
@@ -447,7 +447,7 @@ kms_ioctl_mode_atomic(struct drm_file *file, struct drm_mode_atomic *r)
 		off = 0;
 		for (i = 0; i < r->count_objs; i++) {
 			for (j = 0; j < counts[i]; j++) {
-				(void)drm_object_property_set_value(
+				(void)kms_object_property_set_value(
 				    resolved[i], prop_resolved[off + j],
 				    values[off + j]);
 			}

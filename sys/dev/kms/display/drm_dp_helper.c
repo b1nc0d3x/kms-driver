@@ -23,7 +23,7 @@
 #define	DP_AUX_MAX_RETRIES	7
 
 void
-drm_dp_aux_init(struct drm_dp_aux *aux)
+kms_dp_aux_init(struct drm_dp_aux *aux)
 {
 	/*
 	 * No allocation; .transfer + .name + .priv are caller-filled
@@ -35,7 +35,7 @@ drm_dp_aux_init(struct drm_dp_aux *aux)
 }
 
 ssize_t
-drm_dp_aux_transfer(struct drm_dp_aux *aux, struct drm_dp_aux_msg *msg)
+kms_dp_aux_transfer(struct drm_dp_aux *aux, struct drm_dp_aux_msg *msg)
 {
 	ssize_t ret;
 	int retries;
@@ -74,7 +74,7 @@ drm_dp_aux_transfer(struct drm_dp_aux *aux, struct drm_dp_aux_msg *msg)
 }
 
 ssize_t
-drm_dp_dpcd_read(struct drm_dp_aux *aux, uint32_t offset, void *buffer,
+kms_dp_dpcd_read(struct drm_dp_aux *aux, uint32_t offset, void *buffer,
     size_t size)
 {
 	struct drm_dp_aux_msg msg;
@@ -84,11 +84,11 @@ drm_dp_dpcd_read(struct drm_dp_aux *aux, uint32_t offset, void *buffer,
 	msg.request = DP_AUX_NATIVE_READ;
 	msg.buffer = buffer;
 	msg.size = size;
-	return (drm_dp_aux_transfer(aux, &msg));
+	return (kms_dp_aux_transfer(aux, &msg));
 }
 
 ssize_t
-drm_dp_dpcd_write(struct drm_dp_aux *aux, uint32_t offset, const void *buffer,
+kms_dp_dpcd_write(struct drm_dp_aux *aux, uint32_t offset, const void *buffer,
     size_t size)
 {
 	struct drm_dp_aux_msg msg;
@@ -105,5 +105,5 @@ drm_dp_dpcd_write(struct drm_dp_aux *aux, uint32_t offset, const void *buffer,
 	 */
 	msg.buffer = __DECONST(void *, buffer);
 	msg.size = size;
-	return (drm_dp_aux_transfer(aux, &msg));
+	return (kms_dp_aux_transfer(aux, &msg));
 }

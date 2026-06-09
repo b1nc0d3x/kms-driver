@@ -28,7 +28,7 @@ struct drm_connector;
 					  0xff, 0xff, 0xff, 0x00 }
 
 /*
- * Decoded monitor identification.  Populated by drm_edid_parse from
+ * Decoded monitor identification.  Populated by kms_edid_parse from
  * the vendor block of a validated EDID.  pnp_id is a 3-character
  * Plug-and-Play vendor code (e.g. "SAM" for Samsung); the buffer
  * always has a NUL terminator at index 3.
@@ -49,16 +49,16 @@ struct drm_edid_info {
 /*
  * Verify the EDID block's checksum: every byte summed mod 256 must
  * equal 0.  Returns true on a good checksum.  Does not validate the
- * magic header — drm_edid_parse does that.
+ * magic header — kms_edid_parse does that.
  */
-bool	drm_edid_checksum(const uint8_t *data);
+bool	kms_edid_checksum(const uint8_t *data);
 
 /*
  * Validate + decode an EDID block.  data must be at least 128 bytes.
  * Returns 0 on success and fills *info; returns EINVAL on bad magic
  * or bad checksum.  info may be NULL when only validation is wanted.
  */
-int	drm_edid_parse(const uint8_t *data, size_t len,
+int	kms_edid_parse(const uint8_t *data, size_t len,
 	    struct drm_edid_info *info);
 
 /*
@@ -69,7 +69,7 @@ int	drm_edid_parse(const uint8_t *data, size_t len,
  * they weren't already set.  Returns the number of modes added on
  * success or a negative errno on failure.  On error nothing is added.
  */
-int	drm_edid_add_modes(struct drm_connector *connector,
+int	kms_edid_add_modes(struct drm_connector *connector,
 	    const uint8_t *data, size_t len);
 
 #endif /* _KMS_DRM_EDID_H_ */

@@ -34,7 +34,7 @@ struct drm_connector_funcs {
 	/*
 	 * Called from GETCONNECTOR (and any future "rescan") path when
 	 * the framework wants the connector's mode list refreshed.  The
-	 * hook builds mode entries with drm_mode_create() and adds them
+	 * hook builds mode entries with kms_mode_create() and adds them
 	 * via kms_connector_add_mode().  Returns the number of modes
 	 * added (>= 0) or a negative errno.  If NULL, the connector keeps
 	 * whatever modes the driver populated at init time (the stub
@@ -60,7 +60,7 @@ struct drm_connector {
 	/*
 	 * Available display modes.  Populated by the driver's get_modes
 	 * hook (called from GETCONNECTOR) or by hand at init.  Storage is
-	 * malloc'd via drm_mode_create and owned by the connector — freed
+	 * malloc'd via kms_mode_create and owned by the connector — freed
 	 * in cleanup.  Protected by drm_device->mode_config.mutex.
 	 */
 	struct drm_display_mode_list	 modes;
@@ -84,7 +84,7 @@ int	kms_connector_attach_encoder(struct drm_connector *connector,
  * Append a mode to the connector's mode list.  Connector takes
  * ownership of the storage — the mode is freed during
  * kms_connector_cleanup or kms_connector_modes_clear.
- * If the mode has no name, drm_mode_set_name is called to generate one.
+ * If the mode has no name, kms_mode_set_name is called to generate one.
  */
 void	kms_connector_add_mode(struct drm_connector *connector,
 	    struct drm_display_mode *mode);

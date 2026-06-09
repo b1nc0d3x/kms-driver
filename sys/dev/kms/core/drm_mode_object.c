@@ -129,7 +129,7 @@ kms_mode_object_unregister(struct drm_device *dev, struct drm_mode_object *obj)
 	 * the same lock that protects attach / set_value so a concurrent
 	 * GET sees either the full table or nothing — never half-freed.
 	 */
-	drm_object_properties_cleanup(obj);
+	kms_object_properties_cleanup(obj);
 	list = drm_mode_object_list_for_type(mc, obj->type);
 	count = drm_mode_object_count_for_type(mc, obj->type);
 	if (list != NULL) {
