@@ -210,7 +210,60 @@
 #define	HDMI_VP_STUFF		0x0802
 #define	HDMI_VP_REMAP		0x0803
 #define	HDMI_VP_CONF		0x0804
+#define	HDMI_FC_INVIDCONF	0x1000
+#define	HDMI_FC_INHACTV0	0x1001
+#define	HDMI_FC_INHACTV1	0x1002
+#define	HDMI_FC_INHBLANK0	0x1003
+#define	HDMI_FC_INHBLANK1	0x1004
+#define	HDMI_FC_INVACTV0	0x1005
+#define	HDMI_FC_INVACTV1	0x1006
+#define	HDMI_FC_INVBLANK	0x1007
+#define	HDMI_FC_HSYNCINDELAY0	0x1008
+#define	HDMI_FC_HSYNCINDELAY1	0x1009
+#define	HDMI_FC_HSYNCINWIDTH0	0x100a
+#define	HDMI_FC_HSYNCINWIDTH1	0x100b
+#define	HDMI_FC_VSYNCINDELAY	0x100c
 #define	HDMI_FC_VSYNCINWIDTH	0x100d
+#define	HDMI_FC_CTRLDUR		0x1011
+#define	HDMI_FC_EXCTRLDUR	0x1012
+#define	HDMI_FC_EXCTRLSPAC	0x1013
+#define	HDMI_FC_CH0PREAM	0x1014
+#define	HDMI_FC_CH1PREAM	0x1015
+#define	HDMI_FC_CH2PREAM	0x1016
+#define	HDMI_FC_AVICONF3	0x1017
+#define	HDMI_FC_GCP		0x1018
+#define	HDMI_FC_AVICONF0	0x1019
+#define	HDMI_FC_AVICONF1	0x101a
+#define	HDMI_FC_AVICONF2	0x101b
+#define	HDMI_FC_AVIVID		0x101c
+#define	HDMI_FC_PACKET_TX_EN	0x10e3
+#define	HDMI_PKT_SEND_CTL	0x0640
+#define	HDMI_A_HDCPCFG0		0x5000
+#define	HDMI_A_HDCPCFG1		0x5001
+#define	HDMI_A_VIDPOLCFG	0x5009
+
+#define	HDMI_FC_INVIDCONF_VSYNC_HIGH	0x40
+#define	HDMI_FC_INVIDCONF_HSYNC_HIGH	0x20
+#define	HDMI_FC_INVIDCONF_DE_HIGH	0x10
+#define	HDMI_FC_INVIDCONF_HDMI_MODE	0x08
+#define	HDMI_FC_INVIDCONF_R_V_BLANK_HIGH 0x02
+#define	HDMI_FC_INVIDCONF_INTERLACED	0x01
+#define	HDMI_FC_AVICONF1_PICTURE_ASPECT_4_3  (1u << 4)
+#define	HDMI_FC_AVICONF1_PICTURE_ASPECT_16_9 (2u << 4)
+#define	HDMI_FC_PACKET_TX_EN_AVI	(1u << 2)
+#define	HDMI_FC_PACKET_TX_EN_GCP	(1u << 1)
+#define	HDMI_A_HDCPCFG0_HDMIDVI		(1u << 0)
+#define	HDMI_A_HDCPCFG1_SWRESETN	(1u << 0)
+#define	HDMI_A_HDCPCFG1_ENCRYPTIONDISABLE (1u << 1)
+#define	HDMI_A_HDCPCFG1_PH2UPSHFTENC	(1u << 2)
+#define	HDMI_A_HDCPCFG1_DEFAULT					\
+	(HDMI_A_HDCPCFG1_SWRESETN |				\
+	 HDMI_A_HDCPCFG1_ENCRYPTIONDISABLE |			\
+	 HDMI_A_HDCPCFG1_PH2UPSHFTENC)
+#define	HDMI_A_VIDPOLCFG_DATAENPOL	(1u << 4)
+#define	HDMI_PKT_SEND_CTL_AVI_INFO_UP	(1u << 6)
+#define	HDMI_PKT_SEND_CTL_AVI_INFO_EN	(1u << 2)
+#define	HDMI_FC_VSYNCINWIDTH_DUMMY 0	/* unused, kept for symmetry */
 #define	HDMI_MC_CLKDIS		0x4001
 #define	HDMI_MC_SWRSTZREQ	0x4002
 #define	HDMI_MC_FLOWCTRL	0x4004
@@ -760,6 +813,150 @@ rk_kms_hdmi_phy_init(struct rk_kms_softc *sc,
 }
 
 /*
+ * CEA-861 Video Identification Code lookup.  rk_drm calls drm2's
+ * drm_mode_cea_vic; that's a symbol we can't use (drm2 collision
+ * rules).  Cover the common bring-up modes inline — VIC 16 for
+ * 1920x1080@60, 4 for 1280x720@60, 0 ("unknown / DVI mode") for
+ * anything else.  Returning 0 sends a generic AVI infoframe, which
+ * most sinks accept.  Phase 9g could grow the table but the 1080p
+ * row is what canned-mode tests use.
+ */
+static uint8_t
+rk_kms_cea_vic(const struct drm_display_mode *m)
+{
+	uint32_t refresh = kms_mode_vrefresh(m);
+
+	if (m->hdisplay == 1920 && m->vdisplay == 1080 && refresh == 60)
+		return (16);
+	if (m->hdisplay == 1280 && m->vdisplay == 720 && refresh == 60)
+		return (4);
+	if (m->hdisplay == 720 && m->vdisplay == 480 && refresh == 60)
+		return (3);
+	return (0);
+}
+
+/*
+ * Picture aspect ratio for the AVI infoframe.  Match rk_drm: 16:9 if
+ * the display extent satisfies hdisplay * 9 == vdisplay * 16, 4:3 if
+ * hdisplay * 3 == vdisplay * 4, otherwise unspecified (0).
+ */
+static uint8_t
+rk_kms_picture_aspect(const struct drm_display_mode *m)
+{
+	if ((uint32_t)m->hdisplay * 9 == (uint32_t)m->vdisplay * 16)
+		return (HDMI_FC_AVICONF1_PICTURE_ASPECT_16_9);
+	if ((uint32_t)m->hdisplay * 3 == (uint32_t)m->vdisplay * 4)
+		return (HDMI_FC_AVICONF1_PICTURE_ASPECT_4_3);
+	return (0);
+}
+
+/*
+ * Clear the TMDS-overflow latch.  Sequence lifted from rk_drm — drop
+ * TMDS out of reset, write INVIDCONF four times, then re-arm TMDS.
+ * Required after any change to FC_INVIDCONF because the IP latches
+ * the new sync polarity only after several writes.
+ */
+static void
+rk_kms_hdmi_clear_overflow(struct rk_kms_softc *sc)
+{
+	uint8_t swrstz, invidconf;
+	int i;
+
+	swrstz = hdmi_read1(sc, HDMI_MC_SWRSTZREQ);
+	hdmi_write1(sc, HDMI_MC_SWRSTZREQ, swrstz & ~HDMI_MC_SWRST_TMDS);
+	invidconf = hdmi_read1(sc, HDMI_FC_INVIDCONF);
+	for (i = 0; i < 4; i++)
+		hdmi_write1(sc, HDMI_FC_INVIDCONF, invidconf);
+	hdmi_write1(sc, HDMI_MC_SWRSTZREQ, swrstz | HDMI_MC_SWRST_TMDS);
+}
+
+/*
+ * Program the video composer's input timing block.  hdmi_mode = true
+ * sets HDMI_MODE in INVIDCONF (vs DVI).  All timing values are
+ * 12-bit-or-less and split across two 1-byte registers, low first.
+ */
+static void
+rk_kms_hdmi_program_av_composer(struct rk_kms_softc *sc,
+    const struct drm_display_mode *m, bool hdmi_mode)
+{
+	uint8_t inv;
+	uint16_t hblank = m->htotal - m->hdisplay;
+	uint16_t vblank = m->vtotal - m->vdisplay;
+	uint16_t hfp = m->hsync_start - m->hdisplay;
+	uint16_t vfp = m->vsync_start - m->vdisplay;
+	uint16_t hsync = m->hsync_end - m->hsync_start;
+	uint16_t vsync = m->vsync_end - m->vsync_start;
+
+	inv = HDMI_FC_INVIDCONF_DE_HIGH;
+	if (m->flags & KMS_MODE_FLAG_PVSYNC)
+		inv |= HDMI_FC_INVIDCONF_VSYNC_HIGH;
+	if (m->flags & KMS_MODE_FLAG_PHSYNC)
+		inv |= HDMI_FC_INVIDCONF_HSYNC_HIGH;
+	if (m->flags & KMS_MODE_FLAG_INTERLACE)
+		inv |= HDMI_FC_INVIDCONF_R_V_BLANK_HIGH |
+		    HDMI_FC_INVIDCONF_INTERLACED;
+	if (hdmi_mode)
+		inv |= HDMI_FC_INVIDCONF_HDMI_MODE;
+
+	hdmi_write1(sc, HDMI_FC_INVIDCONF, inv);
+	hdmi_write1(sc, HDMI_FC_INHACTV1, (m->hdisplay >> 8) & 0xff);
+	hdmi_write1(sc, HDMI_FC_INHACTV0, m->hdisplay & 0xff);
+	hdmi_write1(sc, HDMI_FC_INVACTV1, (m->vdisplay >> 8) & 0xff);
+	hdmi_write1(sc, HDMI_FC_INVACTV0, m->vdisplay & 0xff);
+	hdmi_write1(sc, HDMI_FC_INHBLANK1, (hblank >> 8) & 0xff);
+	hdmi_write1(sc, HDMI_FC_INHBLANK0, hblank & 0xff);
+	hdmi_write1(sc, HDMI_FC_INVBLANK, vblank & 0xff);
+	hdmi_write1(sc, HDMI_FC_HSYNCINDELAY1, (hfp >> 8) & 0xff);
+	hdmi_write1(sc, HDMI_FC_HSYNCINDELAY0, hfp & 0xff);
+	hdmi_write1(sc, HDMI_FC_VSYNCINDELAY, vfp & 0xff);
+	hdmi_write1(sc, HDMI_FC_HSYNCINWIDTH1, (hsync >> 8) & 0xff);
+	hdmi_write1(sc, HDMI_FC_HSYNCINWIDTH0, hsync & 0xff);
+	hdmi_write1(sc, HDMI_FC_VSYNCINWIDTH, vsync & 0xff);
+
+	hdmi_write1(sc, HDMI_FC_AVIVID, rk_kms_cea_vic(m));
+}
+
+/*
+ * Bring the DW HDMI controller into HDMI mode for the active modeline.
+ * Programs the video composer, AVI infoframe, AVI-packet enables, and
+ * HDCP shim into their open/disabled state.  Called after PHY init
+ * completes.  Mirrors rk_drm_hdmi_enable_hdmi_mode.
+ */
+static void
+rk_kms_hdmi_enable(struct rk_kms_softc *sc,
+    const struct drm_display_mode *m)
+{
+	uint8_t hdcpcfg0, pkt_en, aspect, vic;
+
+	rk_kms_hdmi_program_av_composer(sc, m, true);
+	aspect = rk_kms_picture_aspect(m);
+	vic = rk_kms_cea_vic(m);
+
+	hdmi_write1(sc, HDMI_FC_AVICONF3, 0x00);
+	hdmi_write1(sc, HDMI_FC_AVICONF0, 0x00);
+	hdmi_write1(sc, HDMI_FC_AVICONF1, aspect);
+	hdmi_write1(sc, HDMI_FC_AVICONF2, 0x00);
+	hdmi_write1(sc, HDMI_FC_AVIVID, vic);
+
+	pkt_en = hdmi_read1(sc, HDMI_FC_PACKET_TX_EN);
+	pkt_en |= HDMI_FC_PACKET_TX_EN_AVI | HDMI_FC_PACKET_TX_EN_GCP;
+	hdmi_write1(sc, HDMI_FC_PACKET_TX_EN, pkt_en);
+	hdmi_write1(sc, HDMI_PKT_SEND_CTL, HDMI_PKT_SEND_CTL_AVI_INFO_UP);
+	DELAY(10);
+	hdmi_write1(sc, HDMI_PKT_SEND_CTL, HDMI_PKT_SEND_CTL_AVI_INFO_EN);
+
+	hdcpcfg0 = hdmi_read1(sc, HDMI_A_HDCPCFG0);
+	hdcpcfg0 |= HDMI_A_HDCPCFG0_HDMIDVI;
+	hdmi_write1(sc, HDMI_A_HDCPCFG0, hdcpcfg0);
+	hdmi_write1(sc, HDMI_A_HDCPCFG1, HDMI_A_HDCPCFG1_DEFAULT);
+	hdmi_write1(sc, HDMI_A_VIDPOLCFG, HDMI_A_VIDPOLCFG_DATAENPOL);
+
+	rk_kms_hdmi_clear_overflow(sc);
+	DPRINTF(sc, "HDMI enable: vic=%u aspect=0x%02x mode=%s\n", vic,
+	    aspect, m->name);
+}
+
+/*
  * Route VOP_BIG to drive the HDMI controller.  Also flips GPIO4C pin
  * mux to I2C3HDMI so the DDC lines are usable for an EDID read once
  * Phase 9f wires that path.
@@ -1018,8 +1215,11 @@ rk_kms_vop_program_timing(struct rk_kms_softc *sc,
 	 */
 	if (sc->hdmi_enable != 0 && sc->output == RK_KMS_OUT_HDMI) {
 		error = rk_kms_hdmi_phy_init(sc, mode);
-		if (error != 0)
+		if (error != 0) {
 			DPRINTF(sc, "HDMI PHY init failed: %d\n", error);
+		} else {
+			rk_kms_hdmi_enable(sc, mode);
+		}
 	}
 
 	/* Shadow-register commit.  Same value-of-1 the rk_drm reference
