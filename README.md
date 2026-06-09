@@ -22,7 +22,7 @@ kernel API lives in `sys/dev/kms/include/kms/`.
 | 5     | EDID parser + mode helpers + DP AUX              | done   |
 | 6     | Dumb buffers + cdev_pager mmap                   | done   |
 | 7     | Legacy modeset (SETCRTC / ADDFB / PAGEFLIP)      | done   |
-| 8     | Atomic modeset                                   | -      |
+| 8     | Atomic modeset                                   | done   |
 | 9     | Port `rk_drm` onto kms                     | -      |
 
 Phase 2 validated live on FreeBSD/arm64 (RockPro64 / `rk3399`).
