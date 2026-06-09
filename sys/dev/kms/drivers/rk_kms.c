@@ -32,6 +32,7 @@
 #include <sys/module.h>
 #include <sys/rman.h>
 #include <sys/sysctl.h>
+#include <sys/taskqueue.h>
 
 #include <arm/include/fdt.h>
 #include <machine/bus.h>
@@ -56,6 +57,7 @@
 #include <kms/drm_mode_config.h>
 #include <kms/drm_modes.h>
 #include <kms/drm_plane.h>
+#include <kms/drm_vblank.h>
 
 #define	RK_KMS_DESC	"Rockchip RK3399 display (kms)"
 
@@ -440,6 +442,24 @@ struct rk_kms_softc {
 	 * to validate vsync/hsync timing on a logic analyzer).
 	 */
 	int				 hdmi_enable;
+
+	/*
+	 * VBLANK ticker: a self-rearming timeout_task on
+	 * taskqueue_thread.  Period derives from the current mode's
+	 * vrefresh.  Default off via vblank_enable; set_config flips
+	 * it on when commit_modeset is on and a valid mode arrives.
+	 *
+	 * Phase 9g part 2 simulates vblank IRQs in software — the real
+	 * VOP_BIG IRQ wiring would require either a child VOP DT node
+	 * binding or hardcoded SPI numbers, both of which add risk
+	 * relative to a software timer that's good to a few hundred
+	 * microseconds of jitter.  X / wlroots can't tell the
+	 * difference.
+	 */
+	struct timeout_task		 vblank_task;
+	int				 vblank_ticks;
+	bool				 vblank_running;
+	int				 vblank_enable;
 
 	/*
 	 * Debug verbosity (0 = quiet, 1 = trace MMIO + set_config).
@@ -1227,6 +1247,57 @@ rk_kms_vop_program_timing(struct rk_kms_softc *sc,
 	vop_big_write(sc, VOP_REG_CFG_DONE, 0x00010001);
 }
 
+/*
+ * Self-rearming vblank ticker.  Each fire advances the framework's
+ * per-CRTC sequence counter, wakes WAIT_VBLANK sleepers, and delivers
+ * any pending FLIP_COMPLETE event from a PAGE_FLIP_EVENT-armed
+ * page-flip.  Re-enqueues itself until vblank_running goes false.
+ */
+static void
+rk_kms_vblank_task(void *arg, int pending __unused)
+{
+	struct rk_kms_softc *sc = arg;
+
+	if (!sc->vblank_running)
+		return;
+	kms_vblank_handler(&sc->crtc);
+	if (sc->vblank_running && sc->vblank_ticks > 0)
+		taskqueue_enqueue_timeout(taskqueue_thread, &sc->vblank_task,
+		    sc->vblank_ticks);
+}
+
+static void
+rk_kms_vblank_start(struct rk_kms_softc *sc,
+    const struct drm_display_mode *mode)
+{
+	uint32_t hz_v;
+
+	if (!sc->vblank_enable || sc->vblank_running)
+		return;
+	hz_v = kms_mode_vrefresh(mode);
+	if (hz_v == 0)
+		hz_v = 60;
+	sc->vblank_ticks = (int)(hz / hz_v);
+	if (sc->vblank_ticks <= 0)
+		sc->vblank_ticks = 1;
+	sc->vblank_running = true;
+	DPRINTF(sc, "vblank ticker start: %u Hz (%d ticks/period)\n",
+	    hz_v, sc->vblank_ticks);
+	taskqueue_enqueue_timeout(taskqueue_thread, &sc->vblank_task,
+	    sc->vblank_ticks);
+}
+
+static void
+rk_kms_vblank_stop(struct rk_kms_softc *sc)
+{
+	if (!sc->vblank_running)
+		return;
+	sc->vblank_running = false;
+	taskqueue_cancel_timeout(taskqueue_thread, &sc->vblank_task, NULL);
+	taskqueue_drain_timeout(taskqueue_thread, &sc->vblank_task);
+	DPRINTF(sc, "vblank ticker stop\n");
+}
+
 static int
 rk_kms_set_config(struct drm_mode_set *set)
 {
@@ -1241,9 +1312,11 @@ rk_kms_set_config(struct drm_mode_set *set)
 		    sc->commit_modeset);
 		if (sc->commit_modeset != 0 && sc->hw_attached)
 			rk_kms_vop_program_timing(sc, set->mode, set->fb);
+		rk_kms_vblank_start(sc, set->mode);
 	} else {
 		DPRINTF(sc, "set_config: blank (commit=%d)\n",
 		    sc->commit_modeset);
+		rk_kms_vblank_stop(sc);
 		if (sc->commit_modeset != 0 && sc->hw_attached) {
 			uint32_t sys_ctrl;
 
@@ -1417,6 +1490,8 @@ rk_kms_attach(device_t dev)
 
 	sc = device_get_softc(dev);
 	sc->dev = dev;
+	TIMEOUT_TASK_INIT(taskqueue_thread, &sc->vblank_task, 0,
+	    rk_kms_vblank_task, sc);
 
 	error = rk_kms_hw_attach(sc);
 	if (error != 0) {
@@ -1458,6 +1533,11 @@ rk_kms_attach(device_t dev)
 	    "hdmi_enable", CTLFLAG_RW, &sc->hdmi_enable, 0,
 	    "Enable DW HDMI PHY bring-up on set_config "
 	    "(Phase 9f part 1: PHY only)");
+	SYSCTL_ADD_INT(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "vblank_enable", CTLFLAG_RW, &sc->vblank_enable, 0,
+	    "Run a software vblank ticker at the active mode's "
+	    "refresh rate (Phase 9g part 2)");
 
 	device_printf(dev, "registered (Phase 9c: VOP code wired behind "
 	    "commit_modeset sysctl, default off)\n");
@@ -1470,6 +1550,7 @@ rk_kms_detach(device_t dev)
 	struct rk_kms_softc *sc;
 
 	sc = device_get_softc(dev);
+	rk_kms_vblank_stop(sc);
 	if (sc->drm_dev != NULL) {
 		rk_kms_topology_teardown(sc);
 		kms_dev_unregister(sc->drm_dev);
