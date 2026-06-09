@@ -4,7 +4,8 @@
 
 KMOD=	kms
 
-SRCS=	drm_connector.c \
+SRCS=	drm_atomic.c \
+	drm_connector.c \
 	drm_crtc.c \
 	drm_dp_helper.c \
 	drm_drv.c \
@@ -20,7 +21,8 @@ SRCS=	drm_connector.c \
 	drm_mode_object.c \
 	drm_modes.c \
 	drm_modeset.c \
-	drm_plane.c
+	drm_plane.c \
+	drm_property.c
 
 CFLAGS+=	-I${SRCTOP}/sys/dev/kms/include
 CFLAGS+=	-I${SRCTOP}/sys/dev/kms/uapi

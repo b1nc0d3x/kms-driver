@@ -26,11 +26,16 @@ struct drm_device;
 #define	DRM_MODE_OBJECT_PLANE		0xeeeeeeee
 #define	DRM_MODE_OBJECT_ANY		0
 
+struct drm_object_property;
+
 /*
  * Embedded base type for every KMS object.  Driver structs (drm_crtc,
  * drm_connector, ...) place this as their first member so a
  * drm_mode_object * can be cast to the concrete type.  ref starts at 1
  * after register and is incremented by kms_mode_object_find.
+ *
+ * Property table (Phase 8): TAILQ of drm_object_property entries.
+ * Mutations and reads happen under drm_device->mode_config.mutex.
  */
 struct drm_mode_object {
 	uint32_t			 id;
@@ -38,6 +43,8 @@ struct drm_mode_object {
 	u_int				 refs;
 	TAILQ_ENTRY(drm_mode_object)	 link;	/* per-type list */
 	TAILQ_ENTRY(drm_mode_object)	 reg;	/* master id->object list */
+	TAILQ_HEAD(, drm_object_property) properties;
+	uint32_t			 prop_count;
 };
 
 TAILQ_HEAD(drm_mode_object_list, drm_mode_object);

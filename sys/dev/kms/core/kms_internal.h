@@ -29,6 +29,14 @@ struct drm_mode_map_dumb;
 struct drm_mode_destroy_dumb;
 struct drm_mode_fb_cmd2;
 struct drm_mode_crtc_page_flip;
+struct drm_set_client_cap;
+struct drm_mode_get_property;
+struct drm_mode_obj_get_properties;
+struct drm_mode_obj_set_property;
+struct drm_mode_create_blob;
+struct drm_mode_destroy_blob;
+struct drm_mode_get_blob;
+struct drm_mode_atomic;
 
 MALLOC_DECLARE(M_KMS);
 
@@ -74,5 +82,21 @@ int	kms_ioctl_mode_setcrtc(struct drm_file *file,
 	    struct drm_mode_crtc *r);
 int	kms_ioctl_mode_page_flip(struct drm_file *file,
 	    struct drm_mode_crtc_page_flip *r);
+int	kms_ioctl_set_client_cap(struct drm_file *file,
+	    struct drm_set_client_cap *cap);
+int	kms_ioctl_mode_getproperty(struct drm_file *file,
+	    struct drm_mode_get_property *r);
+int	kms_ioctl_mode_obj_getproperties(struct drm_file *file,
+	    struct drm_mode_obj_get_properties *r);
+int	kms_ioctl_mode_obj_setproperty(struct drm_file *file,
+	    struct drm_mode_obj_set_property *r);
+int	kms_ioctl_mode_createpropblob(struct drm_file *file,
+	    struct drm_mode_create_blob *r);
+int	kms_ioctl_mode_destroypropblob(struct drm_file *file,
+	    struct drm_mode_destroy_blob *r);
+int	kms_ioctl_mode_getpropblob(struct drm_file *file,
+	    struct drm_mode_get_blob *r);
+int	kms_ioctl_mode_atomic(struct drm_file *file,
+	    struct drm_mode_atomic *r);
 
 #endif /* _KMS_INTERNAL_H_ */

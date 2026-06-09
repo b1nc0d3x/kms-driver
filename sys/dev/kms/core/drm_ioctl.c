@@ -183,6 +183,30 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 	case DRM_IOCTL_MODE_PAGE_FLIP:
 		return (kms_ioctl_mode_page_flip(file,
 		    (struct drm_mode_crtc_page_flip *)data));
+	case DRM_IOCTL_SET_CLIENT_CAP:
+		return (kms_ioctl_set_client_cap(file,
+		    (struct drm_set_client_cap *)data));
+	case DRM_IOCTL_MODE_GETPROPERTY:
+		return (kms_ioctl_mode_getproperty(file,
+		    (struct drm_mode_get_property *)data));
+	case DRM_IOCTL_MODE_OBJ_GETPROPERTIES:
+		return (kms_ioctl_mode_obj_getproperties(file,
+		    (struct drm_mode_obj_get_properties *)data));
+	case DRM_IOCTL_MODE_OBJ_SETPROPERTY:
+		return (kms_ioctl_mode_obj_setproperty(file,
+		    (struct drm_mode_obj_set_property *)data));
+	case DRM_IOCTL_MODE_CREATEPROPBLOB:
+		return (kms_ioctl_mode_createpropblob(file,
+		    (struct drm_mode_create_blob *)data));
+	case DRM_IOCTL_MODE_DESTROYPROPBLOB:
+		return (kms_ioctl_mode_destroypropblob(file,
+		    (struct drm_mode_destroy_blob *)data));
+	case DRM_IOCTL_MODE_GETPROPBLOB:
+		return (kms_ioctl_mode_getpropblob(file,
+		    (struct drm_mode_get_blob *)data));
+	case DRM_IOCTL_MODE_ATOMIC:
+		return (kms_ioctl_mode_atomic(file,
+		    (struct drm_mode_atomic *)data));
 	}
 	return (ENOTTY);
 }

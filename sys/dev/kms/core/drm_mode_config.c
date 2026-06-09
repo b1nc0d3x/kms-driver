@@ -14,8 +14,69 @@
 #include <kms/drm_file.h>
 #include <kms/drm_mode_config.h>
 #include <kms/drm_mode_object.h>
+#include <kms/drm_property.h>
 
 #include "kms_internal.h"
+
+#define	PROP_ATOMIC	KMS_PROP_ATOMIC
+
+void
+drm_mode_config_standard_properties_init(struct drm_device *dev)
+{
+	struct drm_mode_config *mc = &dev->mode_config;
+
+	/*
+	 * The CRTC.ACTIVE / CRTC.MODE_ID pair drives the atomic-style
+	 * "blank or unblank a CRTC" path.  ACTIVE is a 0..1 range;
+	 * MODE_ID points at a blob containing struct drm_mode_modeinfo
+	 * (or 0 to disable).
+	 */
+	mc->prop_crtc_active = drm_property_create_range(dev, PROP_ATOMIC,
+	    "ACTIVE", 0, 1);
+	mc->prop_crtc_mode_id = drm_property_create_blob_prop(dev,
+	    PROP_ATOMIC, "MODE_ID");
+
+	/*
+	 * Universal plane properties.  type is immutable and set at plane
+	 * init to OVERLAY/PRIMARY/CURSOR; the rest are atomic-write
+	 * sources for plane positioning + binding.  Source X/Y/W/H use
+	 * 16.16 fixed point per Linux uapi.
+	 */
+	mc->prop_plane_type = drm_property_create_enum(dev,
+	    KMS_PROP_IMMUTABLE | PROP_ATOMIC, "type");
+	if (mc->prop_plane_type != NULL) {
+		drm_property_add_enum(mc->prop_plane_type, 0, "Overlay");
+		drm_property_add_enum(mc->prop_plane_type, 1, "Primary");
+		drm_property_add_enum(mc->prop_plane_type, 2, "Cursor");
+	}
+	mc->prop_plane_fb_id = drm_property_create_object(dev, PROP_ATOMIC,
+	    "FB_ID", DRM_MODE_OBJECT_FB);
+	mc->prop_plane_crtc_id = drm_property_create_object(dev, PROP_ATOMIC,
+	    "CRTC_ID", DRM_MODE_OBJECT_CRTC);
+	mc->prop_plane_crtc_x = drm_property_create_range(dev,
+	    KMS_PROP_SIGNED_RANGE | PROP_ATOMIC, "CRTC_X",
+	    (uint64_t)INT32_MIN, (uint64_t)INT32_MAX);
+	mc->prop_plane_crtc_y = drm_property_create_range(dev,
+	    KMS_PROP_SIGNED_RANGE | PROP_ATOMIC, "CRTC_Y",
+	    (uint64_t)INT32_MIN, (uint64_t)INT32_MAX);
+	mc->prop_plane_crtc_w = drm_property_create_range(dev, PROP_ATOMIC,
+	    "CRTC_W", 0, UINT32_MAX);
+	mc->prop_plane_crtc_h = drm_property_create_range(dev, PROP_ATOMIC,
+	    "CRTC_H", 0, UINT32_MAX);
+	mc->prop_plane_src_x = drm_property_create_range(dev, PROP_ATOMIC,
+	    "SRC_X", 0, UINT32_MAX);
+	mc->prop_plane_src_y = drm_property_create_range(dev, PROP_ATOMIC,
+	    "SRC_Y", 0, UINT32_MAX);
+	mc->prop_plane_src_w = drm_property_create_range(dev, PROP_ATOMIC,
+	    "SRC_W", 0, UINT32_MAX);
+	mc->prop_plane_src_h = drm_property_create_range(dev, PROP_ATOMIC,
+	    "SRC_H", 0, UINT32_MAX);
+
+	mc->prop_connector_crtc_id = drm_property_create_object(dev,
+	    PROP_ATOMIC, "CRTC_ID", DRM_MODE_OBJECT_CRTC);
+}
+
+#undef PROP_ATOMIC
 
 void
 drm_mode_config_init(struct drm_mode_config *mc)

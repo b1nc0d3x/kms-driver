@@ -12,6 +12,7 @@
 #include <kms/drm_device.h>
 #include <kms/drm_mode_config.h>
 #include <kms/drm_mode_object.h>
+#include <kms/drm_property.h>
 
 #include "kms_internal.h"
 
@@ -72,6 +73,8 @@ kms_mode_object_register_locked(struct drm_device *dev,
 
 	obj->type = type;
 	refcount_init(&obj->refs, 1);
+	TAILQ_INIT(&obj->properties);
+	obj->prop_count = 0;
 
 	/*
 	 * Monotonic ID allocation.  0 is reserved as invalid; wrap is
@@ -121,6 +124,12 @@ kms_mode_object_unregister(struct drm_device *dev, struct drm_mode_object *obj)
 
 	sx_xlock(&mc->mutex);
 	TAILQ_REMOVE(&mc->objects, obj, reg);
+	/*
+	 * Phase 8: free any per-object property entries.  Done under
+	 * the same lock that protects attach / set_value so a concurrent
+	 * GET sees either the full table or nothing — never half-freed.
+	 */
+	drm_object_properties_cleanup(obj);
 	list = drm_mode_object_list_for_type(mc, obj->type);
 	count = drm_mode_object_count_for_type(mc, obj->type);
 	if (list != NULL) {

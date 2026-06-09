@@ -11,8 +11,40 @@
 #include <kms/drm_mode_config.h>
 #include <kms/drm_mode_object.h>
 #include <kms/drm_plane.h>
+#include <kms/drm_property.h>
 
 #include "kms_internal.h"
+
+static void
+drm_plane_attach_standard_properties(struct drm_plane *plane)
+{
+	struct drm_mode_config *mc = &plane->dev->mode_config;
+	struct drm_mode_object *o = &plane->base;
+
+	if (mc->prop_plane_type != NULL)
+		drm_object_attach_property(o, mc->prop_plane_type,
+		    (uint64_t)plane->type);
+	if (mc->prop_plane_fb_id != NULL)
+		drm_object_attach_property(o, mc->prop_plane_fb_id, 0);
+	if (mc->prop_plane_crtc_id != NULL)
+		drm_object_attach_property(o, mc->prop_plane_crtc_id, 0);
+	if (mc->prop_plane_crtc_x != NULL)
+		drm_object_attach_property(o, mc->prop_plane_crtc_x, 0);
+	if (mc->prop_plane_crtc_y != NULL)
+		drm_object_attach_property(o, mc->prop_plane_crtc_y, 0);
+	if (mc->prop_plane_crtc_w != NULL)
+		drm_object_attach_property(o, mc->prop_plane_crtc_w, 0);
+	if (mc->prop_plane_crtc_h != NULL)
+		drm_object_attach_property(o, mc->prop_plane_crtc_h, 0);
+	if (mc->prop_plane_src_x != NULL)
+		drm_object_attach_property(o, mc->prop_plane_src_x, 0);
+	if (mc->prop_plane_src_y != NULL)
+		drm_object_attach_property(o, mc->prop_plane_src_y, 0);
+	if (mc->prop_plane_src_w != NULL)
+		drm_object_attach_property(o, mc->prop_plane_src_w, 0);
+	if (mc->prop_plane_src_h != NULL)
+		drm_object_attach_property(o, mc->prop_plane_src_h, 0);
+}
 
 int
 kms_plane_init(struct drm_device *dev, struct drm_plane *plane,
@@ -20,6 +52,8 @@ kms_plane_init(struct drm_device *dev, struct drm_plane *plane,
     uint32_t possible_crtcs, const uint32_t *format_types,
     uint32_t format_count)
 {
+	int error;
+
 	if (dev == NULL || plane == NULL)
 		return (EINVAL);
 	if (format_count > 0 && format_types == NULL)
@@ -34,8 +68,12 @@ kms_plane_init(struct drm_device *dev, struct drm_plane *plane,
 	plane->format_types = format_types;
 	plane->format_count = format_count;
 
-	return (kms_mode_object_register(dev, &plane->base,
-	    DRM_MODE_OBJECT_PLANE));
+	error = kms_mode_object_register(dev, &plane->base,
+	    DRM_MODE_OBJECT_PLANE);
+	if (error != 0)
+		return (error);
+	drm_plane_attach_standard_properties(plane);
+	return (0);
 }
 
 void

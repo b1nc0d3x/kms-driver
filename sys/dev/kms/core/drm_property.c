@@ -1,0 +1,286 @@
+/*-
+ * SPDX-License-Identifier: BSD-2-Clause
+ *
+ * Copyright (c) 2026 Kyle Crenshaw <b1nc0d3x@gmail.com>
+ *
+ * Property + blob framework.  See drm_property.h for the design.
+ *
+ * Properties are themselves registered as DRM_MODE_OBJECT_PROPERTY
+ * mode objects, so they share the device's 32-bit id namespace with
+ * CRTCs / planes / connectors.  Same for blobs (DRM_MODE_OBJECT_BLOB).
+ * Lookups via kms_mode_object_find work transparently.
+ *
+ * Locking model:
+ *   - property + blob registration / destroy: mode_config.mutex
+ *     exclusive.
+ *   - per-object attach / set / get: mode_config.mutex exclusive
+ *     (object_properties cleanup runs under it during unregister).
+ *   - find paths take a shared lookup ref via mode_object_find which
+ *     internally takes a brief shared lock — no deadlock with the
+ *     callers that hold the mutex.
+ */
+
+#include <sys/param.h>
+#include <sys/systm.h>
+#include <sys/malloc.h>
+#include <sys/queue.h>
+#include <sys/sx.h>
+
+#include <kms/drm_device.h>
+#include <kms/drm_mode_config.h>
+#include <kms/drm_mode_object.h>
+#include <kms/drm_property.h>
+
+#include "kms_internal.h"
+
+static struct drm_property *
+drm_property_alloc(struct drm_device *dev, uint32_t flags, const char *name)
+{
+	struct drm_property *prop;
+	size_t n;
+
+	prop = malloc(sizeof(*prop), M_KMS, M_WAITOK | M_ZERO);
+	prop->dev = dev;
+	prop->flags = flags;
+	TAILQ_INIT(&prop->entries);
+	n = strnlen(name, sizeof(prop->name) - 1);
+	memcpy(prop->name, name, n);
+	prop->name[n] = '\0';
+	return (prop);
+}
+
+struct drm_property *
+drm_property_create_range(struct drm_device *dev, uint32_t flags,
+    const char *name, uint64_t min, uint64_t max)
+{
+	struct drm_property *prop;
+	int error;
+
+	prop = drm_property_alloc(dev, flags | KMS_PROP_RANGE, name);
+	prop->values[0] = min;
+	prop->values[1] = max;
+	prop->num_values = 2;
+	error = kms_mode_object_register(dev, &prop->base,
+	    DRM_MODE_OBJECT_PROPERTY);
+	if (error != 0) {
+		free(prop, M_KMS);
+		return (NULL);
+	}
+	return (prop);
+}
+
+struct drm_property *
+drm_property_create_object(struct drm_device *dev, uint32_t flags,
+    const char *name, uint32_t obj_type)
+{
+	struct drm_property *prop;
+	int error;
+
+	prop = drm_property_alloc(dev, flags | KMS_PROP_OBJECT, name);
+	prop->values[0] = obj_type;
+	prop->num_values = 1;
+	error = kms_mode_object_register(dev, &prop->base,
+	    DRM_MODE_OBJECT_PROPERTY);
+	if (error != 0) {
+		free(prop, M_KMS);
+		return (NULL);
+	}
+	return (prop);
+}
+
+struct drm_property *
+drm_property_create_enum(struct drm_device *dev, uint32_t flags,
+    const char *name)
+{
+	struct drm_property *prop;
+	int error;
+
+	prop = drm_property_alloc(dev, flags | KMS_PROP_ENUM, name);
+	error = kms_mode_object_register(dev, &prop->base,
+	    DRM_MODE_OBJECT_PROPERTY);
+	if (error != 0) {
+		free(prop, M_KMS);
+		return (NULL);
+	}
+	return (prop);
+}
+
+int
+drm_property_add_enum(struct drm_property *prop, uint64_t value,
+    const char *name)
+{
+	struct drm_property_enum *e;
+	size_t n;
+
+	if (prop == NULL ||
+	    (prop->flags & (KMS_PROP_ENUM | KMS_PROP_BITMASK)) == 0)
+		return (EINVAL);
+	e = malloc(sizeof(*e), M_KMS, M_WAITOK | M_ZERO);
+	e->value = value;
+	n = strnlen(name, sizeof(e->name) - 1);
+	memcpy(e->name, name, n);
+	e->name[n] = '\0';
+	sx_xlock(&prop->dev->mode_config.mutex);
+	TAILQ_INSERT_TAIL(&prop->entries, e, link);
+	prop->num_entries++;
+	sx_xunlock(&prop->dev->mode_config.mutex);
+	return (0);
+}
+
+struct drm_property *
+drm_property_create_blob_prop(struct drm_device *dev, uint32_t flags,
+    const char *name)
+{
+	struct drm_property *prop;
+	int error;
+
+	prop = drm_property_alloc(dev, flags | KMS_PROP_BLOB, name);
+	error = kms_mode_object_register(dev, &prop->base,
+	    DRM_MODE_OBJECT_PROPERTY);
+	if (error != 0) {
+		free(prop, M_KMS);
+		return (NULL);
+	}
+	return (prop);
+}
+
+void
+drm_property_destroy(struct drm_property *prop)
+{
+	struct drm_property_enum *e;
+
+	if (prop == NULL)
+		return;
+	kms_mode_object_unregister(prop->dev, &prop->base);
+	while ((e = TAILQ_FIRST(&prop->entries)) != NULL) {
+		TAILQ_REMOVE(&prop->entries, e, link);
+		free(e, M_KMS);
+	}
+	free(prop, M_KMS);
+}
+
+/* --- per-object attach + set + get --- */
+
+int
+drm_object_attach_property(struct drm_mode_object *obj,
+    struct drm_property *prop, uint64_t default_value)
+{
+	struct drm_object_property *op;
+	struct drm_object_property *existing;
+
+	if (obj == NULL || prop == NULL)
+		return (EINVAL);
+	TAILQ_FOREACH(existing, &obj->properties, link) {
+		if (existing->property == prop) {
+			/*
+			 * Idempotent: drivers that re-register the same
+			 * property on the same object just get the existing
+			 * entry's value updated.  Matches Linux behavior.
+			 */
+			existing->value = default_value;
+			return (0);
+		}
+	}
+	op = malloc(sizeof(*op), M_KMS, M_WAITOK | M_ZERO);
+	op->property = prop;
+	op->value = default_value;
+	TAILQ_INSERT_TAIL(&obj->properties, op, link);
+	obj->prop_count++;
+	return (0);
+}
+
+int
+drm_object_property_set_value(struct drm_mode_object *obj,
+    struct drm_property *prop, uint64_t value)
+{
+	struct drm_object_property *op;
+
+	TAILQ_FOREACH(op, &obj->properties, link) {
+		if (op->property == prop) {
+			op->value = value;
+			return (0);
+		}
+	}
+	return (ENOENT);
+}
+
+int
+drm_object_property_get_value(struct drm_mode_object *obj,
+    struct drm_property *prop, uint64_t *value_out)
+{
+	struct drm_object_property *op;
+
+	TAILQ_FOREACH(op, &obj->properties, link) {
+		if (op->property == prop) {
+			*value_out = op->value;
+			return (0);
+		}
+	}
+	return (ENOENT);
+}
+
+void
+drm_object_properties_cleanup(struct drm_mode_object *obj)
+{
+	struct drm_object_property *op;
+
+	while ((op = TAILQ_FIRST(&obj->properties)) != NULL) {
+		TAILQ_REMOVE(&obj->properties, op, link);
+		free(op, M_KMS);
+	}
+	obj->prop_count = 0;
+}
+
+/* --- blobs --- */
+
+struct drm_property_blob *
+drm_property_blob_create(struct drm_device *dev, const void *data,
+    size_t length)
+{
+	struct drm_property_blob *blob;
+	int error;
+
+	if (dev == NULL || length == 0)
+		return (NULL);
+	if (length > (16ULL << 20))	/* 16 MiB sanity cap, rule 4 */
+		return (NULL);
+
+	blob = malloc(sizeof(*blob), M_KMS, M_WAITOK | M_ZERO);
+	blob->dev = dev;
+	blob->length = length;
+	blob->data = malloc(length, M_KMS, M_WAITOK);
+	if (data != NULL)
+		memcpy(blob->data, data, length);
+	else
+		memset(blob->data, 0, length);
+
+	error = kms_mode_object_register(dev, &blob->base,
+	    DRM_MODE_OBJECT_BLOB);
+	if (error != 0) {
+		free(blob->data, M_KMS);
+		free(blob, M_KMS);
+		return (NULL);
+	}
+	return (blob);
+}
+
+struct drm_property_blob *
+drm_property_blob_find(struct drm_device *dev, uint32_t id)
+{
+	struct drm_mode_object *obj;
+
+	obj = kms_mode_object_find(dev, id, DRM_MODE_OBJECT_BLOB);
+	if (obj == NULL)
+		return (NULL);
+	return (__containerof(obj, struct drm_property_blob, base));
+}
+
+void
+drm_property_blob_destroy(struct drm_property_blob *blob)
+{
+	if (blob == NULL)
+		return;
+	kms_mode_object_unregister(blob->dev, &blob->base);
+	free(blob->data, M_KMS);
+	free(blob, M_KMS);
+}

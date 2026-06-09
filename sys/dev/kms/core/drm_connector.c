@@ -15,6 +15,7 @@
 #include <kms/drm_mode_config.h>
 #include <kms/drm_mode_object.h>
 #include <kms/drm_modes.h>
+#include <kms/drm_property.h>
 
 #include "kms_internal.h"
 
@@ -73,7 +74,12 @@ kms_connector_init(struct drm_device *dev, struct drm_connector *connector,
 	error = kms_mode_object_register_locked(dev, &connector->base,
 	    DRM_MODE_OBJECT_CONNECTOR);
 	sx_xunlock(&dev->mode_config.mutex);
-	return (error);
+	if (error != 0)
+		return (error);
+	if (dev->mode_config.prop_connector_crtc_id != NULL)
+		drm_object_attach_property(&connector->base,
+		    dev->mode_config.prop_connector_crtc_id, 0);
+	return (0);
 }
 
 void

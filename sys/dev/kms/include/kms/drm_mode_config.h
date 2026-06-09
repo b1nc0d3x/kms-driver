@@ -52,9 +52,35 @@ struct drm_mode_config {
 	struct drm_mode_object_list	 fbs;
 	struct drm_mode_object_list	 planes;
 	struct drm_mode_object_list	 objects;
+
+	/*
+	 * Standard properties registered at mode_config_init time and
+	 * attached to objects on their init paths.  Drivers may add more
+	 * properties via drm_property_create_* and attach via
+	 * drm_object_attach_property.  Phase 8 surface is the minimum
+	 * an atomic-aware userspace (modesetting DDX, xf86-video-amdgpu-
+	 * style ports) actually queries.
+	 */
+	struct drm_property		*prop_crtc_active;
+	struct drm_property		*prop_crtc_mode_id;
+	struct drm_property		*prop_plane_type;
+	struct drm_property		*prop_plane_fb_id;
+	struct drm_property		*prop_plane_crtc_id;
+	struct drm_property		*prop_plane_crtc_x;
+	struct drm_property		*prop_plane_crtc_y;
+	struct drm_property		*prop_plane_crtc_w;
+	struct drm_property		*prop_plane_crtc_h;
+	struct drm_property		*prop_plane_src_x;
+	struct drm_property		*prop_plane_src_y;
+	struct drm_property		*prop_plane_src_w;
+	struct drm_property		*prop_plane_src_h;
+	struct drm_property		*prop_connector_crtc_id;
 };
+
+struct drm_device;
 
 void	drm_mode_config_init(struct drm_mode_config *mc);
 void	drm_mode_config_cleanup(struct drm_mode_config *mc);
+void	drm_mode_config_standard_properties_init(struct drm_device *dev);
 
 #endif /* _KMS_DRM_MODE_CONFIG_H_ */

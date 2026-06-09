@@ -50,6 +50,7 @@ kms_dev_register(const struct drm_driver *driver, void *driver_priv,
 	dev->mmap_offset_counter = PAGE_SIZE;	/* keep 0 reserved */
 	drm_mode_config_init(&dev->mode_config);
 	refcount_init(&dev->refs, 1);	/* initial: held by the registry */
+	drm_mode_config_standard_properties_init(dev);
 
 	make_dev_args_init(&args);
 	args.mda_flags = MAKEDEV_CHECKNAME;	/* EEXIST instead of panic */

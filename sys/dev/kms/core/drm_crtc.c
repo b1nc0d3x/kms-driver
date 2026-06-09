@@ -11,6 +11,7 @@
 #include <kms/drm_device.h>
 #include <kms/drm_mode_config.h>
 #include <kms/drm_mode_object.h>
+#include <kms/drm_property.h>
 
 #include "kms_internal.h"
 
@@ -40,6 +41,19 @@ kms_crtc_init(struct drm_device *dev, struct drm_crtc *crtc,
 	    DRM_MODE_OBJECT_CRTC);
 	if (error != 0)
 		return (error);
+
+	/*
+	 * Attach the universal CRTC properties so atomic userspace can
+	 * discover them via OBJ_GETPROPERTIES and drive them via the
+	 * ATOMIC ioctl.  Defaults: ACTIVE=0 (blanked), MODE_ID=0 (no
+	 * blob bound).
+	 */
+	if (dev->mode_config.prop_crtc_active != NULL)
+		drm_object_attach_property(&crtc->base,
+		    dev->mode_config.prop_crtc_active, 0);
+	if (dev->mode_config.prop_crtc_mode_id != NULL)
+		drm_object_attach_property(&crtc->base,
+		    dev->mode_config.prop_crtc_mode_id, 0);
 	return (0);
 }
 

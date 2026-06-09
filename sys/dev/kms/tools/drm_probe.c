@@ -534,6 +534,112 @@ cleanup:
 	return (error);
 }
 
+static int
+probe_atomic(int fd, uint32_t crtc_id)
+{
+	struct drm_set_client_cap cap;
+	struct drm_mode_obj_get_properties getprops;
+	uint32_t props[32];
+	uint64_t values[32];
+	struct drm_mode_atomic atomic;
+	uint32_t objs[1];
+	uint32_t counts[1];
+	uint32_t set_props[1];
+	uint64_t set_values[1];
+	uint32_t i, found_active = 0, found_mode_id = 0;
+
+	if (crtc_id == 0) {
+		printf("ATOMIC       : skipped (no crtc)\n");
+		return (0);
+	}
+
+	memset(&cap, 0, sizeof(cap));
+	cap.capability = DRM_CLIENT_CAP_ATOMIC;
+	cap.value = 1;
+	if (ioctl(fd, DRM_IOCTL_SET_CLIENT_CAP, &cap) != 0) {
+		warn("SET_CLIENT_CAP atomic");
+		return (1);
+	}
+	printf("SET_CLIENT_CAP ATOMIC=1 : ok\n");
+
+	memset(&getprops, 0, sizeof(getprops));
+	getprops.obj_id = crtc_id;
+	getprops.obj_type = 0xcccccccc;	/* DRM_MODE_OBJECT_CRTC */
+	getprops.props_ptr = (uintptr_t)props;
+	getprops.prop_values_ptr = (uintptr_t)values;
+	getprops.count_props = 32;
+	if (ioctl(fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &getprops) != 0) {
+		warn("OBJ_GETPROPERTIES");
+		return (1);
+	}
+	printf("OBJ_GETPROPS : crtc=%u count=%u\n", crtc_id,
+	    getprops.count_props);
+	for (i = 0; i < getprops.count_props && i < 32; i++) {
+		struct drm_mode_get_property gp;
+
+		memset(&gp, 0, sizeof(gp));
+		gp.prop_id = props[i];
+		if (ioctl(fd, DRM_IOCTL_MODE_GETPROPERTY, &gp) != 0)
+			continue;
+		printf("  prop[%u]: id=%u name=\"%s\" flags=0x%x value=0x%llx\n",
+		    i, props[i], gp.name, gp.flags,
+		    (unsigned long long)values[i]);
+		if (strcmp(gp.name, "ACTIVE") == 0) {
+			set_props[0] = props[i];
+			found_active = 1;
+		}
+		if (strcmp(gp.name, "MODE_ID") == 0)
+			found_mode_id = props[i];
+	}
+
+	if (!found_active) {
+		printf("ATOMIC       : no ACTIVE property — skipped\n");
+		return (1);
+	}
+
+	memset(&atomic, 0, sizeof(atomic));
+	objs[0] = crtc_id;
+	counts[0] = 1;
+	set_values[0] = 1;	/* try ACTIVE=1 */
+	atomic.flags = DRM_MODE_ATOMIC_TEST_ONLY;
+	atomic.count_objs = 1;
+	atomic.objs_ptr = (uintptr_t)objs;
+	atomic.count_props_ptr = (uintptr_t)counts;
+	atomic.props_ptr = (uintptr_t)set_props;
+	atomic.prop_values_ptr = (uintptr_t)set_values;
+	if (ioctl(fd, DRM_IOCTL_MODE_ATOMIC, &atomic) != 0) {
+		warn("ATOMIC TEST_ONLY");
+		return (1);
+	}
+	printf("ATOMIC TEST  : crtc.ACTIVE=1 -> ok\n");
+
+	atomic.flags = 0;
+	if (ioctl(fd, DRM_IOCTL_MODE_ATOMIC, &atomic) != 0) {
+		warn("ATOMIC commit");
+		return (1);
+	}
+	printf("ATOMIC COMMIT: crtc.ACTIVE=1 -> ok\n");
+
+	/* Read back to confirm the value stuck. */
+	memset(&getprops, 0, sizeof(getprops));
+	getprops.obj_id = crtc_id;
+	getprops.obj_type = 0xcccccccc;
+	getprops.props_ptr = (uintptr_t)props;
+	getprops.prop_values_ptr = (uintptr_t)values;
+	getprops.count_props = 32;
+	if (ioctl(fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &getprops) != 0)
+		return (1);
+	for (i = 0; i < getprops.count_props && i < 32; i++) {
+		if (props[i] == set_props[0]) {
+			printf("  readback   : ACTIVE=%llu (expect 1)\n",
+			    (unsigned long long)values[i]);
+			(void)found_mode_id;
+			return (values[i] == 1 ? 0 : 1);
+		}
+	}
+	return (1);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -560,6 +666,7 @@ main(int argc, char **argv)
 	rc |= probe_mode_getplane(fd, plane_id);
 	rc |= probe_dumb_buffer(fd);
 	rc |= probe_modeset(fd, crtc_id, conn_id);
+	rc |= probe_atomic(fd, crtc_id);
 
 	close(fd);
 	return (rc);
