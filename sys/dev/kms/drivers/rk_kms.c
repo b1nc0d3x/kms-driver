@@ -98,6 +98,8 @@
 #define	RK3399_PMU_SIZE		0x1000UL
 #define	RK3399_PMUCRU_PA	0xff750000UL
 #define	RK3399_PMUCRU_SIZE	0x1000UL
+#define	RK3399_HDMI_PA		0xff940000UL
+#define	RK3399_HDMI_SIZE	0x20000UL
 
 /*
  * VOP register offsets (subset).  Names match Rockchip's RK3399 TRM
@@ -164,6 +166,39 @@
 #define	CRU_VPLL_CON2_LOCK	(1u << 31)
 
 /*
+ * GRF output-mux registers.  SOC_CON20 picks which VOP drives HDMI
+ * and EDP; SOC_CON9 picks which VOP drives the Cadence MHDP (USB-C
+ * DP).  All three writes use the "hiword update" encoding: high 16
+ * bits are the bit mask, low 16 bits are the value to apply.
+ *
+ *   SOC_CON20[5] EDP_LCDC_SEL : 0 = VOP_BIG → eDP, 1 = VOP_LIT
+ *   SOC_CON20[6] HDMI_LCDC_SEL: 0 = VOP_BIG → HDMI, 1 = VOP_LIT
+ *   SOC_CON9[12] DP_SEL_VOP_LIT: 0 = VOP_BIG → MHDP, 1 = VOP_LIT
+ */
+#define	GRF_SOC_CON9		0x6224
+#define	GRF_SOC_CON20		0x6250
+#define	GRF_GPIO4C_IOMUX	0x0e028
+#define	GRF_HDMI_LCDC_SEL	(1u << 6)
+#define	GRF_EDP_LCDC_SEL	(1u << 5)
+#define	GRF_DP_SEL_VOP_LIT	(1u << 12)
+
+/*
+ * Pin-mux value that selects I2C3HDMI mode for GPIO4C pins (DDC SDA /
+ * SCL).  Lifted verbatim from the rk_drm reference — matches the
+ * value the existing driver writes when it routes VOP→HDMI.
+ */
+#define	GRF_GPIO4C_I2C3HDMI	0x003f0005u
+
+/*
+ * Output selector exposed via sysctl.  Defaults to HDMI; users with
+ * USB-C DP topologies switch via dev.rk_kms.0.output=1 before
+ * the first SETCRTC.  Phase 9e wires the GRF mux only — actual DP
+ * link bring-up lands in a later phase when rk_cdn_dp is ported.
+ */
+#define	RK_KMS_OUT_HDMI	0
+#define	RK_KMS_OUT_DP	1
+
+/*
  * Pixel-clock → VPLL coefficient table.  Lifted verbatim from
  * rk_drm_hw.c (which itself derives the values from Rockchip's BSP
  * + measurement on rp64dbg / armbsd).  Phase 9d ships the most-used
@@ -212,6 +247,13 @@ struct rk_kms_softc {
 	bus_space_handle_t		 cru_bsh;
 	bus_space_handle_t		 pmu_bsh;
 	bus_space_handle_t		 pmucru_bsh;
+	/*
+	 * HDMI controller MMIO is mapped via pmap_mapdev (128 KiB
+	 * region — too large for bus_space_map without a memory rman).
+	 * va is the kernel virtual base; nothing reads it yet (Phase 9f
+	 * wires DW HDMI bring-up).
+	 */
+	vm_offset_t			 hdmi_va;
 	bool				 hw_attached;
 
 	/*
@@ -221,6 +263,14 @@ struct rk_kms_softc {
 	 * dev.rk_kms.0.commit_modeset=1 to enable real writes.
 	 */
 	int				 commit_modeset;
+
+	/*
+	 * Output selector: HDMI vs USB-C DP.  Controls which GRF mux
+	 * value set_config writes.  Phase 9e wires the mux only; Phase
+	 * 9f programs the DW HDMI controller and Phase 9g hands off to
+	 * a ported rk_cdn_dp for the DP side.
+	 */
+	int				 output;
 
 	/*
 	 * Debug verbosity (0 = quiet, 1 = trace MMIO + set_config).
@@ -305,6 +355,54 @@ static inline void
 cru_write(struct rk_kms_softc *sc, bus_size_t off, uint32_t val)
 {
 	bus_space_write_4(sc->bst, sc->cru_bsh, off, val);
+}
+
+static inline void
+grf_write(struct rk_kms_softc *sc, bus_size_t off, uint32_t val)
+{
+	bus_space_write_4(sc->bst, sc->grf_bsh, off, val);
+	bus_space_barrier(sc->bst, sc->grf_bsh, off, 4,
+	    BUS_SPACE_BARRIER_WRITE);
+}
+
+/*
+ * Route VOP_BIG to drive the HDMI controller.  Also flips GPIO4C pin
+ * mux to I2C3HDMI so the DDC lines are usable for an EDID read once
+ * Phase 9f wires that path.
+ *
+ * SOC_CON20[6] HDMI_LCDC_SEL = 0 selects VOP_BIG.  Hiword-update:
+ * write only the mask bit in the high half with the value cleared in
+ * the low half.
+ */
+static void
+rk_kms_route_vop_big_to_hdmi(struct rk_kms_softc *sc)
+{
+	grf_write(sc, GRF_SOC_CON20, (GRF_HDMI_LCDC_SEL << 16));
+	grf_write(sc, GRF_GPIO4C_IOMUX, GRF_GPIO4C_I2C3HDMI);
+	DPRINTF(sc, "GRF: routed VOP_BIG -> HDMI (SOC_CON20[6]=0)\n");
+}
+
+/*
+ * Route VOP_BIG to drive the Cadence MHDP (USB-C DP) controller.
+ * The dual mux dance:
+ *   SOC_CON20[5] EDP_LCDC_SEL = 0  (VOP_BIG -> eDP, kept clear)
+ *   SOC_CON20[6] HDMI_LCDC_SEL = 1 (VOP_LIT -> HDMI, freeing HDMI off
+ *                                   VOP_BIG so the DP path owns it)
+ *   SOC_CON9[12]  DP_SEL_VOP_LIT = 0 (VOP_BIG -> MHDP)
+ *
+ * Same sequence the in-tree rk_drm uses when output_select == USBC_DP
+ * — necessary even when no DP cable is plugged so HPD events land on
+ * the right controller.
+ */
+static void
+rk_kms_route_vop_big_to_dp(struct rk_kms_softc *sc)
+{
+	grf_write(sc, GRF_SOC_CON20, (GRF_EDP_LCDC_SEL << 16));
+	grf_write(sc, GRF_SOC_CON20,
+	    (GRF_HDMI_LCDC_SEL << 16) | GRF_HDMI_LCDC_SEL);
+	grf_write(sc, GRF_SOC_CON9, (GRF_DP_SEL_VOP_LIT << 16));
+	DPRINTF(sc, "GRF: routed VOP_BIG -> DP (SOC_CON20[6]=1, "
+	    "CON9[12]=0)\n");
 }
 
 /*
@@ -491,6 +589,11 @@ rk_kms_vop_program_timing(struct rk_kms_softc *sc,
 	uint32_t sys_ctrl;
 	int error;
 
+	if (sc->output == RK_KMS_OUT_DP)
+		rk_kms_route_vop_big_to_dp(sc);
+	else
+		rk_kms_route_vop_big_to_hdmi(sc);
+
 	error = rk_kms_program_vpll(sc, mode->clock);
 	if (error != 0)
 		DPRINTF(sc, "VPLL %u kHz: %d (continuing with current PLL)\n",
@@ -645,9 +748,20 @@ rk_kms_hw_attach(struct rk_kms_softc *sc)
 	if (error != 0)
 		return (error);
 
+	/*
+	 * HDMI controller is 128 KiB — past bus_space_map's comfort
+	 * zone on this platform, so map through pmap_mapdev like the
+	 * rk_drm reference does.  Phase 9f hangs the DW HDMI bring-up
+	 * off this VA.
+	 */
+	sc->hdmi_va = (vm_offset_t)pmap_mapdev(RK3399_HDMI_PA,
+	    RK3399_HDMI_SIZE);
+	if (sc->hdmi_va == 0)
+		return (ENXIO);
+
 	sc->hw_attached = true;
 	DPRINTF(sc, "MMIO mapped: VOP_BIG/LIT @ 0xff9{0,8f}0000 "
-	    "GRF @ 0xff770000 CRU @ 0xff760000\n");
+	    "GRF @ 0xff770000 CRU @ 0xff760000 HDMI @ 0xff940000\n");
 	return (0);
 }
 
@@ -670,6 +784,10 @@ rk_kms_hw_detach(struct rk_kms_softc *sc)
 		bus_space_unmap(sc->bst, sc->pmu_bsh, RK3399_PMU_SIZE);
 	if (sc->pmucru_bsh != 0)
 		bus_space_unmap(sc->bst, sc->pmucru_bsh, RK3399_PMUCRU_SIZE);
+	if (sc->hdmi_va != 0) {
+		pmap_unmapdev((void *)sc->hdmi_va, RK3399_HDMI_SIZE);
+		sc->hdmi_va = 0;
+	}
 	sc->hw_attached = false;
 }
 
@@ -724,6 +842,11 @@ rk_kms_attach(device_t dev)
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 	    "debug", CTLFLAG_RW, &sc->debug, 0,
 	    "Debug verbosity (0 = quiet, 1 = trace attach + set_config)");
+	SYSCTL_ADD_INT(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "output", CTLFLAG_RW, &sc->output, 0,
+	    "Output selector: 0 = HDMI, 1 = USB-C DP (Phase 9e: GRF mux "
+	    "only; DP bring-up TBD)");
 
 	device_printf(dev, "registered (Phase 9c: VOP code wired behind "
 	    "commit_modeset sysctl, default off)\n");
