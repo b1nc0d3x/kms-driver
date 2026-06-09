@@ -99,4 +99,17 @@ int	kms_ioctl_mode_getpropblob(struct drm_file *file,
 int	kms_ioctl_mode_atomic(struct drm_file *file,
 	    struct drm_mode_atomic *r);
 
+struct drm_crtc;
+union drm_wait_vblank;
+
+void	kms_event_queue_init(struct drm_file *file);
+void	kms_event_queue_drain(struct drm_file *file);
+int	kms_send_event(struct drm_file *file, const void *data,
+	    size_t length);
+int	kms_send_vblank_event(struct drm_file *file,
+	    struct drm_crtc *crtc, uint32_t type, uint64_t user_data);
+void	kms_vblank_handler(struct drm_crtc *crtc);
+int	kms_ioctl_wait_vblank(struct drm_file *file,
+	    union drm_wait_vblank *arg);
+
 #endif /* _KMS_INTERNAL_H_ */

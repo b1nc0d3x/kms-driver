@@ -250,6 +250,17 @@ kms_ioctl_mode_page_flip(struct drm_file *file,
 	if (error == 0) {
 		sx_xlock(&file->dev->mode_config.mutex);
 		crtc->primary_fb = fb;
+		/*
+		 * If PAGE_FLIP_EVENT was requested, stash the requesting
+		 * file + user cookie so the next vblank IRQ emits a
+		 * FLIP_COMPLETE event.  Stub drivers without an IRQ chain
+		 * simply leak the stash — no harm, the cookie storage is
+		 * one pointer.
+		 */
+		if (r->flags & DRM_MODE_PAGE_FLIP_EVENT) {
+			crtc->pending_flip_file = file;
+			crtc->pending_flip_user_data = r->user_data;
+		}
 		sx_xunlock(&file->dev->mode_config.mutex);
 	}
 

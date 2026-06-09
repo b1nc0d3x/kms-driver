@@ -207,6 +207,9 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 	case DRM_IOCTL_MODE_ATOMIC:
 		return (kms_ioctl_mode_atomic(file,
 		    (struct drm_mode_atomic *)data));
+	case DRM_IOCTL_WAIT_VBLANK:
+		return (kms_ioctl_wait_vblank(file,
+		    (union drm_wait_vblank *)data));
 	}
 	return (ENOTTY);
 }

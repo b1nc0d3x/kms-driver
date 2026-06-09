@@ -71,6 +71,19 @@ struct drm_crtc {
 	uint32_t			 x;
 	uint32_t			 y;
 	uint8_t				 mode_valid;
+
+	/*
+	 * VBLANK accounting (Phase 9g).  sequence advances on every
+	 * driver vblank IRQ via kms_vblank_handler; pending_flip
+	 * is the file that armed a PAGE_FLIP_EVENT and the user_data
+	 * cookie that page-flip-event delivery echoes back.  Both are
+	 * protected by drm_device->mode_config.mutex held exclusive
+	 * for mutation, shared for reads.  WAIT_VBLANK sleeps tsleep()
+	 * on &crtc->sequence.
+	 */
+	uint32_t			 sequence;
+	struct drm_file			*pending_flip_file;
+	uint64_t			 pending_flip_user_data;
 };
 
 int	kms_crtc_init(struct drm_device *dev, struct drm_crtc *crtc,

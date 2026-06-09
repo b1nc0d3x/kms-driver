@@ -9,11 +9,28 @@
 
 #include <sys/types.h>
 #include <sys/queue.h>
+#include <sys/mutex.h>
+#include <sys/selinfo.h>
 #include <sys/sx.h>
 
 struct drm_device;
 struct drm_gem_handle;
+struct drm_pending_event;
 TAILQ_HEAD(drm_gem_handle_list, drm_gem_handle);
+TAILQ_HEAD(drm_pending_event_list, drm_pending_event);
+
+/*
+ * Pending kernel→user event queued on a drm_file's event ring.  The
+ * payload is variable-length (a drm_event header followed by the
+ * type-specific bytes — drm_event_vblank for VBLANK/FLIP_COMPLETE).
+ * read() drains entries one at a time and only when the user buffer
+ * is large enough to hold the whole event, matching Linux semantics.
+ */
+struct drm_pending_event {
+	uint32_t			 length;
+	void				*data;	/* malloc'd, length bytes */
+	TAILQ_ENTRY(drm_pending_event)	 link;
+};
 
 /*
  * Per-open state.  Allocated in d_open, freed in d_close.  Lives on
@@ -38,6 +55,18 @@ struct drm_file {
 	struct sx			 handle_lock;
 	struct drm_gem_handle_list	 handles;
 	uint32_t			 next_handle;
+
+	/*
+	 * Kernel→user event ring.  event_mtx protects events list +
+	 * pending byte count + the cv-equivalent wait channel.  Drivers
+	 * push events via kms_send_event from any context (most
+	 * commonly an IRQ vblank handler); userspace pops via read().
+	 * Select/poll integration is via the selinfo (Phase 9g+1).
+	 */
+	struct mtx			 event_mtx;
+	struct drm_pending_event_list	 events;
+	uint32_t			 events_bytes;
+	struct selinfo			 event_select;
 };
 
 #endif /* _KMS_DRM_FILE_H_ */

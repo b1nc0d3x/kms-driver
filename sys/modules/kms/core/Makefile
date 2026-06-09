@@ -11,6 +11,7 @@ SRCS=	drm_atomic.c \
 	drm_drv.c \
 	drm_edid.c \
 	drm_encoder.c \
+	drm_events.c \
 	drm_file.c \
 	drm_framebuffer.c \
 	drm_gem.c \
@@ -68,6 +69,9 @@ EXPORT_SYMS=	M_KMS \
 		kms_mode_object_register_locked \
 		kms_mode_object_unregister \
 		kms_plane_cleanup \
-		kms_plane_init
+		kms_plane_init \
+		kms_send_event \
+		kms_send_vblank_event \
+		kms_vblank_handler
 
 .include <bsd.kmod.mk>
