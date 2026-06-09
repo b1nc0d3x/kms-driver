@@ -36,6 +36,10 @@
 #include <arm/include/fdt.h>
 #include <machine/bus.h>
 
+#include <vm/vm.h>
+#include <vm/pmap.h>
+#include <vm/vm_page.h>
+
 #include <dev/ofw/ofw_bus.h>
 #include <dev/ofw/ofw_bus_subr.h>
 
@@ -48,6 +52,7 @@
 #include <kms/drm_drv.h>
 #include <kms/drm_encoder.h>
 #include <kms/drm_framebuffer.h>
+#include <kms/drm_gem.h>
 #include <kms/drm_mode_config.h>
 #include <kms/drm_modes.h>
 #include <kms/drm_plane.h>
@@ -116,6 +121,72 @@
 #define	VOP_SYS_CTRL_ENABLE	(1u << 11)
 #define	VOP_SYS_CTRL_RGB_EN	(1u << 12)
 #define	VOP_SYS_CTRL_HDMI_EN	(1u << 13)
+
+/*
+ * WIN0 (primary plane) register block.  Programmed at scanout time.
+ * Values mirror the in-tree rk_drm reference; bit-pack semantics
+ * documented in the RK3399 TRM §22.4.
+ */
+#define	VOP_REG_WIN0_CTRL0	0x0030
+#define	VOP_REG_WIN0_YRGB_BUFSIZE 0x0038
+#define	VOP_REG_WIN0_VIR	0x003c
+#define	VOP_REG_WIN0_YRGB_MST	0x0040
+#define	VOP_REG_WIN0_ACT_INFO	0x0048
+#define	VOP_REG_WIN0_DSP_INFO	0x004c
+#define	VOP_REG_WIN0_DSP_ST	0x0050
+#define	VOP_REG_WIN0_SRC_ALPHA	0x0060
+#define	VOP_REG_WIN0_DST_ALPHA	0x0064
+#define	VOP_REG_WIN0_CTRL2	0x006c
+#define	VOP_REG_POST_DSP_HACT	0x0170
+#define	VOP_REG_POST_DSP_VACT	0x0174
+
+#define	VOP_WIN0_CTRL0_UPPER_HDMI 0x00000000u
+#define	VOP_WIN0_LB_MODE_RGB	(4u << 5)
+#define	VOP_WIN0_DATA_FMT_XRGB8888 0x00000000u
+#define	VOP_WIN0_CTRL0_LOWER	(VOP_WIN0_LB_MODE_RGB |			\
+				 VOP_WIN0_DATA_FMT_XRGB8888 | 0x01u)
+#define	VOP_WIN0_CTRL2_PRIMARY	0x00000021u
+
+/*
+ * CRU / VPLL registers — bits the rk_drm reference uses.  Names from
+ * the RK3399 TRM §3.2 (CRU).
+ */
+#define	CRU_VPLL_CON0		0x0080
+#define	CRU_VPLL_CON1		0x0084
+#define	CRU_VPLL_CON2		0x0088
+#define	CRU_VPLL_CON3		0x008c
+
+#define	CRU_PLL_BYPASS		(1u << 1)
+#define	CRU_PLL_POWER_DOWN	(1u << 0)
+#define	CRU_PLL_DSMPD		(1u << 3)
+#define	CRU_PLL_MODE_SLOW	0u
+#define	CRU_PLL_MODE_NORMAL	(1u << 8)
+#define	CRU_VPLL_CON2_LOCK	(1u << 31)
+
+/*
+ * Pixel-clock → VPLL coefficient table.  Lifted verbatim from
+ * rk_drm_hw.c (which itself derives the values from Rockchip's BSP
+ * + measurement on rp64dbg / armbsd).  Phase 9d ships the most-used
+ * subset; rk_drm's full table can be back-ported as more sinks land.
+ */
+struct rk_kms_pll_rate {
+	uint32_t	clock_khz;
+	uint16_t	refdiv;
+	uint16_t	fbdiv;
+	uint16_t	postdiv1;
+	uint16_t	postdiv2;
+};
+
+static const struct rk_kms_pll_rate rk_kms_pll_rates[] = {
+	{  25200, 5,  21, 4, 1 },
+	{  27000, 1,  27, 6, 4 },
+	{  65000, 1,  65, 6, 4 },
+	{  74250, 2,  99, 4, 4 },
+	{ 108000, 3,  54, 4, 1 },
+	{ 148500, 4,  99, 4, 1 },
+};
+
+#define	RK_KMS_PLL_TOLERANCE_KHZ	250
 
 struct rk_kms_softc {
 	device_t			 dev;
@@ -224,6 +295,157 @@ vop_big_write(struct rk_kms_softc *sc, bus_size_t off, uint32_t val)
 	bus_space_write_4(sc->bst, sc->vop_big_bsh, off, val);
 }
 
+static inline uint32_t
+cru_read(struct rk_kms_softc *sc, bus_size_t off)
+{
+	return (bus_space_read_4(sc->bst, sc->cru_bsh, off));
+}
+
+static inline void
+cru_write(struct rk_kms_softc *sc, bus_size_t off, uint32_t val)
+{
+	bus_space_write_4(sc->bst, sc->cru_bsh, off, val);
+}
+
+/*
+ * Pick the PLL coefficient row whose synthesized clock is closest to
+ * the requested pixel clock — within a configurable tolerance so
+ * userspace timing perturbations don't fail the entire modeset.
+ */
+static const struct rk_kms_pll_rate *
+rk_kms_find_pll_rate(uint32_t clock_khz)
+{
+	const struct rk_kms_pll_rate *best = NULL;
+	uint32_t best_delta = UINT32_MAX;
+	uint32_t i, delta;
+
+	for (i = 0; i < nitems(rk_kms_pll_rates); i++) {
+		const struct rk_kms_pll_rate *r = &rk_kms_pll_rates[i];
+
+		delta = (r->clock_khz > clock_khz) ?
+		    (r->clock_khz - clock_khz) :
+		    (clock_khz - r->clock_khz);
+		if (delta < best_delta) {
+			best_delta = delta;
+			best = r;
+		}
+	}
+	if (best == NULL || best_delta > RK_KMS_PLL_TOLERANCE_KHZ)
+		return (NULL);
+	return (best);
+}
+
+/*
+ * Drive VPLL to the requested pixel clock.  Sequence matches the
+ * rk_drm reference: bypass + slow mode, write fbdiv/refdiv/postdivs,
+ * wait for PLL_LOCK in CON2, then flip to normal mode.  Returns 0 on
+ * success, EINVAL if the clock is unsupported, ETIMEDOUT on PLL lock
+ * failure.
+ */
+static int
+rk_kms_program_vpll(struct rk_kms_softc *sc, uint32_t clock_khz)
+{
+	const struct rk_kms_pll_rate *r;
+	const uint32_t con3_mask = (0x3u << 8) | CRU_PLL_DSMPD |
+	    CRU_PLL_BYPASS | CRU_PLL_POWER_DOWN;
+	const uint32_t con1_mask = (0x7u << 12) | (0x7u << 8) | 0x3fu;
+	uint32_t con3;
+	int i;
+
+	r = rk_kms_find_pll_rate(clock_khz);
+	if (r == NULL)
+		return (EINVAL);
+
+	con3 = CRU_PLL_MODE_SLOW | CRU_PLL_DSMPD | CRU_PLL_POWER_DOWN;
+	cru_write(sc, CRU_VPLL_CON3, (con3_mask << 16) | con3);
+	DELAY(2);
+
+	cru_write(sc, CRU_VPLL_CON0, (0x0fffu << 16) | r->fbdiv);
+	cru_write(sc, CRU_VPLL_CON1, (con1_mask << 16) |
+	    (r->postdiv2 << 12) | (r->postdiv1 << 8) | r->refdiv);
+	cru_write(sc, CRU_VPLL_CON2, 0u);
+
+	con3 = CRU_PLL_MODE_SLOW | CRU_PLL_DSMPD;
+	cru_write(sc, CRU_VPLL_CON3, (con3_mask << 16) | con3);
+
+	for (i = 0; i < 5000; i++) {
+		if (cru_read(sc, CRU_VPLL_CON2) & CRU_VPLL_CON2_LOCK)
+			break;
+		DELAY(10);
+	}
+	if (i == 5000)
+		return (ETIMEDOUT);
+
+	con3 = CRU_PLL_MODE_NORMAL | CRU_PLL_DSMPD;
+	cru_write(sc, CRU_VPLL_CON3, (con3_mask << 16) | con3);
+	return (0);
+}
+
+/*
+ * Resolve the physical base of a framebuffer's first GEM plane.  Our
+ * drm_gem_object stores pages as a contiguous wired allocation
+ * (vm_page_alloc_noobj_contig), so the base address of pages[0] is
+ * the linear scanout address VOP_REG_WIN0_YRGB_MST wants.  Returns 0
+ * if the framebuffer has no GEM backing.
+ */
+static vm_paddr_t
+rk_kms_fb_paddr(struct drm_framebuffer *fb)
+{
+	struct drm_gem_object *obj;
+
+	if (fb == NULL)
+		return (0);
+	obj = fb->gem_objs[0];
+	if (obj == NULL || obj->pages == NULL || obj->npages == 0)
+		return (0);
+	return (VM_PAGE_TO_PHYS(obj->pages[0]));
+}
+
+/*
+ * Program VOP_BIG WIN0 to scan out `fb` according to `mode`.  Bit
+ * patterns mirror rk_drm_vop_program_win0_opaque (HDMI route): no
+ * CSC, no forced-opaque alpha, XRGB8888 line-buffer mode.  All 32-bit
+ * registers; shadow latch is the trailing CFG_DONE write back in
+ * vop_program_timing.
+ */
+static void
+rk_kms_vop_program_win0(struct rk_kms_softc *sc,
+    const struct drm_display_mode *mode, struct drm_framebuffer *fb,
+    uint32_t hact_start, uint32_t vact_start)
+{
+	uint32_t stride_bytes, stride_words;
+	vm_paddr_t pa;
+
+	pa = rk_kms_fb_paddr(fb);
+	if (pa == 0) {
+		DPRINTF(sc, "win0: no fb pa, skipping\n");
+		return;
+	}
+	stride_bytes = roundup2(mode->hdisplay, 16) * 4u;	/* XR24 */
+	stride_words = stride_bytes / 4u;
+
+	vop_big_write(sc, VOP_REG_WIN0_YRGB_BUFSIZE, 0u);
+	vop_big_write(sc, VOP_REG_WIN0_VIR, stride_words);
+	vop_big_write(sc, VOP_REG_WIN0_YRGB_MST, (uint32_t)pa);
+	vop_big_write(sc, VOP_REG_WIN0_ACT_INFO,
+	    (((uint32_t)mode->vdisplay - 1u) << 16) |
+	    ((uint32_t)mode->hdisplay - 1u));
+	vop_big_write(sc, VOP_REG_WIN0_DSP_INFO,
+	    (((uint32_t)mode->vdisplay - 1u) << 16) |
+	    ((uint32_t)mode->hdisplay - 1u));
+	vop_big_write(sc, VOP_REG_WIN0_DSP_ST,
+	    (vact_start << 16) | hact_start);
+	vop_big_write(sc, VOP_REG_WIN0_CTRL2, VOP_WIN0_CTRL2_PRIMARY);
+	vop_big_write(sc, VOP_REG_POST_DSP_HACT,
+	    (hact_start << 16) | (hact_start + mode->hdisplay));
+	vop_big_write(sc, VOP_REG_POST_DSP_VACT,
+	    (vact_start << 16) | (vact_start + mode->vdisplay));
+	vop_big_write(sc, VOP_REG_WIN0_CTRL0,
+	    VOP_WIN0_CTRL0_UPPER_HDMI | VOP_WIN0_CTRL0_LOWER);
+	DPRINTF(sc, "win0: pa=0x%jx stride=%u (%u words)\n",
+	    (uintmax_t)pa, stride_bytes, stride_words);
+}
+
 /*
  * Compute VOP DSP timing field values from a drm_display_mode.  Same
  * arithmetic the in-tree rk_drm uses: HACT_ST is the offset from the
@@ -260,13 +482,19 @@ rk_kms_vact_start(const struct drm_display_mode *m)
  */
 static void
 rk_kms_vop_program_timing(struct rk_kms_softc *sc,
-    const struct drm_display_mode *mode)
+    const struct drm_display_mode *mode, struct drm_framebuffer *fb)
 {
 	uint32_t hact_start = rk_kms_hact_start(mode);
 	uint32_t vact_start = rk_kms_vact_start(mode);
 	uint32_t hsync_len = mode->hsync_end - mode->hsync_start;
 	uint32_t vsync_len = mode->vsync_end - mode->vsync_start;
 	uint32_t sys_ctrl;
+	int error;
+
+	error = rk_kms_program_vpll(sc, mode->clock);
+	if (error != 0)
+		DPRINTF(sc, "VPLL %u kHz: %d (continuing with current PLL)\n",
+		    mode->clock, error);
 
 	sys_ctrl = vop_big_read(sc, VOP_REG_SYS_CTRL);
 	sys_ctrl &= ~(VOP_SYS_CTRL_STANDBY | VOP_SYS_CTRL_MMU_EN);
@@ -282,6 +510,8 @@ rk_kms_vop_program_timing(struct rk_kms_softc *sc,
 	    ((uint32_t)mode->vtotal << 16) | vsync_len);
 	vop_big_write(sc, VOP_REG_DSP_VACT,
 	    (vact_start << 16) | (vact_start + mode->vdisplay));
+
+	rk_kms_vop_program_win0(sc, mode, fb, hact_start, vact_start);
 
 	/* Shadow-register commit.  Same value-of-1 the rk_drm reference
 	 * uses to latch the timing block in one shot. */
@@ -301,7 +531,7 @@ rk_kms_set_config(struct drm_mode_set *set)
 		    set->fb != NULL ? set->fb->base.id : 0,
 		    sc->commit_modeset);
 		if (sc->commit_modeset != 0 && sc->hw_attached)
-			rk_kms_vop_program_timing(sc, set->mode);
+			rk_kms_vop_program_timing(sc, set->mode, set->fb);
 	} else {
 		DPRINTF(sc, "set_config: blank (commit=%d)\n",
 		    sc->commit_modeset);
