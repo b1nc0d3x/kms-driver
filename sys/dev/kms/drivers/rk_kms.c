@@ -43,7 +43,14 @@
 #include <vm/vm_page.h>
 
 #include <sys/fbio.h>
-#include "fb_if.h"
+#include <dev/vt/vt.h>
+#include <dev/vt/hw/fb/vt_fb.h>
+/*
+ * vt/vt.h #defines DPRINTF for its own debug noise; we re-define it
+ * below with a softc-aware variant.  Undef here so the local
+ * definition wins without warnings.
+ */
+#undef DPRINTF
 
 #include <dev/ofw/ofw_bus.h>
 #include <dev/ofw/ofw_bus_subr.h>
@@ -558,6 +565,7 @@ struct rk_kms_softc {
 	size_t				 fb_size;
 	struct fb_info			 fb_info;
 	bool				 fb_published;
+	bool				 vt_fb_attached;
 };
 
 #define	RK_KMS_FB_WIDTH	1920
@@ -1520,16 +1528,6 @@ rk_kms_fb_free(struct rk_kms_softc *sc)
 	sc->fb_size = 0;
 }
 
-static struct fb_info *
-rk_kms_fb_getinfo(device_t dev)
-{
-	struct rk_kms_softc *sc = device_get_softc(dev);
-
-	if (!sc->fb_published)
-		return (NULL);
-	return (&sc->fb_info);
-}
-
 /*
  * Run cdn_dp's full 19-stage bring-up + frame video-active arm.
  * Shared between the sysctl trigger and the altmode-entry poller.
@@ -1947,21 +1945,24 @@ rk_kms_attach(device_t dev)
 	callout_reset(&sc->usbc_poll, hz / 2, rk_kms_usbc_poll, sc);
 
 	/*
-	 * Phase 12 — boot fb + fbd child so vt has something to
-	 * register against.  Non-fatal if allocation fails; we just
-	 * lose /dev/ttyv* and Xorg can't start, but card0 / DP path
-	 * still work for headless / DRM-direct clients.
+	 * Phase 12 — boot fb + direct vt_fb_attach.  Skipping the
+	 * fbd_driver middleman because fbd is Giant-locked and tagged
+	 * for removal by FreeBSD 16.0; calling vt_fb_attach with our
+	 * fb_info directly does the same vt registration without the
+	 * deprecated fbd layer.  Non-fatal on failure: card0 + DP still
+	 * work for headless / DRM-direct clients, we just lose
+	 * /dev/ttyv* (so Xorg can't grab a VT).
 	 */
 	if (rk_kms_fb_alloc(sc) != 0) {
 		device_printf(dev,
-		    "boot fb alloc failed; fbd / vt bridge skipped\n");
+		    "boot fb alloc failed; vt bridge skipped\n");
 	} else {
-		device_t fbdev = device_add_child(dev, "fbd",
-		    device_get_unit(dev));
-		if (fbdev == NULL)
-			device_printf(dev, "fbd child add failed\n");
+		int verr = vt_fb_attach(&sc->fb_info);
+		if (verr != 0)
+			device_printf(dev,
+			    "vt_fb_attach failed: %d (no /dev/ttyv*)\n", verr);
 		else
-			bus_attach_children(dev);
+			sc->vt_fb_attached = true;
 	}
 
 	device_printf(dev, "registered (Phase 9c: VOP code wired behind "
@@ -1977,7 +1978,10 @@ rk_kms_detach(device_t dev)
 	sc = device_get_softc(dev);
 	sc->usbc_poll_armed = false;
 	callout_drain(&sc->usbc_poll);
-	bus_generic_detach(dev);
+	if (sc->vt_fb_attached) {
+		vt_fb_detach(&sc->fb_info);
+		sc->vt_fb_attached = false;
+	}
 	rk_kms_fb_free(sc);
 	rk_kms_vblank_stop(sc);
 	if (sc->drm_dev != NULL) {
@@ -1993,7 +1997,6 @@ static device_method_t rk_kms_methods[] = {
 	DEVMETHOD(device_probe,		rk_kms_probe),
 	DEVMETHOD(device_attach,	rk_kms_attach),
 	DEVMETHOD(device_detach,	rk_kms_detach),
-	DEVMETHOD(fb_getinfo,		rk_kms_fb_getinfo),
 	DEVMETHOD_END
 };
 
@@ -2029,10 +2032,3 @@ MODULE_DEPEND(rk_kms, rk_cdn_dp, 1, 1, 1);
  * removed instead of crashing on first call.
  */
 MODULE_DEPEND(rk_kms, fusb302, 1, 2, 2);
-
-/*
- * Phase 12 — attach fbd as our child so it can call our fb_getinfo
- * DEVMETHOD, register with vt_fb, and publish /dev/fb0 + /dev/ttyv*.
- */
-extern driver_t fbd_driver;
-DRIVER_MODULE(fbd, rk_kms, fbd_driver, 0, 0);
