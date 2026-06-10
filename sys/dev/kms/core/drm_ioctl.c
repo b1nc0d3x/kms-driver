@@ -103,11 +103,24 @@ drm_ioctl_get_cap(struct drm_file *file __unused, struct drm_get_cap *c)
 	 */
 	switch (c->capability) {
 	case DRM_CAP_DUMB_BUFFER:
-	case DRM_CAP_VBLANK_HIGH_CRTC:
+		/*
+		 * Phase 6 implements CREATE_DUMB / MAP_DUMB / DESTROY_DUMB +
+		 * mmap via cdev_pager.  Xorg's modesetting driver refuses to
+		 * load without this, even if it never calls CREATE_DUMB.
+		 */
+		c->value = 1;
+		return (0);
 	case DRM_CAP_DUMB_PREFERRED_DEPTH:
+		c->value = 24;
+		return (0);
 	case DRM_CAP_DUMB_PREFER_SHADOW:
-	case DRM_CAP_PRIME:
+		c->value = 1;
+		return (0);
 	case DRM_CAP_TIMESTAMP_MONOTONIC:
+		c->value = 1;
+		return (0);
+	case DRM_CAP_VBLANK_HIGH_CRTC:
+	case DRM_CAP_PRIME:
 	case DRM_CAP_ASYNC_PAGE_FLIP:
 	case DRM_CAP_CURSOR_WIDTH:
 	case DRM_CAP_CURSOR_HEIGHT:
@@ -135,6 +148,18 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 		return (error);
 
 	switch (cmd) {
+	case DRM_IOCTL_SET_MASTER:
+	case DRM_IOCTL_DROP_MASTER:
+		/*
+		 * Phase 12: minimal master semantics — first opener is
+		 * already implicit master (kms_open sets is_master on
+		 * open_count==1), and we don't yet enforce single-master
+		 * exclusivity.  Xorg + modesetting just need both ioctls to
+		 * succeed so its ScreenInit path can proceed.  Multi-X
+		 * coexistence isn't a use case anyone will hit before we
+		 * port a second consumer.
+		 */
+		return (0);
 	case DRM_IOCTL_VERSION:
 		return (drm_ioctl_version(file, (struct drm_version *)data));
 	case DRM_IOCTL_GET_UNIQUE:

@@ -42,6 +42,9 @@
 #include <vm/pmap.h>
 #include <vm/vm_page.h>
 
+#include <sys/fbio.h>
+#include "fb_if.h"
+
 #include <dev/ofw/ofw_bus.h>
 #include <dev/ofw/ofw_bus_subr.h>
 
@@ -531,7 +534,38 @@ struct rk_kms_softc {
 	struct callout			 usbc_poll;
 	uint32_t			 usbc_attach_seq_done;
 	bool				 usbc_poll_armed;
+
+	/*
+	 * Phase 12 — vt console framebuffer bridge.
+	 *
+	 * Allocate a contiguous physical framebuffer at attach time,
+	 * publish it via the fb_getinfo DEVMETHOD, and attach fbd_driver
+	 * as our child.  fbd publishes /dev/fb0 + registers with vt_fb,
+	 * which gives us /dev/ttyv* — which is what Xorg's xf86OpenConsole
+	 * needs to grab a VT.
+	 *
+	 * VOP scanout from this buffer is wired by the SETCRTC path or
+	 * by the bootfb sysctl in Phase 12 part 2.  For Phase 12 part 1
+	 * we just want the device nodes to exist so Xorg can start.
+	 *
+	 * Hardcoded 1920x1080 XRGB8888 boot fb; matches the canned mode
+	 * the stub connector advertises.
+	 */
+	bus_dma_tag_t			 fb_dma_tag;
+	bus_dmamap_t			 fb_dma_map;
+	vm_offset_t			 fb_va;
+	vm_paddr_t			 fb_pa;
+	size_t				 fb_size;
+	struct fb_info			 fb_info;
+	bool				 fb_published;
 };
+
+#define	RK_KMS_FB_WIDTH	1920
+#define	RK_KMS_FB_HEIGHT	1080
+#define	RK_KMS_FB_BPP	32	/* XRGB8888 */
+#define	RK_KMS_FB_STRIDE	(RK_KMS_FB_WIDTH * 4)
+#define	RK_KMS_FB_SIZE	(RK_KMS_FB_STRIDE *		\
+				 RK_KMS_FB_HEIGHT)
 
 static const struct ofw_compat_data rk_kms_compat_data[] = {
 	{ "rockchip,display-subsystem",	1 },
@@ -1389,6 +1423,114 @@ rk_kms_dp_modeset(struct rk_kms_softc *sc,
 }
 
 /*
+ * Phase 12 — boot framebuffer + fbd bridge.
+ *
+ * Allocate a 1920x1080 XRGB8888 framebuffer via bus_dma so we have both
+ * a kernel VA (for vt to write to) and a contig physical address
+ * (for VOP_BIG WIN0 to scan).  Populate sc->fb_info so the fb_getinfo
+ * DEVMETHOD has something to return.  The actual VOP wire-up to scan
+ * from sc->fb_pa is left to SETCRTC / a future bootfb sysctl — Phase 12
+ * part 1 only wants /dev/ttyv* to exist so Xorg can grab a console.
+ */
+static void
+rk_kms_fb_dma_cb(void *arg, bus_dma_segment_t *segs, int nseg, int error)
+{
+	bus_addr_t *fb_busaddr = arg;
+
+	if (error != 0 || nseg != 1)
+		return;
+	*fb_busaddr = segs[0].ds_addr;
+}
+
+static int
+rk_kms_fb_alloc(struct rk_kms_softc *sc)
+{
+	bus_addr_t fb_busaddr;
+	void *fb_kva;
+	int error;
+
+	sc->fb_size = RK_KMS_FB_SIZE;
+	error = bus_dma_tag_create(NULL, PAGE_SIZE, 0,
+	    BUS_SPACE_MAXADDR_32BIT, BUS_SPACE_MAXADDR,
+	    NULL, NULL, sc->fb_size, 1, sc->fb_size, 0,
+	    NULL, NULL, &sc->fb_dma_tag);
+	if (error != 0)
+		return (error);
+
+	error = bus_dmamem_alloc(sc->fb_dma_tag, &fb_kva,
+	    BUS_DMA_WAITOK | BUS_DMA_COHERENT | BUS_DMA_ZERO,
+	    &sc->fb_dma_map);
+	if (error != 0) {
+		bus_dma_tag_destroy(sc->fb_dma_tag);
+		sc->fb_dma_tag = NULL;
+		return (error);
+	}
+
+	fb_busaddr = 0;
+	error = bus_dmamap_load(sc->fb_dma_tag, sc->fb_dma_map, fb_kva,
+	    sc->fb_size, rk_kms_fb_dma_cb, &fb_busaddr, BUS_DMA_WAITOK);
+	if (error != 0 || fb_busaddr == 0) {
+		bus_dmamem_free(sc->fb_dma_tag, fb_kva, sc->fb_dma_map);
+		bus_dma_tag_destroy(sc->fb_dma_tag);
+		sc->fb_dma_tag = NULL;
+		sc->fb_dma_map = NULL;
+		return (error != 0 ? error : ENXIO);
+	}
+
+	sc->fb_va = (vm_offset_t)fb_kva;
+	sc->fb_pa = (vm_paddr_t)fb_busaddr;
+
+	memset(&sc->fb_info, 0, sizeof(sc->fb_info));
+	sc->fb_info.fb_name = device_get_nameunit(sc->dev);
+	sc->fb_info.fb_vbase = sc->fb_va;
+	sc->fb_info.fb_pbase = sc->fb_pa;
+	sc->fb_info.fb_size = sc->fb_size;
+	sc->fb_info.fb_bpp = RK_KMS_FB_BPP;
+	sc->fb_info.fb_depth = 24;
+	sc->fb_info.fb_width = RK_KMS_FB_WIDTH;
+	sc->fb_info.fb_height = RK_KMS_FB_HEIGHT;
+	sc->fb_info.fb_stride = RK_KMS_FB_STRIDE;
+	sc->fb_info.fb_flags = FB_FLAG_MEMATTR;
+	sc->fb_info.fb_memattr = VM_MEMATTR_WRITE_COMBINING;
+	sc->fb_published = true;
+	device_printf(sc->dev,
+	    "boot fb: pa=0x%jx va=0x%lx size=%zu stride=%d %dx%d bpp=%d\n",
+	    (uintmax_t)sc->fb_pa, (unsigned long)sc->fb_va, sc->fb_size,
+	    sc->fb_info.fb_stride, sc->fb_info.fb_width,
+	    sc->fb_info.fb_height, sc->fb_info.fb_bpp);
+	return (0);
+}
+
+static void
+rk_kms_fb_free(struct rk_kms_softc *sc)
+{
+	sc->fb_published = false;
+	if (sc->fb_dma_tag != NULL) {
+		if (sc->fb_dma_map != NULL && sc->fb_va != 0)
+			bus_dmamap_unload(sc->fb_dma_tag, sc->fb_dma_map);
+		if (sc->fb_va != 0)
+			bus_dmamem_free(sc->fb_dma_tag, (void *)sc->fb_va,
+			    sc->fb_dma_map);
+		bus_dma_tag_destroy(sc->fb_dma_tag);
+	}
+	sc->fb_dma_tag = NULL;
+	sc->fb_dma_map = NULL;
+	sc->fb_va = 0;
+	sc->fb_pa = 0;
+	sc->fb_size = 0;
+}
+
+static struct fb_info *
+rk_kms_fb_getinfo(device_t dev)
+{
+	struct rk_kms_softc *sc = device_get_softc(dev);
+
+	if (!sc->fb_published)
+		return (NULL);
+	return (&sc->fb_info);
+}
+
+/*
  * Run cdn_dp's full 19-stage bring-up + frame video-active arm.
  * Shared between the sysctl trigger and the altmode-entry poller.
  * Both calls are idempotent; on a link that's already trained this
@@ -1804,6 +1946,24 @@ rk_kms_attach(device_t dev)
 	sc->usbc_poll_armed = true;
 	callout_reset(&sc->usbc_poll, hz / 2, rk_kms_usbc_poll, sc);
 
+	/*
+	 * Phase 12 — boot fb + fbd child so vt has something to
+	 * register against.  Non-fatal if allocation fails; we just
+	 * lose /dev/ttyv* and Xorg can't start, but card0 / DP path
+	 * still work for headless / DRM-direct clients.
+	 */
+	if (rk_kms_fb_alloc(sc) != 0) {
+		device_printf(dev,
+		    "boot fb alloc failed; fbd / vt bridge skipped\n");
+	} else {
+		device_t fbdev = device_add_child(dev, "fbd",
+		    device_get_unit(dev));
+		if (fbdev == NULL)
+			device_printf(dev, "fbd child add failed\n");
+		else
+			bus_attach_children(dev);
+	}
+
 	device_printf(dev, "registered (Phase 9c: VOP code wired behind "
 	    "commit_modeset sysctl, default off)\n");
 	return (0);
@@ -1817,6 +1977,8 @@ rk_kms_detach(device_t dev)
 	sc = device_get_softc(dev);
 	sc->usbc_poll_armed = false;
 	callout_drain(&sc->usbc_poll);
+	bus_generic_detach(dev);
+	rk_kms_fb_free(sc);
 	rk_kms_vblank_stop(sc);
 	if (sc->drm_dev != NULL) {
 		rk_kms_topology_teardown(sc);
@@ -1831,6 +1993,7 @@ static device_method_t rk_kms_methods[] = {
 	DEVMETHOD(device_probe,		rk_kms_probe),
 	DEVMETHOD(device_attach,	rk_kms_attach),
 	DEVMETHOD(device_detach,	rk_kms_detach),
+	DEVMETHOD(fb_getinfo,		rk_kms_fb_getinfo),
 	DEVMETHOD_END
 };
 
@@ -1865,4 +2028,11 @@ MODULE_DEPEND(rk_kms, rk_cdn_dp, 1, 1, 1);
  * fail kldload cleanly if someone runs on a kernel where fusb302 was
  * removed instead of crashing on first call.
  */
-MODULE_DEPEND(rk_kms, fusb302, 1, 1, 1);
+MODULE_DEPEND(rk_kms, fusb302, 1, 2, 2);
+
+/*
+ * Phase 12 — attach fbd as our child so it can call our fb_getinfo
+ * DEVMETHOD, register with vt_fb, and publish /dev/fb0 + /dev/ttyv*.
+ */
+extern driver_t fbd_driver;
+DRIVER_MODULE(fbd, rk_kms, fbd_driver, 0, 0);
