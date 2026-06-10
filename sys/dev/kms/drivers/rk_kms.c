@@ -32,6 +32,7 @@
 #include <sys/module.h>
 #include <sys/rman.h>
 #include <sys/sysctl.h>
+#include <sys/callout.h>
 #include <sys/taskqueue.h>
 
 #include <arm/include/fdt.h>
@@ -75,9 +76,20 @@ int	rk_cdn_dp_enable_mode(uint32_t clock, uint16_t hdisplay,
 	    uint16_t vtotal, uint32_t flags);
 int	rk_cdn_dp_set_video_active_first(bool active);
 
+/*
+ * fusb302 helpers — declared in <dev/iicbus/usb/fusb302_var.h>, but
+ * fusb302 is statically linked into RP64KERN_KMS so the
+ * symbols are always resolvable from this module.  Used by the
+ * altmode-entry poller (Phase 11) to fire DP bring-up automatically
+ * once fusb302 sees the cable enter DP altmode, without waiting for
+ * SETCRTC from X.
+ */
+#include <dev/iicbus/usb/fusb302_var.h>
+
 struct rk_kms_softc;
 static int rk_kms_dp_modeset(struct rk_kms_softc *sc,
     const struct drm_display_mode *mode);
+static void rk_kms_usbc_poll(void *arg);
 
 #define	RK_KMS_DESC	"Rockchip RK3399 display (kms)"
 
@@ -495,6 +507,30 @@ struct rk_kms_softc {
 	 * Controlled by dev.rk_kms.0.debug.
 	 */
 	int				 debug;
+
+	/*
+	 * USB-C DP altmode-entry poller (Phase 11).
+	 *
+	 * Polls fusb302's attach_seq + dp_altmode state every 500 ms.
+	 * When a fresh attach completes with DP altmode ready+valid AND
+	 * we have not yet brought the link up for this attach_seq, fire
+	 * rk_cdn_dp_auto_bringup_default + set_video_active_first(true).
+	 *
+	 * The alternative — wire a notify callback through rk_typec_phy
+	 * — would be cleaner but means new ABI on rk_typec_phy.  Polling
+	 * costs one i2c-free softc-field read per tick and has no side
+	 * effects; the heavy work only runs on edge.
+	 *
+	 * Gated by dp_enable=1 and output==RK_KMS_OUT_DP.
+	 *
+	 * usbc_attach_seq_done is the last attach_seq we successfully
+	 * fired bring-up against.  Setting it back to 0 (via the
+	 * usbc_bringup_now sysctl with arg 2) forces a re-fire even
+	 * without a fresh attach.
+	 */
+	struct callout			 usbc_poll;
+	uint32_t			 usbc_attach_seq_done;
+	bool				 usbc_poll_armed;
 };
 
 static const struct ofw_compat_data rk_kms_compat_data[] = {
@@ -1353,6 +1389,106 @@ rk_kms_dp_modeset(struct rk_kms_softc *sc,
 }
 
 /*
+ * Run cdn_dp's full 19-stage bring-up + frame video-active arm.
+ * Shared between the sysctl trigger and the altmode-entry poller.
+ * Both calls are idempotent; on a link that's already trained this
+ * is fast.  Returns the two errno values so callers can log them.
+ */
+static void
+rk_kms_usbc_bringup(struct rk_kms_softc *sc, const char *cause)
+{
+	int brerr, vaerr;
+
+	brerr = rk_cdn_dp_auto_bringup_default();
+	vaerr = rk_cdn_dp_set_video_active_first(true);
+	device_printf(sc->dev,
+	    "%s: auto_bringup=%d video_active=%d\n", cause, brerr, vaerr);
+}
+
+/*
+ * Trigger cdn_dp's full 19-stage bring-up + frame video-active arm,
+ * without going through SETCRTC.  Useful for manual debug; the
+ * Phase 11 poller below normally takes care of this automatically.
+ *
+ * Writing 1 fires the bring-up.  Writing 2 also resets the poller's
+ * "already fired against this attach_seq" tracker so the next poll
+ * tick re-fires (useful when the bring-up succeeded but the sink
+ * dropped HPD and we want to retry without yanking the cable).
+ */
+static int
+rk_kms_usbc_bringup_now_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_kms_softc *sc = arg1;
+	int trigger = 0;
+	int error;
+
+	error = sysctl_handle_int(oidp, &trigger, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (trigger == 0)
+		return (0);
+	if (trigger >= 2)
+		sc->usbc_attach_seq_done = 0;
+	rk_kms_usbc_bringup(sc, "usbc_bringup_now");
+	return (0);
+}
+
+/*
+ * Phase 11 — altmode-entry poller.
+ *
+ * Runs every 500 ms while the driver is attached.  Reads fusb302's
+ * attach_seq and DP altmode state; if a fresh cable attach has gone
+ * all the way through DP altmode entry (dp_ready && valid) and we
+ * haven't yet fired bring-up for this attach_seq, fire it.
+ *
+ * Why polling instead of a notify callback: a notify path would need
+ * new ABI on either fusb302 or rk_typec_phy and ordering guarantees
+ * I'd rather not commit to before getting the polled version working
+ * end-to-end.  500 ms is comfortably above any visible-to-user
+ * latency once the cable is in.
+ */
+static void
+rk_kms_usbc_poll(void *arg)
+{
+	struct rk_kms_softc *sc = arg;
+	device_t fdev;
+	devclass_t fdc;
+	struct rk3399_typec_dp_altmode_status alt;
+	uint32_t seq;
+
+	if (!sc->usbc_poll_armed)
+		return;
+	if (sc->dp_enable == 0 || sc->output != RK_KMS_OUT_DP)
+		goto reschedule;
+
+	fdc = devclass_find("fusb302");
+	if (fdc == NULL)
+		goto reschedule;
+	fdev = devclass_get_device(fdc, 0);
+	if (fdev == NULL)
+		goto reschedule;
+
+	seq = fusb302_get_attach_seq(fdev);
+	if (seq == sc->usbc_attach_seq_done)
+		goto reschedule;
+	if (fusb302_get_dp_altmode_state(fdev, &alt) != 0)
+		goto reschedule;
+	if (!alt.valid || !alt.dp_ready)
+		goto reschedule;
+
+	device_printf(sc->dev,
+	    "usbc_poll: altmode ready (seq=%u pin=%u status=0x%x); firing "
+	    "bring-up\n", seq, alt.pin_assignment, alt.dp_status);
+	rk_kms_usbc_bringup(sc, "usbc_poll");
+	sc->usbc_attach_seq_done = seq;
+
+reschedule:
+	if (sc->usbc_poll_armed)
+		callout_reset(&sc->usbc_poll, hz / 2,
+		    rk_kms_usbc_poll, sc);
+}
+
+/*
  * Self-rearming vblank ticker.  Each fire advances the framework's
  * per-CRTC sequence counter, wakes WAIT_VBLANK sleepers, and delivers
  * any pending FLIP_COMPLETE event from a PAGE_FLIP_EVENT-armed
@@ -1648,6 +1784,25 @@ rk_kms_attach(device_t dev)
 	    "dp_enable", CTLFLAG_RW, &sc->dp_enable, 0,
 	    "Drive Cadence MHDP DP TX through set_config "
 	    "(Phase 9h: requires output=1)");
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "usbc_bringup_now",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE, sc, 0,
+	    rk_kms_usbc_bringup_now_sysctl, "I",
+	    "Write 1 to run rk_cdn_dp_auto_bringup_default + "
+	    "set_video_active_first(true) without going through "
+	    "SETCRTC.  Idempotent.  Write 2 to also reset the poller "
+	    "tracker so the next tick re-fires.");
+
+	/*
+	 * Arm the Phase 11 altmode-entry poller.  No work happens
+	 * until dp_enable=1 + output=1, but we run the tick
+	 * unconditionally so toggling either sysctl post-boot starts
+	 * the bring-up on the next half-second tick.
+	 */
+	callout_init(&sc->usbc_poll, 1);
+	sc->usbc_poll_armed = true;
+	callout_reset(&sc->usbc_poll, hz / 2, rk_kms_usbc_poll, sc);
 
 	device_printf(dev, "registered (Phase 9c: VOP code wired behind "
 	    "commit_modeset sysctl, default off)\n");
@@ -1660,6 +1815,8 @@ rk_kms_detach(device_t dev)
 	struct rk_kms_softc *sc;
 
 	sc = device_get_softc(dev);
+	sc->usbc_poll_armed = false;
+	callout_drain(&sc->usbc_poll);
 	rk_kms_vblank_stop(sc);
 	if (sc->drm_dev != NULL) {
 		rk_kms_topology_teardown(sc);
@@ -1684,6 +1841,13 @@ static driver_t rk_kms_driver_kdrv = {
 };
 
 DRIVER_MODULE(rk_kms, simplebus, rk_kms_driver_kdrv, 0, 0);
+/*
+ * The rockchip,display-subsystem node lives at the device-tree root
+ * on the upstream RK3399 DTS, so it's enumerated directly by ofwbus.
+ * Match how the in-tree rk_drm does it (DRIVER_MODULE on both buses)
+ * so the driver attaches regardless of where the node hangs.
+ */
+DRIVER_MODULE(rk_kms, ofwbus, rk_kms_driver_kdrv, 0, 0);
 MODULE_VERSION(rk_kms, 1);
 MODULE_DEPEND(rk_kms, kms, 1, 1, 1);
 /*
@@ -1695,3 +1859,10 @@ MODULE_DEPEND(rk_kms, kms, 1, 1, 1);
  * rather than crash later from a NULL function pointer.
  */
 MODULE_DEPEND(rk_kms, rk_cdn_dp, 1, 1, 1);
+/*
+ * fusb302 supplies the altmode-entry signals (attach_seq + DP altmode
+ * status) that the Phase 11 poller reads.  Declared MODULE_DEPEND to
+ * fail kldload cleanly if someone runs on a kernel where fusb302 was
+ * removed instead of crashing on first call.
+ */
+MODULE_DEPEND(rk_kms, fusb302, 1, 1, 1);
