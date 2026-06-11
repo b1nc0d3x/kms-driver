@@ -884,6 +884,8 @@ rk_kms_hdmi_phy_i2c_reset(struct rk_kms_softc *sc)
 			return (0);
 		DELAY(10);
 	}
+	DPRINTF(sc, "phy i2c reset timed out (SOFTRSTZ=0x%02x)\n",
+	    hdmi_read1(sc, HDMI_PHY_I2CM_SOFTRSTZ));
 	return (ETIMEDOUT);
 }
 
@@ -896,11 +898,15 @@ static int
 rk_kms_hdmi_phy_i2c_write(struct rk_kms_softc *sc, uint8_t reg,
     uint16_t val)
 {
-	uint8_t err, sticky;
+	uint8_t err, sticky, ctlint_init, stat0_init;
 	int t;
 
-	if (rk_kms_hdmi_phy_i2c_reset(sc) != 0)
+	if (rk_kms_hdmi_phy_i2c_reset(sc) != 0) {
+		DPRINTF(sc, "phy i2c reset failed (reg=0x%02x)\n", reg);
 		return (ETIMEDOUT);
+	}
+	ctlint_init = hdmi_read1(sc, HDMI_PHY_I2CM_CTLINT);
+	stat0_init = hdmi_read1(sc, HDMI_IH_I2CMPHY_STAT0);
 
 	hdmi_write1(sc, HDMI_IH_I2CMPHY_STAT0, 0x03);
 	hdmi_write1(sc, HDMI_PHY_I2CM_SLAVE, HDMI_PHY_I2C_ADDR);
@@ -922,6 +928,9 @@ rk_kms_hdmi_phy_i2c_write(struct rk_kms_softc *sc, uint8_t reg,
 			return (EIO);
 		}
 	}
+	DPRINTF(sc, "phy i2c write reg=0x%02x val=0x%04x TIMEOUT "
+	    "(ctlint init/final=0x%02x/0x%02x stat0 init/final=0x%02x/0x%02x)\n",
+	    reg, val, ctlint_init, err, stat0_init, sticky);
 	return (ETIMEDOUT);
 }
 
@@ -1183,6 +1192,122 @@ rk_kms_hdmi_program_av_composer(struct rk_kms_softc *sc,
 	hdmi_write1(sc, HDMI_FC_VSYNCINWIDTH, vsync & 0xff);
 
 	hdmi_write1(sc, HDMI_FC_AVIVID, rk_kms_cea_vic(m));
+}
+
+/*
+ * DVI-mode bring-up — programs the video composer with hdmi_mode=false
+ * and clears the HDMIDVI bit so the HDCP shim treats the link as DVI.
+ * Called from hdmi_init_mode below before the PHY MPLL i2c writes;
+ * without it the DW HDMI controller leaves the framer in a state that
+ * blocks the PHY i2c master (its done bit never fires).
+ */
+static void
+rk_kms_hdmi_enable_dvi(struct rk_kms_softc *sc,
+    const struct drm_display_mode *m)
+{
+	uint8_t hdcpcfg0;
+
+	rk_kms_hdmi_program_av_composer(sc, m, false);
+	hdcpcfg0 = hdmi_read1(sc, HDMI_A_HDCPCFG0);
+	hdcpcfg0 &= ~HDMI_A_HDCPCFG0_HDMIDVI;
+	hdmi_write1(sc, HDMI_A_HDCPCFG0, hdcpcfg0);
+	hdmi_write1(sc, HDMI_A_HDCPCFG1, HDMI_A_HDCPCFG1_DEFAULT);
+	hdmi_write1(sc, HDMI_A_VIDPOLCFG, HDMI_A_VIDPOLCFG_DATAENPOL);
+}
+
+/*
+ * Pre-PHY DW HDMI controller init.  Runs before hdmi_phy_init so the
+ * framer's control durations, channel preambles, and AVI config land
+ * in a known state — the PHY i2c master inside the controller won't
+ * respond otherwise.  Mirrors rk_drm_dw_hdmi_init_mode.
+ */
+static void
+rk_kms_hdmi_init_mode(struct rk_kms_softc *sc,
+    const struct drm_display_mode *m)
+{
+	rk_kms_hdmi_enable_dvi(sc, m);
+	hdmi_write1(sc, HDMI_FC_CTRLDUR, 12);
+	hdmi_write1(sc, HDMI_FC_EXCTRLDUR, 32);
+	hdmi_write1(sc, HDMI_FC_EXCTRLSPAC, 1);
+	hdmi_write1(sc, HDMI_FC_CH0PREAM, 0x0b);
+	hdmi_write1(sc, HDMI_FC_CH1PREAM, 0x16);
+	hdmi_write1(sc, HDMI_FC_CH2PREAM, 0x21);
+	hdmi_write1(sc, HDMI_FC_AVICONF3, 0x00);
+	hdmi_write1(sc, HDMI_FC_GCP, 0x00);
+	hdmi_write1(sc, HDMI_FC_AVICONF0, 0x00);
+	hdmi_write1(sc, HDMI_FC_AVICONF1, 0x00);
+	hdmi_write1(sc, HDMI_FC_AVICONF2, 0x00);
+	hdmi_write1(sc, HDMI_FC_AVIVID, rk_kms_cea_vic(m));
+	/*
+	 * 0x01ff is the FC_PRCONF (pixel-repetition) low byte; 0x0184 is
+	 * the VP_HDCP_KEEPOUT register.  rk_drm writes both with these
+	 * fixed values — no datasheet name, but the live captures show
+	 * 0xfe at 0x0184 on a working link.
+	 */
+	hdmi_write1(sc, 0x01ff, 0x00);
+	hdmi_write1(sc, 0x0184, 0xfe);
+}
+
+/*
+ * Post-PHY DW HDMI video composer setup.  Programs MC_CLKDIS to ungate
+ * the pixel/TMDS clocks, VP_STUFF/VP_CONF/VP_REMAP for 8bpc output
+ * mode, and VSYNC width.  Without this finish step the framer trains
+ * the PHY but never opens its video path → panel sees signal but no
+ * picture.  Mirrors rk_drm_dw_hdmi_finish_mode.
+ */
+static void
+rk_kms_hdmi_finish_mode(struct rk_kms_softc *sc,
+    const struct drm_display_mode *m)
+{
+	uint8_t clkdis;
+	uint8_t val;
+	uint16_t vsync = m->vsync_end - m->vsync_start;
+
+	hdmi_write1(sc, HDMI_MC_FLOWCTRL, 0x00);
+	hdmi_write1(sc, HDMI_FC_CTRLDUR, 12);
+	hdmi_write1(sc, HDMI_FC_EXCTRLDUR, 32);
+	hdmi_write1(sc, HDMI_FC_EXCTRLSPAC, 1);
+	hdmi_write1(sc, HDMI_FC_CH0PREAM, 0x0b);
+	hdmi_write1(sc, HDMI_FC_CH1PREAM, 0x16);
+	hdmi_write1(sc, HDMI_FC_CH2PREAM, 0x21);
+
+	clkdis = hdmi_read1(sc, HDMI_MC_CLKDIS) &
+	    HDMI_MC_CLKDIS_CECCLK_DISABLE;
+	clkdis |= (uint8_t)~HDMI_MC_CLKDIS_CECCLK_DISABLE;
+	clkdis &= ~0x01;
+	hdmi_write1(sc, HDMI_MC_CLKDIS, clkdis);
+	clkdis &= ~0x02;
+	hdmi_write1(sc, HDMI_MC_CLKDIS, clkdis);
+	hdmi_write1(sc, HDMI_FC_VSYNCINWIDTH, vsync & 0xff);
+
+	hdmi_write1(sc, HDMI_VP_PR_CD, 0x40);
+
+	val = hdmi_read1(sc, HDMI_VP_STUFF);
+	val &= ~0x01;
+	val |= 0x01;
+	hdmi_write1(sc, HDMI_VP_STUFF, val);
+
+	val = hdmi_read1(sc, HDMI_VP_CONF);
+	val &= ~(0x10 | 0x04);
+	val |= 0x04;
+	hdmi_write1(sc, HDMI_VP_CONF, val);
+
+	hdmi_write1(sc, HDMI_VP_REMAP, 0x00);
+
+	val = hdmi_read1(sc, HDMI_VP_CONF);
+	val &= ~(0x40 | 0x20 | 0x08);
+	val |= 0x40;
+	hdmi_write1(sc, HDMI_VP_CONF, val);
+
+	val = hdmi_read1(sc, HDMI_VP_STUFF);
+	val &= ~(0x02 | 0x04);
+	val |= 0x02 | 0x04;
+	hdmi_write1(sc, HDMI_VP_STUFF, val);
+
+	val = hdmi_read1(sc, HDMI_VP_CONF);
+	val &= ~0x03;
+	val |= 0x03;
+	hdmi_write1(sc, HDMI_VP_CONF, val);
 }
 
 /*
@@ -1453,8 +1578,8 @@ rk_kms_vact_start(const struct drm_display_mode *m)
  * commit_modeset is a bitmask of stages to actually execute.  Each
  * stage represents one chunk of hardware writes that could AXI-hang
  * the CPU if a clock/PD prerequisite is missing.  Bracketing every
- * stage with device_printf("STAGE foo STARTING") + device_printf
- * ("STAGE foo DONE") lets us bisect the freeze by watching the
+ * stage with DPRINTF("STAGE foo STARTING") + DPRINTF("STAGE foo
+ * DONE") lets us bisect the freeze with debug=1 by watching the
  * framebuffer console: the last "STARTING" line without a matching
  * "DONE" names the culprit access.
  *
@@ -1487,7 +1612,6 @@ rk_kms_vop_program_timing(struct rk_kms_softc *sc,
 	vm_paddr_t pa;
 	uint32_t stride;
 	int error;
-	device_t dev = sc->dev;
 
 	/*
 	 * For USB-C DP, swap in the DMT-style timing the XYM panel needs.
@@ -1517,7 +1641,7 @@ rk_kms_vop_program_timing(struct rk_kms_softc *sc,
 		forced.flags |= KMS_MODE_FLAG_NHSYNC |
 		    KMS_MODE_FLAG_PVSYNC;
 		mode = &forced;
-		device_printf(dev, "DP forced mode: hsync %u-%u (len %u) "
+		DPRINTF(sc, "DP forced mode: hsync %u-%u (len %u) "
 		    "NHSYNC+PVSYNC\n",
 		    forced.hsync_start, forced.hsync_end,
 		    forced.hsync_end - forced.hsync_start);
@@ -1529,7 +1653,7 @@ rk_kms_vop_program_timing(struct rk_kms_softc *sc,
 
 	pa = rk_kms_fb_paddr(fb);
 	stride = roundup2(mode->hdisplay, 16) * 4u;
-	device_printf(dev, "modeset: out=%d %ux%u clk=%u h(s=%u t=%u "
+	DPRINTF(sc, "modeset: out=%d %ux%u clk=%u h(s=%u t=%u "
 	    "as=%u) v(s=%u t=%u as=%u) fb pa=0x%jx stride=%u stages=0x%x\n",
 	    sc->output, mode->hdisplay, mode->vdisplay, mode->clock,
 	    hsync_len, mode->htotal, hact_start, vsync_len, mode->vtotal,
@@ -1539,16 +1663,16 @@ rk_kms_vop_program_timing(struct rk_kms_softc *sc,
 		return;
 
 	if ((stages & RK_KMS_STAGE_ROUTE) != 0) {
-		device_printf(dev, "STAGE route STARTING\n");
+		DPRINTF(sc, "STAGE route STARTING\n");
 		if (sc->output == RK_KMS_OUT_DP)
 			rk_kms_route_vop_big_to_dp(sc);
 		else
 			rk_kms_route_vop_big_to_hdmi(sc);
-		device_printf(dev, "STAGE route DONE\n");
+		DPRINTF(sc, "STAGE route DONE\n");
 	}
 
 	if ((stages & RK_KMS_STAGE_VPLL) != 0) {
-		device_printf(dev, "STAGE vpll STARTING (%u kHz)\n",
+		DPRINTF(sc, "STAGE vpll STARTING (%u kHz)\n",
 		    mode->clock);
 		error = rk_kms_program_vpll(sc, mode->clock);
 		/*
@@ -1563,26 +1687,26 @@ rk_kms_vop_program_timing(struct rk_kms_softc *sc,
 		    ((3u << 8) | (1u << 6) | 1u)));
 		cru_write(sc, CRU_CLKSEL_CON49,
 		    ((((1u << 11) | (0x3u << 8) | 0xffu) << 16) | 0x0000u));
-		device_printf(dev, "STAGE vpll DONE rc=%d (DCLK mux set)\n",
+		DPRINTF(sc, "STAGE vpll DONE rc=%d (DCLK mux set)\n",
 		    error);
 	}
 
 	if ((stages & RK_KMS_STAGE_VOP_SYS) != 0) {
-		device_printf(dev, "STAGE vop_sys STARTING\n");
+		DPRINTF(sc, "STAGE vop_sys STARTING\n");
 		sys_ctrl = vop_big_read(sc, VOP_REG_SYS_CTRL);
-		device_printf(dev, "STAGE vop_sys read=0x%x\n", sys_ctrl);
+		DPRINTF(sc, "STAGE vop_sys read=0x%x\n", sys_ctrl);
 		sys_ctrl &= ~(VOP_SYS_CTRL_STANDBY | VOP_SYS_CTRL_MMU_EN);
 		sys_ctrl |= VOP_SYS_CTRL_ENABLE | VOP_SYS_CTRL_RGB_EN |
 		    VOP_SYS_CTRL_HDMI_EN;
 		vop_big_write(sc, VOP_REG_SYS_CTRL, sys_ctrl);
-		device_printf(dev, "STAGE vop_sys DONE write=0x%x\n",
+		DPRINTF(sc, "STAGE vop_sys DONE write=0x%x\n",
 		    sys_ctrl);
 	}
 
 	if ((stages & RK_KMS_STAGE_VOP_TIMING) != 0) {
 		uint32_t dsp_ctrl0, dsp_ctrl1, post_scl, pin_pol;
 
-		device_printf(dev, "STAGE vop_timing STARTING\n");
+		DPRINTF(sc, "STAGE vop_timing STARTING\n");
 		/*
 		 * DSP_CTRL0 = AAAA out_mode (the Cadence DP framer and DW HDMI
 		 * controller both want 32-bit RGB+alpha).  Pin polarity lives
@@ -1666,15 +1790,15 @@ rk_kms_vop_program_timing(struct rk_kms_softc *sc,
 			DELAY(40000);
 		}
 
-		device_printf(dev, "STAGE vop_timing DONE dsp_ctrl0=0x%x "
+		DPRINTF(sc, "STAGE vop_timing DONE dsp_ctrl0=0x%x "
 		    "dsp_ctrl1=0x%x\n", dsp_ctrl0, dsp_ctrl1);
 	}
 
 	if ((stages & RK_KMS_STAGE_WIN0) != 0) {
-		device_printf(dev, "STAGE win0 STARTING\n");
+		DPRINTF(sc, "STAGE win0 STARTING\n");
 		rk_kms_vop_program_win0(sc, mode, fb, hact_start,
 		    vact_start);
-		device_printf(dev, "STAGE win0 DONE\n");
+		DPRINTF(sc, "STAGE win0 DONE\n");
 	}
 
 	/*
@@ -1686,25 +1810,35 @@ rk_kms_vop_program_timing(struct rk_kms_softc *sc,
 	 * per-output vop_init_mode_* before calling cdn_dp_enable_mode.
 	 */
 	if ((stages & RK_KMS_STAGE_CFG_DONE) != 0) {
-		device_printf(dev, "STAGE cfg_done STARTING\n");
+		DPRINTF(sc, "STAGE cfg_done STARTING\n");
 		vop_big_write(sc, VOP_REG_CFG_DONE, 0x00010001);
-		device_printf(dev, "STAGE cfg_done DONE\n");
+		DPRINTF(sc, "STAGE cfg_done DONE\n");
 	}
 
 	if ((stages & RK_KMS_STAGE_HDMI_DP) != 0) {
-		device_printf(dev, "STAGE hdmi_dp STARTING\n");
+		DPRINTF(sc, "STAGE hdmi_dp STARTING\n");
 		if (sc->hdmi_enable != 0 &&
 		    sc->output == RK_KMS_OUT_HDMI) {
+			/*
+			 * Pre-PHY init must run before phy_init or the PHY
+			 * i2c master never asserts done — the framer left in
+			 * an indeterminate state blocks the i2c bus.  See
+			 * rk_drm_hw_modeset_hdmi_lit for the canonical order:
+			 * init_mode → phy_init → finish_mode → enable.
+			 */
+			rk_kms_hdmi_init_mode(sc, mode);
 			error = rk_kms_hdmi_phy_init(sc, mode);
-			if (error != 0)
+			if (error != 0) {
 				DPRINTF(sc, "HDMI PHY init failed: %d\n",
 				    error);
-			else
+			} else {
+				rk_kms_hdmi_finish_mode(sc, mode);
 				rk_kms_hdmi_enable(sc, mode);
+			}
 		}
 		if (sc->dp_enable != 0 && sc->output == RK_KMS_OUT_DP)
 			(void)rk_kms_dp_modeset(sc, mode);
-		device_printf(dev, "STAGE hdmi_dp DONE\n");
+		DPRINTF(sc, "STAGE hdmi_dp DONE\n");
 	}
 
 }
@@ -1893,8 +2027,8 @@ rk_kms_usbc_bringup(struct rk_kms_softc *sc, const char *cause)
 
 	brerr = rk_cdn_dp_auto_bringup_default();
 	vaerr = rk_cdn_dp_set_video_active_first(true);
-	device_printf(sc->dev,
-	    "%s: auto_bringup=%d video_active=%d\n", cause, brerr, vaerr);
+	DPRINTF(sc, "%s: auto_bringup=%d video_active=%d\n", cause, brerr,
+	    vaerr);
 }
 
 /*
@@ -1968,9 +2102,8 @@ rk_kms_usbc_poll(void *arg)
 	if (!alt.valid || !alt.dp_ready)
 		goto reschedule;
 
-	device_printf(sc->dev,
-	    "usbc_poll: altmode ready (seq=%u pin=%u status=0x%x); firing "
-	    "bring-up\n", seq, alt.pin_assignment, alt.dp_status);
+	DPRINTF(sc, "usbc_poll: altmode ready (seq=%u pin=%u status=0x%x); "
+	    "firing bring-up\n", seq, alt.pin_assignment, alt.dp_status);
 	rk_kms_usbc_bringup(sc, "usbc_poll");
 	sc->usbc_attach_seq_done = seq;
 
@@ -2055,12 +2188,12 @@ rk_kms_set_config(struct drm_mode_set *set)
 		    != 0 && sc->hw_attached) {
 			uint32_t sys_ctrl;
 
-			device_printf(sc->dev, "STAGE blank STARTING\n");
+			DPRINTF(sc, "STAGE blank STARTING\n");
 			sys_ctrl = vop_big_read(sc, VOP_REG_SYS_CTRL);
 			sys_ctrl |= VOP_SYS_CTRL_STANDBY;
 			vop_big_write(sc, VOP_REG_SYS_CTRL, sys_ctrl);
 			vop_big_write(sc, VOP_REG_CFG_DONE, 0x00010001);
-			device_printf(sc->dev, "STAGE blank DONE\n");
+			DPRINTF(sc, "STAGE blank DONE\n");
 		}
 	}
 	return (0);
@@ -2159,9 +2292,8 @@ rk_kms_display_domain_sanity(struct rk_kms_softc *sc)
 	pwrdn_st = pmu_read(sc, PMU_PWRDN_ST);
 	idle_req = pmu_read(sc, PMU_BUS_IDLE_REQ);
 	gatedis0 = pmucru_read(sc, PMUCRU_GATEDIS_CON0);
-	device_printf(sc->dev, "PD sanity in: pwrdn_con=0x%x st=0x%x "
-	    "idle=0x%x gatedis0=0x%x\n", pwrdn_con, pwrdn_st, idle_req,
-	    gatedis0);
+	DPRINTF(sc, "PD sanity in: pwrdn_con=0x%x st=0x%x idle=0x%x "
+	    "gatedis0=0x%x\n", pwrdn_con, pwrdn_st, idle_req, gatedis0);
 
 	if ((pwrdn_st & PMU_PD_VO) != 0) {
 		pmu_write(sc, PMU_PWRDN_CON, pwrdn_con & ~PMU_PD_VO);
@@ -2171,8 +2303,8 @@ rk_kms_display_domain_sanity(struct rk_kms_softc *sc)
 				break;
 			DELAY(10);
 		}
-		device_printf(sc->dev,
-		    "PD sanity: PD_VO powered up after %d poll(s)\n", i);
+		DPRINTF(sc, "PD sanity: PD_VO powered up after %d poll(s)\n",
+		    i);
 	}
 
 	if ((idle_req & (PMU_IDLE_VOPB | PMU_IDLE_VOPL)) != 0)
