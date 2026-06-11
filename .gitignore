@@ -9,6 +9,13 @@ machine
 x86
 i386
 opt_global.h
+opt_platform.h
+opt_splash.h
+opt_syscons.h
+opt_teken.h
+bus_if.h
+device_if.h
+ofw_bus_if.h
 export_syms
 drm_probe
 drm_probe.full

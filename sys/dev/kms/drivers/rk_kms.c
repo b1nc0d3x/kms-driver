@@ -71,6 +71,24 @@
 #include <kms/drm_vblank.h>
 
 /*
+ * DMT-style 1920x1080 timing the XYM W156F1 panel accepts over USB-C
+ * DP.  Xorg's default is CEA-VIC 16 with hsync_len=44 (narrow + PHSYNC)
+ * which the panel ignores at the DP input.  Wide-NHSYNC variant below
+ * (htotal/vtotal unchanged, but hsync placement & width and polarity
+ * differ from VIC 16) lights the panel.  Mirrors rk_dp_forced_mode.h
+ * in the in-tree rk_drm.
+ */
+#define	RK_DP_FORCED_CLOCK_KHZ		148500
+#define	RK_DP_FORCED_HDISPLAY		1920
+#define	RK_DP_FORCED_HSYNC_START	2008
+#define	RK_DP_FORCED_HSYNC_END		2152
+#define	RK_DP_FORCED_HTOTAL		2200
+#define	RK_DP_FORCED_VDISPLAY		1080
+#define	RK_DP_FORCED_VSYNC_START	1084
+#define	RK_DP_FORCED_VSYNC_END		1089
+#define	RK_DP_FORCED_VTOTAL		1125
+
+/*
  * Cadence MHDP (USB-C DP) entry points.  rk_cdn_dp.c declares these
  * as exported; we MODULE_DEPEND on rk_cdn_dp so the kernel linker
  * resolves them at load time (no runtime symbol lookup — see the
@@ -164,9 +182,24 @@ static void rk_kms_usbc_poll(void *arg);
 
 #define	VOP_SYS_CTRL_STANDBY	(1u << 22)
 #define	VOP_SYS_CTRL_MMU_EN	(1u << 20)
+#define	VOP_SYS_CTRL_MIPI_DUAL	(1u << 11)
+#define	VOP_SYS_CTRL_MIPI_EN	(1u << 15)
 #define	VOP_SYS_CTRL_ENABLE	(1u << 11)
 #define	VOP_SYS_CTRL_RGB_EN	(1u << 12)
 #define	VOP_SYS_CTRL_HDMI_EN	(1u << 13)
+
+#define	VOP_DSP_OUT_MODE_MASK	0x0000000fu
+#define	VOP_DSP_OUT_MODE_AAAA	0x0000000fu	/* RGB+alpha 30bpp */
+#define	VOP_DSP_CTRL0_PIN_POL_MASK	(0x7u << 4)
+#define	VOP_DSP_CTRL0_DCLK_POL		(1u << 7)
+#define	VOP_DSP_CTRL0_P2I_EN		(1u << 5)
+#define	VOP_DSP_CTRL0_INTERLACE		(1u << 10)
+#define	VOP_DSP_CTRL1_DP_PIN_POL_MASK	(0x7u << 16)
+#define	VOP_DSP_CTRL1_DP_DCLK_POL	(1u << 19)
+#define	VOP_DSP_CTRL1_HDMI_PIN_POL_MASK	(0x7u << 20)
+#define	VOP_DSP_CTRL1_HDMI_DCLK_POL	(1u << 23)
+#define	VOP_REG_POST_SCL_CTRL		0x0180
+#define	VOP_REG_DSP_BG			0x0018
 
 /*
  * WIN0 (primary plane) register block.  Programmed at scanout time.
@@ -187,6 +220,15 @@ static void rk_kms_usbc_poll(void *arg);
 #define	VOP_REG_POST_DSP_VACT	0x0174
 
 #define	VOP_WIN0_CTRL0_UPPER_HDMI 0x00000000u
+/*
+ * DP path needs CSC bits set in WIN0_CTRL0[31:25] + force-opaque alpha
+ * in SRC/DST_ALPHA — the Cadence DP framer drops pixels without them.
+ * Empirically validated against the rk_drm reference (rk_drm_hw.c
+ * RK_DRM_WIN0_ROUTE_DP).
+ */
+#define	VOP_WIN0_CTRL0_UPPER_DP	0x3a000000u
+#define	VOP_WIN0_SRC_ALPHA_OPAQUE 0x00ff0000u
+#define	VOP_WIN0_DST_ALPHA_OPAQUE 0x00000000u
 #define	VOP_WIN0_LB_MODE_RGB	(4u << 5)
 #define	VOP_WIN0_DATA_FMT_XRGB8888 0x00000000u
 #define	VOP_WIN0_CTRL0_LOWER	(VOP_WIN0_LB_MODE_RGB |			\
@@ -197,10 +239,18 @@ static void rk_kms_usbc_poll(void *arg);
  * CRU / VPLL registers — bits the rk_drm reference uses.  Names from
  * the RK3399 TRM §3.2 (CRU).
  */
-#define	CRU_VPLL_CON0		0x0080
-#define	CRU_VPLL_CON1		0x0084
-#define	CRU_VPLL_CON2		0x0088
-#define	CRU_VPLL_CON3		0x008c
+/*
+ * RK3399 CRU PLL bank — VPLL_CON0..3 sit at 0x00c0..0x00cc.  An earlier
+ * draft of this driver had these at 0x0080..0x008c (which is CPLL —
+ * one of the CPU/AXI clock sources).  Power-cycling CPLL by way of the
+ * VPLL slow-mode dance instantly AXI-hangs the issuing CPU on the next
+ * load.  Cross-checked against rk_drm_hw.c (RK_DRM_CRU_VPLL_CON*) and
+ * the TRM PLL map.
+ */
+#define	CRU_VPLL_CON0		0x00c0
+#define	CRU_VPLL_CON1		0x00c4
+#define	CRU_VPLL_CON2		0x00c8
+#define	CRU_VPLL_CON3		0x00cc
 
 #define	CRU_PLL_BYPASS		(1u << 1)
 #define	CRU_PLL_POWER_DOWN	(1u << 0)
@@ -208,6 +258,58 @@ static void rk_kms_usbc_poll(void *arg);
 #define	CRU_PLL_MODE_SLOW	0u
 #define	CRU_PLL_MODE_NORMAL	(1u << 8)
 #define	CRU_VPLL_CON2_LOCK	(1u << 31)
+
+/*
+ * CRU clock gates for the VOP block.  Both registers use hiword-update
+ * encoding (write mask<<16 to ungate the named bits).
+ *
+ *   CLKGATE_CON10 : VOP0 PLL outputs — DCLK_VOP0_DIV, ACLK_VOP0_PRE,
+ *                   HCLK_VOP0_PRE (bits 8/9/12)
+ *   CLKGATE_CON28 : VOP_BIG fabric clocks — ACLK_VOPB / HCLK_VOPB /
+ *                   DCLK_VOPB and friends (bits 0-7)
+ * Values mirror rk_drm_hw.c (RK_DRM_CRU_CLKGATE_{VOP0,VOPB}_MASK).
+ */
+#define	CRU_CLKGATE_CON10	0x0328
+#define	CRU_CLKGATE_CON28	0x0370
+
+/*
+ * DCLK source muxes and softreset for VOP_BIG.  After VPLL is at the
+ * target rate, CLKSEL_CON47 / CON49 pick "VPLL → DCLK_VOP0" and the
+ * divider.  Bit patterns mirror the working HDMI path in rk_drm_hw.c:
+ *   CLKSEL_CON47 low  = (3<<8)|(1<<6)|1
+ *      mask           = (0x1f<<8)|(0x3<<6)|0x1f
+ *   CLKSEL_CON49 low  = 0x0000
+ *      mask           = (1<<11)|(0x3<<8)|0xff
+ *
+ * SOFTRST_CON17 bit 8 = DCLK_VOP0 reset request; pulse to resync the
+ * VOP timing engine to the new clock.
+ */
+#define	CRU_CLKSEL_CON47	0x01bc
+#define	CRU_CLKSEL_CON49	0x01c4
+#define	CRU_SOFTRST_CON17	0x0444
+#define	CRU_DRESETN_VOP0_REQ	(1u << 8)
+#define	CRU_CLKGATE_VOP0_MASK	((1u << 12) | (1u << 9) | (1u << 8))
+#define	CRU_CLKGATE_VOPB_MASK	\
+	((1u << 7) | (1u << 6) | (1u << 5) | (1u << 4) | \
+	 (1u << 3) | (1u << 2) | (1u << 1) | (1u << 0))
+
+/*
+ * PMU power-domain + bus-idle registers, plus PMUCRU GATEDIS.  The VOP
+ * sits inside power-domain PD_VO (bit 20 of PMU_PWRDN_{CON,ST}).  If
+ * PWRDN_ST shows PD_VO down, we clear the corresponding CON bit and
+ * poll ST.  Once VO is up, drop BUS_IDLE_REQ for VOPB/VOPL and set
+ * GATEDIS_VOPB on PMUCRU so the always-on side of the VOP clock can
+ * actually run.  Sequence matches rk_drm_display_domain_sanity().
+ */
+#define	PMU_PWRDN_CON		0x0014
+#define	PMU_PWRDN_ST		0x0018
+#define	PMU_BUS_IDLE_REQ	0x0060
+#define	PMU_PD_VO		(1u << 20)
+#define	PMU_IDLE_VOPB		(1u << 7)
+#define	PMU_IDLE_VOPL		(1u << 8)
+
+#define	PMUCRU_GATEDIS_CON0	0x0130
+#define	PMUCRU_GATEDIS_VOPB	(1u << 19)
 
 /*
  * GRF output-mux registers.  SOC_CON20 picks which VOP drives HDMI
@@ -513,6 +615,22 @@ struct rk_kms_softc {
 	int				 vblank_enable;
 
 	/*
+	 * Optional DCLK_VOP0 soft-reset pulse inside the vop_timing stage.
+	 * rk_drm only does this on the first scanout (cold attach) — doing
+	 * it on every modeset stops an already-scanning VOP for ~41 ms.
+	 * Default off; flip to 1 if a stale DCLK domain needs reseating.
+	 */
+	int				 vop_dclk_reset;
+
+	/*
+	 * For USB-C DP, override Xorg's CEA-VIC 16 modeline with the
+	 * DMT-style wide-NHSYNC 1920x1080 timing the XYM panel actually
+	 * accepts.  See RK_DP_FORCED_* constants above.  Default 1 — Xorg
+	 * has no way to know about the panel quirk.
+	 */
+	int				 dp_force_mode;
+
+	/*
 	 * Debug verbosity (0 = quiet, 1 = trace MMIO + set_config).
 	 * Controlled by dev.rk_kms.0.debug.
 	 */
@@ -659,6 +777,30 @@ grf_write(struct rk_kms_softc *sc, bus_size_t off, uint32_t val)
 	bus_space_write_4(sc->bst, sc->grf_bsh, off, val);
 	bus_space_barrier(sc->bst, sc->grf_bsh, off, 4,
 	    BUS_SPACE_BARRIER_WRITE);
+}
+
+static inline uint32_t
+pmu_read(struct rk_kms_softc *sc, bus_size_t off)
+{
+	return (bus_space_read_4(sc->bst, sc->pmu_bsh, off));
+}
+
+static inline void
+pmu_write(struct rk_kms_softc *sc, bus_size_t off, uint32_t val)
+{
+	bus_space_write_4(sc->bst, sc->pmu_bsh, off, val);
+}
+
+static inline uint32_t
+pmucru_read(struct rk_kms_softc *sc, bus_size_t off)
+{
+	return (bus_space_read_4(sc->bst, sc->pmucru_bsh, off));
+}
+
+static inline void
+pmucru_write(struct rk_kms_softc *sc, bus_size_t off, uint32_t val)
+{
+	bus_space_write_4(sc->bst, sc->pmucru_bsh, off, val);
 }
 
 /*
@@ -1202,19 +1344,28 @@ rk_kms_program_vpll(struct rk_kms_softc *sc, uint32_t clock_khz)
  * drm_gem_object stores pages as a contiguous wired allocation
  * (vm_page_alloc_noobj_contig), so the base address of pages[0] is
  * the linear scanout address VOP_REG_WIN0_YRGB_MST wants.  Returns 0
- * if the framebuffer has no GEM backing.
+ * if the framebuffer has no GEM backing or if the base lives above
+ * 4 GiB — VOP_BIG's WIN0_YRGB_MST is a 32-bit register, so silently
+ * truncating a >4 GiB pa would steer the DMA engine into nonsense
+ * and panic the box on the first scanout.  Caller treats "0" as
+ * "skip programming WIN0," which is the safe behavior until GEM
+ * starts allocating into a 32-bit-low pool.
  */
 static vm_paddr_t
 rk_kms_fb_paddr(struct drm_framebuffer *fb)
 {
 	struct drm_gem_object *obj;
+	vm_paddr_t pa;
 
 	if (fb == NULL)
 		return (0);
 	obj = fb->gem_objs[0];
 	if (obj == NULL || obj->pages == NULL || obj->npages == 0)
 		return (0);
-	return (VM_PAGE_TO_PHYS(obj->pages[0]));
+	pa = VM_PAGE_TO_PHYS(obj->pages[0]);
+	if (pa > UINT32_MAX)
+		return (0);
+	return (pa);
 }
 
 /*
@@ -1234,7 +1385,14 @@ rk_kms_vop_program_win0(struct rk_kms_softc *sc,
 
 	pa = rk_kms_fb_paddr(fb);
 	if (pa == 0) {
-		DPRINTF(sc, "win0: no fb pa, skipping\n");
+		struct drm_gem_object *obj;
+		vm_paddr_t raw;
+
+		obj = (fb != NULL) ? fb->gem_objs[0] : NULL;
+		raw = (obj != NULL && obj->pages != NULL && obj->npages > 0)
+		    ? VM_PAGE_TO_PHYS(obj->pages[0]) : 0;
+		DPRINTF(sc, "win0: skipping (pa=0x%jx unaddressable by VOP)\n",
+		    (uintmax_t)raw);
 		return;
 	}
 	stride_bytes = roundup2(mode->hdisplay, 16) * 4u;	/* XR24 */
@@ -1251,13 +1409,21 @@ rk_kms_vop_program_win0(struct rk_kms_softc *sc,
 	    ((uint32_t)mode->hdisplay - 1u));
 	vop_big_write(sc, VOP_REG_WIN0_DSP_ST,
 	    (vact_start << 16) | hact_start);
+	if (sc->output == RK_KMS_OUT_DP) {
+		vop_big_write(sc, VOP_REG_WIN0_SRC_ALPHA,
+		    VOP_WIN0_SRC_ALPHA_OPAQUE);
+		vop_big_write(sc, VOP_REG_WIN0_DST_ALPHA,
+		    VOP_WIN0_DST_ALPHA_OPAQUE);
+	}
 	vop_big_write(sc, VOP_REG_WIN0_CTRL2, VOP_WIN0_CTRL2_PRIMARY);
 	vop_big_write(sc, VOP_REG_POST_DSP_HACT,
 	    (hact_start << 16) | (hact_start + mode->hdisplay));
 	vop_big_write(sc, VOP_REG_POST_DSP_VACT,
 	    (vact_start << 16) | (vact_start + mode->vdisplay));
 	vop_big_write(sc, VOP_REG_WIN0_CTRL0,
-	    VOP_WIN0_CTRL0_UPPER_HDMI | VOP_WIN0_CTRL0_LOWER);
+	    (sc->output == RK_KMS_OUT_DP ?
+	    VOP_WIN0_CTRL0_UPPER_DP : VOP_WIN0_CTRL0_UPPER_HDMI) |
+	    VOP_WIN0_CTRL0_LOWER);
 	DPRINTF(sc, "win0: pa=0x%jx stride=%u (%u words)\n",
 	    (uintmax_t)pa, stride_bytes, stride_words);
 }
@@ -1282,79 +1448,265 @@ rk_kms_vact_start(const struct drm_display_mode *m)
 
 /*
  * Phase 9c "real" modeset.  Programs the VOP_BIG timing block + flips
- * SYS_CTRL out of standby and into HDMI-driven RGB mode.  Does NOT
- * touch:
- *   - VPLL (DCLK frequency) — Phase 9c assumes whatever U-Boot or the
- *     previous driver left in place is close enough to the requested
- *     pixel clock for the validation pattern to be readable.  Phase
- *     9d wires the CRU CLKSEL_CON47/49 dance from the rk_drm reference.
- *   - WIN0 framebuffer setup — that needs the scanout buffer's
- *     physical base, which arrives in Phase 9d alongside the page-
- *     flip path.
- *   - HDMI PHY / EDID / TMDS — Phase 9e.
- * What we DO program is exactly the surface that lets a logic analyzer
- * see the VOP emitting the right vsync rate, which is the cheapest way
- * to validate the addressing chain on real silicon.
+ * SYS_CTRL out of standby and into HDMI-driven RGB mode.
+ *
+ * commit_modeset is a bitmask of stages to actually execute.  Each
+ * stage represents one chunk of hardware writes that could AXI-hang
+ * the CPU if a clock/PD prerequisite is missing.  Bracketing every
+ * stage with device_printf("STAGE foo STARTING") + device_printf
+ * ("STAGE foo DONE") lets us bisect the freeze by watching the
+ * framebuffer console: the last "STARTING" line without a matching
+ * "DONE" names the culprit access.
+ *
+ *   commit_modeset == 0 : set_config is a no-op (gated in caller)
+ *   commit_modeset != 0 : run the dry-run summary, then execute every
+ *                         stage whose bit is set.
+ *
+ * Bisection recipe: set 0x01, restart slim, check dmesg.  If alive, OR
+ * in the next bit (0x03), repeat.  Power-cycle on freeze; the previous
+ * boot's "STARTING" on the framebuffer names the bad stage.
  */
+#define	RK_KMS_STAGE_ROUTE	(1u << 0)
+#define	RK_KMS_STAGE_VPLL		(1u << 1)
+#define	RK_KMS_STAGE_VOP_SYS	(1u << 2)
+#define	RK_KMS_STAGE_VOP_TIMING	(1u << 3)
+#define	RK_KMS_STAGE_WIN0		(1u << 4)
+#define	RK_KMS_STAGE_HDMI_DP	(1u << 5)
+#define	RK_KMS_STAGE_CFG_DONE	(1u << 6)
+#define	RK_KMS_STAGE_ALL		0x7fu
+
 static void
 rk_kms_vop_program_timing(struct rk_kms_softc *sc,
-    const struct drm_display_mode *mode, struct drm_framebuffer *fb)
+    const struct drm_display_mode *mode_in, struct drm_framebuffer *fb)
 {
-	uint32_t hact_start = rk_kms_hact_start(mode);
-	uint32_t vact_start = rk_kms_vact_start(mode);
-	uint32_t hsync_len = mode->hsync_end - mode->hsync_start;
-	uint32_t vsync_len = mode->vsync_end - mode->vsync_start;
+	struct drm_display_mode forced;
+	const struct drm_display_mode *mode = mode_in;
+	uint32_t hact_start, vact_start, hsync_len, vsync_len;
+	uint32_t stages = sc->commit_modeset;
 	uint32_t sys_ctrl;
+	vm_paddr_t pa;
+	uint32_t stride;
 	int error;
-
-	if (sc->output == RK_KMS_OUT_DP)
-		rk_kms_route_vop_big_to_dp(sc);
-	else
-		rk_kms_route_vop_big_to_hdmi(sc);
-
-	error = rk_kms_program_vpll(sc, mode->clock);
-	if (error != 0)
-		DPRINTF(sc, "VPLL %u kHz: %d (continuing with current PLL)\n",
-		    mode->clock, error);
-
-	sys_ctrl = vop_big_read(sc, VOP_REG_SYS_CTRL);
-	sys_ctrl &= ~(VOP_SYS_CTRL_STANDBY | VOP_SYS_CTRL_MMU_EN);
-	sys_ctrl |= VOP_SYS_CTRL_ENABLE | VOP_SYS_CTRL_RGB_EN |
-	    VOP_SYS_CTRL_HDMI_EN;
-	vop_big_write(sc, VOP_REG_SYS_CTRL, sys_ctrl);
-
-	vop_big_write(sc, VOP_REG_DSP_HTOTAL,
-	    ((uint32_t)mode->htotal << 16) | hsync_len);
-	vop_big_write(sc, VOP_REG_DSP_HACT,
-	    (hact_start << 16) | (hact_start + mode->hdisplay));
-	vop_big_write(sc, VOP_REG_DSP_VTOTAL,
-	    ((uint32_t)mode->vtotal << 16) | vsync_len);
-	vop_big_write(sc, VOP_REG_DSP_VACT,
-	    (vact_start << 16) | (vact_start + mode->vdisplay));
-
-	rk_kms_vop_program_win0(sc, mode, fb, hact_start, vact_start);
+	device_t dev = sc->dev;
 
 	/*
-	 * HDMI bring-up — PHY only in 9f part 1.  TMDS framer + AVI
-	 * infoframes land in 9f part 2; until then the panel won't see
-	 * a clean signal even with hdmi_enable=1, but the PHY locking
-	 * to the requested clock is itself the diagnostic value.
+	 * For USB-C DP, swap in the DMT-style timing the XYM panel needs.
+	 * Mode is `const` because the framework hands us a shared pointer,
+	 * but we only mutate our local stack copy + redirect the pointer
+	 * before any HW write.  htotal/vtotal/clock match CEA 1080p60 so
+	 * VPLL math doesn't change; only the hsync placement+width and
+	 * sync polarity differ.  flags forced to NHSYNC + PVSYNC.
 	 */
-	if (sc->hdmi_enable != 0 && sc->output == RK_KMS_OUT_HDMI) {
-		error = rk_kms_hdmi_phy_init(sc, mode);
-		if (error != 0) {
-			DPRINTF(sc, "HDMI PHY init failed: %d\n", error);
-		} else {
-			rk_kms_hdmi_enable(sc, mode);
-		}
+	if (sc->output == RK_KMS_OUT_DP && sc->dp_force_mode != 0 &&
+	    mode_in->clock >= RK_DP_FORCED_CLOCK_KHZ - 250 &&
+	    mode_in->clock <= RK_DP_FORCED_CLOCK_KHZ + 250 &&
+	    mode_in->hdisplay == RK_DP_FORCED_HDISPLAY &&
+	    mode_in->vdisplay == RK_DP_FORCED_VDISPLAY) {
+		forced = *mode_in;
+		forced.clock = RK_DP_FORCED_CLOCK_KHZ;
+		forced.hsync_start = RK_DP_FORCED_HSYNC_START;
+		forced.hsync_end = RK_DP_FORCED_HSYNC_END;
+		forced.htotal = RK_DP_FORCED_HTOTAL;
+		forced.vsync_start = RK_DP_FORCED_VSYNC_START;
+		forced.vsync_end = RK_DP_FORCED_VSYNC_END;
+		forced.vtotal = RK_DP_FORCED_VTOTAL;
+		forced.flags &= ~(KMS_MODE_FLAG_PHSYNC |
+		    KMS_MODE_FLAG_NHSYNC |
+		    KMS_MODE_FLAG_PVSYNC |
+		    KMS_MODE_FLAG_NVSYNC);
+		forced.flags |= KMS_MODE_FLAG_NHSYNC |
+		    KMS_MODE_FLAG_PVSYNC;
+		mode = &forced;
+		device_printf(dev, "DP forced mode: hsync %u-%u (len %u) "
+		    "NHSYNC+PVSYNC\n",
+		    forced.hsync_start, forced.hsync_end,
+		    forced.hsync_end - forced.hsync_start);
+	}
+	hact_start = rk_kms_hact_start(mode);
+	vact_start = rk_kms_vact_start(mode);
+	hsync_len = mode->hsync_end - mode->hsync_start;
+	vsync_len = mode->vsync_end - mode->vsync_start;
+
+	pa = rk_kms_fb_paddr(fb);
+	stride = roundup2(mode->hdisplay, 16) * 4u;
+	device_printf(dev, "modeset: out=%d %ux%u clk=%u h(s=%u t=%u "
+	    "as=%u) v(s=%u t=%u as=%u) fb pa=0x%jx stride=%u stages=0x%x\n",
+	    sc->output, mode->hdisplay, mode->vdisplay, mode->clock,
+	    hsync_len, mode->htotal, hact_start, vsync_len, mode->vtotal,
+	    vact_start, (uintmax_t)pa, stride, stages);
+
+	if (stages == 0)
+		return;
+
+	if ((stages & RK_KMS_STAGE_ROUTE) != 0) {
+		device_printf(dev, "STAGE route STARTING\n");
+		if (sc->output == RK_KMS_OUT_DP)
+			rk_kms_route_vop_big_to_dp(sc);
+		else
+			rk_kms_route_vop_big_to_hdmi(sc);
+		device_printf(dev, "STAGE route DONE\n");
 	}
 
-	if (sc->dp_enable != 0 && sc->output == RK_KMS_OUT_DP)
-		(void)rk_kms_dp_modeset(sc, mode);
+	if ((stages & RK_KMS_STAGE_VPLL) != 0) {
+		device_printf(dev, "STAGE vpll STARTING (%u kHz)\n",
+		    mode->clock);
+		error = rk_kms_program_vpll(sc, mode->clock);
+		/*
+		 * Point DCLK_VOP0 at the freshly programmed VPLL.  Mirrors
+		 * rk_drm_vop_init_mode()'s post-VPLL CLKSEL writes — without
+		 * these the VOP still scans out, but the pixel clock is
+		 * sourced from whatever U-Boot picked, so the panel sees
+		 * mistimed pixels and reports "no signal".
+		 */
+		cru_write(sc, CRU_CLKSEL_CON47,
+		    ((((0x1fu << 8) | (0x3u << 6) | 0x1fu) << 16) |
+		    ((3u << 8) | (1u << 6) | 1u)));
+		cru_write(sc, CRU_CLKSEL_CON49,
+		    ((((1u << 11) | (0x3u << 8) | 0xffu) << 16) | 0x0000u));
+		device_printf(dev, "STAGE vpll DONE rc=%d (DCLK mux set)\n",
+		    error);
+	}
 
-	/* Shadow-register commit.  Same value-of-1 the rk_drm reference
-	 * uses to latch the timing block in one shot. */
-	vop_big_write(sc, VOP_REG_CFG_DONE, 0x00010001);
+	if ((stages & RK_KMS_STAGE_VOP_SYS) != 0) {
+		device_printf(dev, "STAGE vop_sys STARTING\n");
+		sys_ctrl = vop_big_read(sc, VOP_REG_SYS_CTRL);
+		device_printf(dev, "STAGE vop_sys read=0x%x\n", sys_ctrl);
+		sys_ctrl &= ~(VOP_SYS_CTRL_STANDBY | VOP_SYS_CTRL_MMU_EN);
+		sys_ctrl |= VOP_SYS_CTRL_ENABLE | VOP_SYS_CTRL_RGB_EN |
+		    VOP_SYS_CTRL_HDMI_EN;
+		vop_big_write(sc, VOP_REG_SYS_CTRL, sys_ctrl);
+		device_printf(dev, "STAGE vop_sys DONE write=0x%x\n",
+		    sys_ctrl);
+	}
+
+	if ((stages & RK_KMS_STAGE_VOP_TIMING) != 0) {
+		uint32_t dsp_ctrl0, dsp_ctrl1, post_scl, pin_pol;
+
+		device_printf(dev, "STAGE vop_timing STARTING\n");
+		/*
+		 * DSP_CTRL0 = AAAA out_mode (the Cadence DP framer and DW HDMI
+		 * controller both want 32-bit RGB+alpha).  Pin polarity lives
+		 * in different fields per output:
+		 *   HDMI: DSP_CTRL1[22:20] = pin pol, [23] = DCLK pol
+		 *   DP:   DSP_CTRL1[18:16] = pin pol, [19] = DCLK pol (force 0)
+		 * On RK3399 (VOP 3.5) DSP_CTRL0[6:4] are NOT pin polarity (the
+		 * legacy bits) — must be cleared on DP, leftover HDMI state
+		 * there confuses the Cadence framer.
+		 */
+		dsp_ctrl0 = vop_big_read(sc, VOP_REG_DSP_CTRL0);
+		dsp_ctrl0 &= ~VOP_DSP_OUT_MODE_MASK;
+		dsp_ctrl0 |= VOP_DSP_OUT_MODE_AAAA;
+		dsp_ctrl1 = vop_big_read(sc, VOP_REG_DSP_CTRL1);
+
+		pin_pol = 0;
+		if ((mode->flags & KMS_MODE_FLAG_NHSYNC) == 0)
+			pin_pol |= (1u << 0);
+		if ((mode->flags & KMS_MODE_FLAG_NVSYNC) == 0)
+			pin_pol |= (1u << 1);
+
+		if (sc->output == RK_KMS_OUT_DP) {
+			dsp_ctrl0 &= ~(VOP_DSP_CTRL0_PIN_POL_MASK |
+			    VOP_DSP_CTRL0_DCLK_POL |
+			    VOP_DSP_CTRL0_P2I_EN |
+			    VOP_DSP_CTRL0_INTERLACE);
+			dsp_ctrl0 &= ~(0x1fu << 12);	/* dsp_data_swap=0 */
+			dsp_ctrl1 &= ~(VOP_DSP_CTRL1_DP_PIN_POL_MASK |
+			    VOP_DSP_CTRL1_DP_DCLK_POL |
+			    VOP_DSP_CTRL1_HDMI_PIN_POL_MASK |
+			    VOP_DSP_CTRL1_HDMI_DCLK_POL);
+			dsp_ctrl1 |= (pin_pol & 0x7) << 16;
+			/* No dither down/pre-dither on the AAAA path. */
+			dsp_ctrl1 &= ~((1u << 3) | (1u << 2) | (1u << 1));
+			dsp_ctrl1 |= (1u << 4);
+		} else {
+			dsp_ctrl1 &= ~(VOP_DSP_CTRL1_HDMI_PIN_POL_MASK |
+			    VOP_DSP_CTRL1_HDMI_DCLK_POL);
+			dsp_ctrl1 |= ((pin_pol & 0x7) << 20) |
+			    VOP_DSP_CTRL1_HDMI_DCLK_POL;
+		}
+		vop_big_write(sc, VOP_REG_DSP_CTRL0, dsp_ctrl0);
+		vop_big_write(sc, VOP_REG_DSP_CTRL1, dsp_ctrl1);
+
+		if (sc->output == RK_KMS_OUT_DP) {
+			/*
+			 * Clear post-scaler YUV-out + background.  Stale YUV
+			 * state from u-boot has been observed to produce a
+			 * trained DP link that emits no visible pixels.
+			 */
+			post_scl = vop_big_read(sc, VOP_REG_POST_SCL_CTRL);
+			post_scl &= ~(1u << 2);
+			vop_big_write(sc, VOP_REG_POST_SCL_CTRL, post_scl);
+			vop_big_write(sc, VOP_REG_DSP_BG, 0u);
+		}
+
+		vop_big_write(sc, VOP_REG_DSP_HTOTAL,
+		    ((uint32_t)mode->htotal << 16) | hsync_len);
+		vop_big_write(sc, VOP_REG_DSP_HACT,
+		    (hact_start << 16) | (hact_start + mode->hdisplay));
+		vop_big_write(sc, VOP_REG_DSP_VTOTAL,
+		    ((uint32_t)mode->vtotal << 16) | vsync_len);
+		vop_big_write(sc, VOP_REG_DSP_VACT,
+		    (vact_start << 16) | (vact_start + mode->vdisplay));
+
+		/*
+		 * Optional DCLK_VOP0 reset pulse, gated by vop_dclk_reset
+		 * sysctl.  rk_drm only pulses on first scanout (cold attach)
+		 * to avoid putting an already-running VOP into 41 ms of
+		 * reset.  We don't track first-vs-subsequent state yet, so
+		 * default off; operator flips to 1 if a stale clock domain
+		 * needs reseating after VPLL changes.
+		 */
+		if (sc->vop_dclk_reset != 0) {
+			cru_write(sc, CRU_SOFTRST_CON17,
+			    (CRU_DRESETN_VOP0_REQ << 16) |
+			    CRU_DRESETN_VOP0_REQ);
+			DELAY(1000);
+			cru_write(sc, CRU_SOFTRST_CON17,
+			    (CRU_DRESETN_VOP0_REQ << 16));
+			DELAY(40000);
+		}
+
+		device_printf(dev, "STAGE vop_timing DONE dsp_ctrl0=0x%x "
+		    "dsp_ctrl1=0x%x\n", dsp_ctrl0, dsp_ctrl1);
+	}
+
+	if ((stages & RK_KMS_STAGE_WIN0) != 0) {
+		device_printf(dev, "STAGE win0 STARTING\n");
+		rk_kms_vop_program_win0(sc, mode, fb, hact_start,
+		    vact_start);
+		device_printf(dev, "STAGE win0 DONE\n");
+	}
+
+	/*
+	 * Latch the VOP shadow registers BEFORE the framer (HDMI or DP) is
+	 * told to consume our stream.  Without this ordering the Cadence DP
+	 * framer (and DW HDMI controller) capture the still-stale u-boot
+	 * timing, see a mistimed pixel clock, drop pixels, and the panel
+	 * gets no signal at all.  rk_drm does the equivalent inside its
+	 * per-output vop_init_mode_* before calling cdn_dp_enable_mode.
+	 */
+	if ((stages & RK_KMS_STAGE_CFG_DONE) != 0) {
+		device_printf(dev, "STAGE cfg_done STARTING\n");
+		vop_big_write(sc, VOP_REG_CFG_DONE, 0x00010001);
+		device_printf(dev, "STAGE cfg_done DONE\n");
+	}
+
+	if ((stages & RK_KMS_STAGE_HDMI_DP) != 0) {
+		device_printf(dev, "STAGE hdmi_dp STARTING\n");
+		if (sc->hdmi_enable != 0 &&
+		    sc->output == RK_KMS_OUT_HDMI) {
+			error = rk_kms_hdmi_phy_init(sc, mode);
+			if (error != 0)
+				DPRINTF(sc, "HDMI PHY init failed: %d\n",
+				    error);
+			else
+				rk_kms_hdmi_enable(sc, mode);
+		}
+		if (sc->dp_enable != 0 && sc->output == RK_KMS_OUT_DP)
+			(void)rk_kms_dp_modeset(sc, mode);
+		device_printf(dev, "STAGE hdmi_dp DONE\n");
+	}
+
 }
 
 /*
@@ -1698,13 +2050,17 @@ rk_kms_set_config(struct drm_mode_set *set)
 		DPRINTF(sc, "set_config: blank (commit=%d)\n",
 		    sc->commit_modeset);
 		rk_kms_vblank_stop(sc);
-		if (sc->commit_modeset != 0 && sc->hw_attached) {
+		if ((sc->commit_modeset &
+		    (RK_KMS_STAGE_VOP_SYS | RK_KMS_STAGE_CFG_DONE))
+		    != 0 && sc->hw_attached) {
 			uint32_t sys_ctrl;
 
+			device_printf(sc->dev, "STAGE blank STARTING\n");
 			sys_ctrl = vop_big_read(sc, VOP_REG_SYS_CTRL);
 			sys_ctrl |= VOP_SYS_CTRL_STANDBY;
 			vop_big_write(sc, VOP_REG_SYS_CTRL, sys_ctrl);
 			vop_big_write(sc, VOP_REG_CFG_DONE, 0x00010001);
+			device_printf(sc->dev, "STAGE blank DONE\n");
 		}
 	}
 	return (0);
@@ -1776,6 +2132,61 @@ rk_kms_topology_teardown(struct rk_kms_softc *sc)
  * (Phase 9c) free of failable allocations.  Unmapped symmetrically
  * on detach.
  */
+/*
+ * Bring PD_VO up and ungate the VOP clock tree so any VOP MMIO access
+ * actually returns instead of AXI-hanging the CPU.  u-boot leaves the
+ * display block in whatever state suited its splash logic — usually on
+ * for the framebuffer console, but not guaranteed.  Mirrors the order
+ * rk_drm_display_domain_sanity() uses on the in-tree driver:
+ *
+ *   1. If PD_VO is currently down (PWRDN_ST bit set), clear it in
+ *      PWRDN_CON and poll ST until the domain reports up (10us × 1000).
+ *   2. Clear VOPB+VOPL idle requests in BUS_IDLE_REQ so the AXI bridge
+ *      starts forwarding transactions to them.
+ *   3. Set GATEDIS_VOPB in PMUCRU so the always-on side of VOPB's clock
+ *      survives even when nothing else is driving it.
+ *   4. Hiword-ungate VOP0 + VOPB gates in CRU_CLKGATE_CON10 / CON28.
+ *
+ * Safe to run when everything's already on — every write is idempotent.
+ */
+static void
+rk_kms_display_domain_sanity(struct rk_kms_softc *sc)
+{
+	uint32_t pwrdn_con, pwrdn_st, idle_req, gatedis0;
+	int i;
+
+	pwrdn_con = pmu_read(sc, PMU_PWRDN_CON);
+	pwrdn_st = pmu_read(sc, PMU_PWRDN_ST);
+	idle_req = pmu_read(sc, PMU_BUS_IDLE_REQ);
+	gatedis0 = pmucru_read(sc, PMUCRU_GATEDIS_CON0);
+	device_printf(sc->dev, "PD sanity in: pwrdn_con=0x%x st=0x%x "
+	    "idle=0x%x gatedis0=0x%x\n", pwrdn_con, pwrdn_st, idle_req,
+	    gatedis0);
+
+	if ((pwrdn_st & PMU_PD_VO) != 0) {
+		pmu_write(sc, PMU_PWRDN_CON, pwrdn_con & ~PMU_PD_VO);
+		for (i = 0; i < 1000; i++) {
+			pwrdn_st = pmu_read(sc, PMU_PWRDN_ST);
+			if ((pwrdn_st & PMU_PD_VO) == 0)
+				break;
+			DELAY(10);
+		}
+		device_printf(sc->dev,
+		    "PD sanity: PD_VO powered up after %d poll(s)\n", i);
+	}
+
+	if ((idle_req & (PMU_IDLE_VOPB | PMU_IDLE_VOPL)) != 0)
+		pmu_write(sc, PMU_BUS_IDLE_REQ,
+		    idle_req & ~(PMU_IDLE_VOPB | PMU_IDLE_VOPL));
+
+	if ((gatedis0 & PMUCRU_GATEDIS_VOPB) == 0)
+		pmucru_write(sc, PMUCRU_GATEDIS_CON0,
+		    gatedis0 | PMUCRU_GATEDIS_VOPB);
+
+	cru_write(sc, CRU_CLKGATE_CON10, (CRU_CLKGATE_VOP0_MASK << 16));
+	cru_write(sc, CRU_CLKGATE_CON28, (CRU_CLKGATE_VOPB_MASK << 16));
+}
+
 static int
 rk_kms_hw_attach(struct rk_kms_softc *sc)
 {
@@ -1822,6 +2233,7 @@ rk_kms_hw_attach(struct rk_kms_softc *sc)
 	sc->hw_attached = true;
 	DPRINTF(sc, "MMIO mapped: VOP_BIG/LIT @ 0xff9{0,8f}0000 "
 	    "GRF @ 0xff770000 CRU @ 0xff760000 HDMI @ 0xff940000\n");
+	rk_kms_display_domain_sanity(sc);
 	return (0);
 }
 
@@ -1924,6 +2336,17 @@ rk_kms_attach(device_t dev)
 	    "dp_enable", CTLFLAG_RW, &sc->dp_enable, 0,
 	    "Drive Cadence MHDP DP TX through set_config "
 	    "(Phase 9h: requires output=1)");
+	SYSCTL_ADD_INT(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "vop_dclk_reset", CTLFLAG_RW, &sc->vop_dclk_reset, 0,
+	    "Pulse CRU_SOFTRST_CON17 DCLK_VOP0 reset inside vop_timing "
+	    "stage (default off; rk_drm only pulses on first scanout)");
+	sc->dp_force_mode = 1;
+	SYSCTL_ADD_INT(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "dp_force_mode", CTLFLAG_RW, &sc->dp_force_mode, 0,
+	    "Replace CEA-VIC 1080p60 with DMT-style wide-NHSYNC timing the "
+	    "XYM panel accepts (default on)");
 	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 	    "usbc_bringup_now",
@@ -1976,12 +2399,23 @@ rk_kms_detach(device_t dev)
 	struct rk_kms_softc *sc;
 
 	sc = device_get_softc(dev);
+	/*
+	 * vt(4)'s flush callout reaches into fb_info->fb_vbase from a
+	 * softclock thread on its own schedule.  vt_fb_detach() does not
+	 * synchronously drain that callout, so freeing the bus_dma-backed
+	 * framebuffer here races a pending vt_fb_bitblt_bitmap() write
+	 * and panics with a data abort on a stale VA.  Once vt is bound
+	 * to our fb, the only safe way to swap the module is a reboot.
+	 * Refuse devctl detach / kldunload to make the rule enforceable;
+	 * shutdown is fine because the system is already going down.
+	 */
+	if (sc->vt_fb_attached) {
+		device_printf(dev, "detach refused: vt_fb is live; reboot to "
+		    "swap rk_kms\n");
+		return (EBUSY);
+	}
 	sc->usbc_poll_armed = false;
 	callout_drain(&sc->usbc_poll);
-	if (sc->vt_fb_attached) {
-		vt_fb_detach(&sc->fb_info);
-		sc->vt_fb_attached = false;
-	}
 	rk_kms_fb_free(sc);
 	rk_kms_vblank_stop(sc);
 	if (sc->drm_dev != NULL) {

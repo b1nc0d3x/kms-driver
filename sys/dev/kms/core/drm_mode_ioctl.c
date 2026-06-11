@@ -52,7 +52,16 @@ kms_ioctl_mode_getcrtc(struct drm_file *file, struct drm_mode_crtc *r)
 	r->fb_id = (fb != NULL) ? fb->base.id : 0;
 	r->x = crtc->x;
 	r->y = crtc->y;
-	r->gamma_size = 0;
+	/*
+	 * Advertise a standard 256-entry LUT.  Xorg's modesetting driver
+	 * mallocs gamma_size * sizeof(entry) on ScreenInit; with 0 that
+	 * malloc returns NULL and the next deref segfaults at offset 0x8
+	 * deep in modesetting_drv.so (no symbols, but the surrounding
+	 * "gamma ramp entries on CRTC" error string gives it away).
+	 * We don't apply gamma LUTs yet — SETGAMMA is a no-op — but
+	 * reporting a non-zero size keeps Xorg happy.
+	 */
+	r->gamma_size = 256;
 	r->mode_valid = crtc->mode_valid;
 	if (crtc->mode_valid)
 		kms_display_mode_to_modeinfo(&crtc->mode, &r->mode);

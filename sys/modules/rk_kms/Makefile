@@ -3,7 +3,8 @@
 KMOD=	rk_kms
 
 SRCS=	rk_kms.c \
-	bus_if.h device_if.h ofw_bus_if.h
+	bus_if.h device_if.h ofw_bus_if.h \
+	opt_platform.h opt_splash.h opt_syscons.h opt_teken.h
 
 CFLAGS+=	-I${SRCTOP}/sys/dev/kms/include
 CFLAGS+=	-I${SRCTOP}/sys/dev/kms/uapi

@@ -23,6 +23,7 @@
 
 #include <drm/drm.h>
 #include <drm/drm_mode.h>
+#include <drm/drm_fourcc.h>
 
 #include <kms/drm_connector.h>
 #include <kms/drm_crtc.h>
@@ -78,6 +79,66 @@ kms_ioctl_mode_addfb2(struct drm_file *file, struct drm_mode_fb_cmd2 *cmd)
 	int error;
 
 	error = kms_framebuffer_create(file, cmd, &fb);
+	if (error != 0)
+		return (error);
+	cmd->fb_id = fb->base.id;
+	return (0);
+}
+
+/*
+ * Translate the legacy DRM_IOCTL_MODE_ADDFB (single-handle, bpp+depth-coded
+ * format) into a drm_mode_fb_cmd2 and forward.  Xorg's modesetting driver
+ * still issues the legacy ioctl for scanout buffers on FreeBSD-arm64;
+ * without this handler we return ENOTTY and the screen stays black.
+ *
+ * Format mapping mirrors Linux's drm_mode_legacy_fb_format(): bpp+depth
+ * picks a fourcc.  Stick to the four combinations Xorg's
+ * modesetting driver actually emits; anything else returns EINVAL.
+ */
+int
+kms_ioctl_mode_addfb(struct drm_file *file, struct drm_mode_fb_cmd *cmd)
+{
+	struct drm_mode_fb_cmd2 cmd2;
+	struct drm_framebuffer *fb;
+	uint32_t fourcc;
+	int error;
+
+	if (file == NULL || cmd == NULL)
+		return (EINVAL);
+
+	switch (cmd->bpp) {
+	case 16:
+		if (cmd->depth == 16)
+			fourcc = DRM_FORMAT_RGB565;
+		else
+			return (EINVAL);
+		break;
+	case 24:
+		if (cmd->depth == 24)
+			fourcc = DRM_FORMAT_RGB888;
+		else
+			return (EINVAL);
+		break;
+	case 32:
+		if (cmd->depth == 24)
+			fourcc = DRM_FORMAT_XRGB8888;
+		else if (cmd->depth == 32)
+			fourcc = DRM_FORMAT_ARGB8888;
+		else
+			return (EINVAL);
+		break;
+	default:
+		return (EINVAL);
+	}
+
+	memset(&cmd2, 0, sizeof(cmd2));
+	cmd2.width = cmd->width;
+	cmd2.height = cmd->height;
+	cmd2.pixel_format = fourcc;
+	cmd2.handles[0] = cmd->handle;
+	cmd2.pitches[0] = cmd->pitch;
+
+	error = kms_framebuffer_create(file, &cmd2, &fb);
 	if (error != 0)
 		return (error);
 	cmd->fb_id = fb->base.id;

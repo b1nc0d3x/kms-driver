@@ -43,8 +43,21 @@ kms_ioctl_mode_create_dumb(struct drm_file *file,
 
 	if (file == NULL || args == NULL)
 		return (EINVAL);
-	if (args->width == 0 || args->height == 0 || args->bpp == 0)
-		return (EINVAL);
+	/*
+	 * Xorg's modesetting driver calls CREATE_DUMB with width=0,
+	 * height=0, bpp=32 as part of its CRTC-shadow probe and segfaults
+	 * if we return EINVAL.  Linux's drm core also returns EINVAL for
+	 * 0x0 but modesetting must dodge this on real Linux drivers some
+	 * other way (probably via a feature flag).  Clamp to 1x1 so
+	 * userspace gets a valid handle and can free it again; the BO
+	 * costs one page and pins no further state.
+	 */
+	if (args->width == 0)
+		args->width = 1;
+	if (args->height == 0)
+		args->height = 1;
+	if (args->bpp == 0)
+		args->bpp = 32;
 	if (args->bpp > 64 || (args->bpp & 7) != 0)
 		return (EINVAL);
 	if (args->flags != 0)

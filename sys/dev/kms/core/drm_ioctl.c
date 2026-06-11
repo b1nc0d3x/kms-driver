@@ -148,6 +148,21 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 		return (error);
 
 	switch (cmd) {
+	case DRM_IOCTL_MODE_LIST_LESSEES: {
+		/*
+		 * No DRM-lease support; report zero lessees.  Xorg's
+		 * modesetting driver probes this during DRI2 init and
+		 * derefs a result field unconditionally, so returning
+		 * ENOTTY here makes it segfault rather than fall back to
+		 * the no-leases path.  Just say "no lessees" and move on.
+		 */
+		struct drm_mode_list_lessees *r =
+		    (struct drm_mode_list_lessees *)data;
+
+		r->count_lessees = 0;
+		r->pad = 0;
+		return (0);
+	}
 	case DRM_IOCTL_SET_MASTER:
 	case DRM_IOCTL_DROP_MASTER:
 		/*
@@ -197,6 +212,9 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 	case DRM_IOCTL_MODE_DESTROY_DUMB:
 		return (kms_ioctl_mode_destroy_dumb(file,
 		    (struct drm_mode_destroy_dumb *)data));
+	case DRM_IOCTL_MODE_ADDFB:
+		return (kms_ioctl_mode_addfb(file,
+		    (struct drm_mode_fb_cmd *)data));
 	case DRM_IOCTL_MODE_ADDFB2:
 		return (kms_ioctl_mode_addfb2(file,
 		    (struct drm_mode_fb_cmd2 *)data));
