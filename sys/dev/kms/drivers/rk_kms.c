@@ -450,17 +450,32 @@ static void rk_kms_usbc_poll(void *arg);
 #define	HDMI_PHY_I2C_MSM_CTRL	0x12
 
 #define	HDMI_PHY_I2C_ADDR	0x69
-#define	HDMI_PHY_I2CM_DIV_DEFAULT  0x0a
-#define	HDMI_PHY_I2CM_SS_HCNT0_DEFAULT 0x4f
-#define	HDMI_PHY_I2CM_SS_LCNT0_DEFAULT 0x91
-#define	HDMI_PHY_I2CM_FS_HCNT0_DEFAULT 0x0f
-#define	HDMI_PHY_I2CM_FS_LCNT0_DEFAULT 0x21
-#define	HDMI_PHY_I2CM_SDA_HOLD_DEFAULT 0x08
-#define	HDMI_BASE_SFRDIVLOW_DEFAULT   0xff
-#define	HDMI_BASE_SFRDIVHIGH_DEFAULT  0x00
+/*
+ * PHY i2c bit-timing + SFR clock divider defaults.  Cross-checked
+ * against rk_drm_hw.c; an earlier draft of this driver had a different
+ * set of values (likely from a sibling Synopsys DW HDMI variant or an
+ * older BSP) which produced clean SCL but NACKs on every transfer.
+ * BASE_SFRDIV{LOW,HIGH} together set the SFR clock period; with the
+ * wrong divider the slave never sees a valid sample window.
+ */
+#define	HDMI_PHY_I2CM_DIV_DEFAULT  0x0b
+#define	HDMI_PHY_I2CM_SS_HCNT0_DEFAULT 0x6c
+#define	HDMI_PHY_I2CM_SS_LCNT0_DEFAULT 0x7f
+#define	HDMI_PHY_I2CM_FS_HCNT0_DEFAULT 0x11
+#define	HDMI_PHY_I2CM_FS_LCNT0_DEFAULT 0x24
+#define	HDMI_PHY_I2CM_SDA_HOLD_DEFAULT 0x09
+#define	HDMI_BASE_SFRDIVLOW_DEFAULT   0x93
+#define	HDMI_BASE_SFRDIVHIGH_DEFAULT  0x69
 #define	HDMI_PHY_JTAG_CFG_I2C	0x80
 #define	HDMI_PHY_MSM_CTRL_FB_CLK 0x0006
-#define	HDMI_PHY_I2C_CKCALCTRL_OVERRIDE 0x0000
+/*
+ * Bit 15 of CKCALCTRL is the override-enable.  rk_drm writes 0x8000
+ * here, which tells the PHY to skip its auto clock-calibration path
+ * and use the explicit override values fed by CPCE/GMP/CURR.  Without
+ * bit 15 the PHY runs auto-cal and intermittently fails to lock at
+ * higher pixel rates.
+ */
+#define	HDMI_PHY_I2C_CKCALCTRL_OVERRIDE 0x8000
 
 #define	HDMI_PHY_CONF0_PDDQ	(1u << 1)
 #define	HDMI_PHY_CONF0_PDZ	(1u << 2)
@@ -915,22 +930,37 @@ rk_kms_hdmi_phy_i2c_write(struct rk_kms_softc *sc, uint8_t reg,
 	hdmi_write1(sc, HDMI_PHY_I2CM_DATAO_0, val & 0xff);
 	hdmi_write1(sc, HDMI_PHY_I2CM_OPERATION, 0x10);
 
+	/*
+	 * IH_I2CMPHY_STAT0 sticky bits:
+	 *   bit 0 = error (NACK / arb-loss / device fault)
+	 *   bit 1 = done  (transfer completed with ACK)
+	 * An earlier draft of this driver treated bit 0 as "done" — which
+	 * meant every successful transfer (bit 1 set) timed out and every
+	 * NACK was misread as success.  Cross-check against rk_drm_hw.c
+	 * rk_drm_hdmi_phy_i2c_write.
+	 */
 	for (t = 200; t > 0; t--) {
 		DELAY(1000);
 		err = hdmi_read1(sc, HDMI_PHY_I2CM_CTLINT);
 		sticky = hdmi_read1(sc, HDMI_IH_I2CMPHY_STAT0);
-		if ((sticky & 0x01) != 0)
-			return (0);
-		if ((err & 0x10) != 0 || (err & 0x01) != 0) {
+		if ((sticky & 0x01) != 0 || (err & 0x10) != 0 ||
+		    (err & 0x01) != 0) {
 			DPRINTF(sc, "phy i2c write reg=0x%02x val=0x%04x "
 			    "err=0x%02x sticky=0x%02x\n", reg, val, err,
 			    sticky);
+			hdmi_write1(sc, HDMI_IH_I2CMPHY_STAT0, sticky);
+			(void)rk_kms_hdmi_phy_i2c_reset(sc);
 			return (EIO);
+		}
+		if ((sticky & 0x02) != 0) {
+			hdmi_write1(sc, HDMI_IH_I2CMPHY_STAT0, 0x02);
+			return (0);
 		}
 	}
 	DPRINTF(sc, "phy i2c write reg=0x%02x val=0x%04x TIMEOUT "
 	    "(ctlint init/final=0x%02x/0x%02x stat0 init/final=0x%02x/0x%02x)\n",
 	    reg, val, ctlint_init, err, stat0_init, sticky);
+	(void)rk_kms_hdmi_phy_i2c_reset(sc);
 	return (ETIMEDOUT);
 }
 
@@ -941,9 +971,19 @@ rk_kms_hdmi_phy_i2c_write(struct rk_kms_softc *sc, uint8_t reg,
 static void
 rk_kms_hdmi_toggle_main_reset(struct rk_kms_softc *sc, uint8_t bits)
 {
-	hdmi_write1(sc, HDMI_MC_SWRSTZREQ, (uint8_t)~bits);
+	uint8_t reg;
+
+	/*
+	 * SWRSTZREQ bits are active-low: 0 = reset asserted, 1 = released.
+	 * Preserve the state of unrelated reset domains across the toggle —
+	 * an earlier draft of this function blasted 0xff after the assert
+	 * which inadvertently deasserts every other reset on the controller
+	 * (HEACPHY, CEC, audio…) and confuses the PLL-lock check.
+	 */
+	reg = hdmi_read1(sc, HDMI_MC_SWRSTZREQ);
+	hdmi_write1(sc, HDMI_MC_SWRSTZREQ, reg & ~bits);
 	DELAY(100);
-	hdmi_write1(sc, HDMI_MC_SWRSTZREQ, 0xff);
+	hdmi_write1(sc, HDMI_MC_SWRSTZREQ, reg | bits);
 }
 
 /*
