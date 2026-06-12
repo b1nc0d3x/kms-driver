@@ -691,6 +691,16 @@ struct rk_kms_softc {
 	int				 dp_force_mode;
 
 	/*
+	 * The RK3399 Innosilicon HDMI PHY doesn't seem to assert the
+	 * generic Synopsys TX_PHY_LOCK bit even when the link is up and
+	 * the TMDS / pixel clock domains are locked (per MC_LOCKONCLOCK).
+	 * When this knob is set, phy_init logs the timeout but returns
+	 * success, so finish_mode + enable_hdmi_mode get a chance to run.
+	 * Default on until the real lock indicator is identified.
+	 */
+	int				 hdmi_skip_lock_check;
+
+	/*
 	 * Debug verbosity (0 = quiet, 1 = trace MMIO + set_config).
 	 * Controlled by dev.rk_kms.0.debug.
 	 */
@@ -1166,6 +1176,28 @@ rk_kms_hdmi_phy_init(struct rk_kms_softc *sc,
 			    mpll->cpce, phy->sym);
 			return (0);
 		}
+	}
+	/*
+	 * The RK3399 Innosilicon HDMI PHY appears to advance through its
+	 * power-up FSM without ever asserting PHY_STAT0[0] (the Synopsys-
+	 * generic TX_PHY_LOCK bit).  Observed evidence: MC_LOCKONCLOCK
+	 * reports the TMDS / pixel clock domains locked, and the panel
+	 * sees the framer output as "flashing color → no signal" (i.e.
+	 * the link is up but downstream config — finish_mode + enable_
+	 * hdmi_mode — is being skipped because we bailed on the lock-bit
+	 * timeout).  Promote the timeout to a non-fatal warning when
+	 * hdmi_skip_lock_check is set, so the rest of the bring-up
+	 * proceeds and we can see whether AVI infoframe + HDMIDVI bit +
+	 * VP_STUFF/CONF make the sink lock.  Default on while we sort
+	 * out the real lock indicator.
+	 */
+	if (sc->hdmi_skip_lock_check != 0) {
+		DPRINTF(sc, "PHY lock bit timeout — proceeding anyway "
+		    "(stat0=0x%02x lock=0x%02x conf0=0x%02x)\n",
+		    hdmi_read1(sc, HDMI_PHY_STAT0),
+		    hdmi_read1(sc, HDMI_MC_LOCKONCLOCK),
+		    hdmi_read1(sc, HDMI_PHY_CONF0));
+		return (0);
 	}
 	DPRINTF(sc, "PHY pll lock timeout stat0=0x%02x lock=0x%02x "
 	    "conf0=0x%02x\n",
@@ -2718,6 +2750,14 @@ rk_kms_attach(device_t dev)
 	    "dp_force_mode", CTLFLAG_RW, &sc->dp_force_mode, 0,
 	    "Replace CEA-VIC 1080p60 with DMT-style wide-NHSYNC timing the "
 	    "XYM panel accepts (default on)");
+	sc->hdmi_skip_lock_check = 1;
+	SYSCTL_ADD_INT(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "hdmi_skip_lock_check", CTLFLAG_RW,
+	    &sc->hdmi_skip_lock_check, 0,
+	    "Treat the DW HDMI PHY_STAT0[0] lock-bit timeout as non-fatal "
+	    "(default on — Innosilicon PHY doesn't assert that bit even "
+	    "when the link is up)");
 	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 	    "usbc_bringup_now",
