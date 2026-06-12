@@ -89,6 +89,38 @@
 #define	RK_DP_FORCED_VTOTAL		1125
 
 /*
+ * Standard CEA 1920x1080@60 timing for HDMI scanout.  HDMI sinks accept
+ * the CEA-VIC 16 narrow-PHSYNC variant directly (unlike the XYM panel
+ * over DP which needs DMT-style wide-NHSYNC).
+ */
+#define	RK_HDMI_FORCED_CLOCK_KHZ	148500
+#define	RK_HDMI_FORCED_HDISPLAY		1920
+#define	RK_HDMI_FORCED_HSYNC_START	2008
+#define	RK_HDMI_FORCED_HSYNC_END	2052
+#define	RK_HDMI_FORCED_HTOTAL		2200
+#define	RK_HDMI_FORCED_VDISPLAY		1080
+#define	RK_HDMI_FORCED_VSYNC_START	1084
+#define	RK_HDMI_FORCED_VSYNC_END		1089
+#define	RK_HDMI_FORCED_VTOTAL		1125
+
+/*
+ * Output configuration target.  The `config` sysctl selects which
+ * physical output the driver brings up as a self-contained path —
+ * each config has its own complete VOP + framer + PHY bring-up so the
+ * two never share half-state.  HDMI and DP touch different IP blocks
+ * (DW HDMI controller + Innosilicon PHY vs. Cadence MHDP + Synopsys
+ * TYPEC PHY) but compete for VOP_BIG.  Switching `config` re-runs the
+ * target's bring-up from scratch; whatever the other side had latched
+ * gets overwritten as a side-effect of the comprehensive write
+ * sequence rather than via an explicit teardown.
+ */
+enum rk_kms_config {
+	RK_KMS_CONFIG_NONE = 0,
+	RK_KMS_CONFIG_HDMI = 1,
+	RK_KMS_CONFIG_DP   = 2,
+};
+
+/*
  * Cadence MHDP (USB-C DP) entry points.  rk_cdn_dp.c declares these
  * as exported; we MODULE_DEPEND on rk_cdn_dp so the kernel linker
  * resolves them at load time (no runtime symbol lookup — see the
@@ -115,6 +147,7 @@ int	rk_cdn_dp_set_video_active_first(bool active);
 #include <dev/iicbus/usb/fusb302_var.h>
 
 struct rk_kms_softc;
+static void rk_kms_display_domain_sanity(struct rk_kms_softc *sc);
 static int rk_kms_dp_modeset(struct rk_kms_softc *sc,
     const struct drm_display_mode *mode);
 static void rk_kms_usbc_poll(void *arg);
@@ -585,6 +618,18 @@ struct rk_kms_softc {
 	 * dev.rk_kms.0.commit_modeset=1 to enable real writes.
 	 */
 	int				 commit_modeset;
+
+	/*
+	 * Active output configuration.  `config_target` mirrors the user-
+	 * facing sysctl (0 = none, 1 = hdmi, 2 = dp).  `config_active`
+	 * tracks what's actually been brought up; the two diverge only
+	 * during an in-flight switch.  When a config is set, the bring-up
+	 * functions overwrite the legacy `output` / `hdmi_enable` /
+	 * `dp_enable` / `commit_modeset` knobs as needed — the legacy
+	 * knobs remain for fine-grained debug.
+	 */
+	int				 config_target;
+	int				 config_active;
 
 	/*
 	 * Output selector: HDMI vs USB-C DP.  Controls which GRF mux
@@ -1348,6 +1393,27 @@ rk_kms_hdmi_finish_mode(struct rk_kms_softc *sc,
 	val &= ~0x03;
 	val |= 0x03;
 	hdmi_write1(sc, HDMI_VP_CONF, val);
+
+	/*
+	 * TX (Transmitter) tail: rk_drm writes these at the end of
+	 * dw_hdmi_finish_mode.  TX_INVID0 = 0x01 marks the input video
+	 * source as "internal" (VP-fed) instead of an external IF; 0x0201
+	 * = 0x07 enables YCC/RGB conversion paths in the TX block; the
+	 * 0x0202..0x0207 zero-fill clears the rest of the TX_INVID
+	 * register file.  Without these the controller leaves residual TX
+	 * config in place from u-boot's splash setup and the framer can
+	 * mis-route pixels on the way to the PHY.
+	 */
+	hdmi_write1(sc, HDMI_TX_INVID0, 0x01);
+	hdmi_write1(sc, 0x0201, 0x07);
+	hdmi_write1(sc, 0x0202, 0x00);
+	hdmi_write1(sc, 0x0203, 0x00);
+	hdmi_write1(sc, 0x0204, 0x00);
+	hdmi_write1(sc, 0x0205, 0x00);
+	hdmi_write1(sc, 0x0206, 0x00);
+	hdmi_write1(sc, 0x0207, 0x00);
+
+	rk_kms_hdmi_clear_overflow(sc);
 }
 
 /*
@@ -2055,6 +2121,139 @@ rk_kms_fb_free(struct rk_kms_softc *sc)
 }
 
 /*
+ * Fill an empty struct drm_display_mode with the canned timing for
+ * the requested config target.  Used by the config_{hdmi,dp} entry
+ * points so they don't depend on Xorg / SETCRTC having handed us a
+ * mode.  HDMI: standard CEA 1920x1080@60 (narrow PHSYNC).  DP: the
+ * DMT-style wide-NHSYNC variant the XYM panel accepts.
+ */
+static void
+rk_kms_fill_forced_mode(struct drm_display_mode *mode, int target)
+{
+	memset(mode, 0, sizeof(*mode));
+	if (target == RK_KMS_CONFIG_HDMI) {
+		mode->clock = RK_HDMI_FORCED_CLOCK_KHZ;
+		mode->hdisplay = RK_HDMI_FORCED_HDISPLAY;
+		mode->hsync_start = RK_HDMI_FORCED_HSYNC_START;
+		mode->hsync_end = RK_HDMI_FORCED_HSYNC_END;
+		mode->htotal = RK_HDMI_FORCED_HTOTAL;
+		mode->vdisplay = RK_HDMI_FORCED_VDISPLAY;
+		mode->vsync_start = RK_HDMI_FORCED_VSYNC_START;
+		mode->vsync_end = RK_HDMI_FORCED_VSYNC_END;
+		mode->vtotal = RK_HDMI_FORCED_VTOTAL;
+		mode->flags = KMS_MODE_FLAG_PHSYNC |
+		    KMS_MODE_FLAG_PVSYNC;
+		strlcpy(mode->name, "1920x1080", sizeof(mode->name));
+	} else {
+		mode->clock = RK_DP_FORCED_CLOCK_KHZ;
+		mode->hdisplay = RK_DP_FORCED_HDISPLAY;
+		mode->hsync_start = RK_DP_FORCED_HSYNC_START;
+		mode->hsync_end = RK_DP_FORCED_HSYNC_END;
+		mode->htotal = RK_DP_FORCED_HTOTAL;
+		mode->vdisplay = RK_DP_FORCED_VDISPLAY;
+		mode->vsync_start = RK_DP_FORCED_VSYNC_START;
+		mode->vsync_end = RK_DP_FORCED_VSYNC_END;
+		mode->vtotal = RK_DP_FORCED_VTOTAL;
+		mode->flags = KMS_MODE_FLAG_NHSYNC |
+		    KMS_MODE_FLAG_PVSYNC;
+		strlcpy(mode->name, "1920x1080_dp", sizeof(mode->name));
+	}
+}
+
+/*
+ * Self-contained HDMI bring-up.  Sets the legacy knobs to the values
+ * the HDMI path needs, runs display_domain_sanity to (re-)arm the
+ * power / clock state, then drives the full VOP + DW HDMI
+ * controller + PHY sequence via vop_program_timing with the forced
+ * CEA 1080p mode.  Skip STAGE_WIN0 because we don't have a fresh
+ * framebuffer pa to hand it; whatever VOP was scanning previously
+ * keeps scanning out, which is enough to validate PHY lock against a
+ * connected sink.
+ */
+static int
+rk_kms_config_hdmi(struct rk_kms_softc *sc)
+{
+	struct drm_display_mode mode;
+
+	if (!sc->hw_attached) {
+		DPRINTF(sc, "config_hdmi: hw not attached\n");
+		return (ENXIO);
+	}
+	rk_kms_fill_forced_mode(&mode, RK_KMS_CONFIG_HDMI);
+	sc->output = RK_KMS_OUT_HDMI;
+	sc->hdmi_enable = 1;
+	sc->dp_enable = 0;
+	sc->commit_modeset = RK_KMS_STAGE_ALL &
+	    ~RK_KMS_STAGE_WIN0;
+	DPRINTF(sc, "config_hdmi: starting (%ux%u@%u)\n",
+	    mode.hdisplay, mode.vdisplay, mode.clock);
+	rk_kms_display_domain_sanity(sc);
+	rk_kms_vop_program_timing(sc, &mode, NULL);
+	sc->config_active = RK_KMS_CONFIG_HDMI;
+	DPRINTF(sc, "config_hdmi: done\n");
+	return (0);
+}
+
+/*
+ * Self-contained USB-C DP bring-up.  Mirror image of config_hdmi:
+ * sets the legacy knobs to the DP-friendly defaults, then runs the
+ * full bring-up against the forced DMT-style 1080p mode.  The
+ * STAGE_HDMI_DP stage internally calls rk_kms_dp_modeset,
+ * which talks to the rk_cdn_dp module.
+ */
+static int
+rk_kms_config_dp(struct rk_kms_softc *sc)
+{
+	struct drm_display_mode mode;
+
+	if (!sc->hw_attached) {
+		DPRINTF(sc, "config_dp: hw not attached\n");
+		return (ENXIO);
+	}
+	rk_kms_fill_forced_mode(&mode, RK_KMS_CONFIG_DP);
+	sc->output = RK_KMS_OUT_DP;
+	sc->hdmi_enable = 0;
+	sc->dp_enable = 1;
+	sc->commit_modeset = RK_KMS_STAGE_ALL &
+	    ~RK_KMS_STAGE_WIN0;
+	DPRINTF(sc, "config_dp: starting (%ux%u@%u)\n",
+	    mode.hdisplay, mode.vdisplay, mode.clock);
+	rk_kms_display_domain_sanity(sc);
+	rk_kms_vop_program_timing(sc, &mode, NULL);
+	sc->config_active = RK_KMS_CONFIG_DP;
+	DPRINTF(sc, "config_dp: done\n");
+	return (0);
+}
+
+/*
+ * `dev.rk_kms.0.config` sysctl handler.  Write 1 to bring up
+ * HDMI, 2 for DP, 0 is currently a no-op (real teardown wiring
+ * lands later).  Reads return the active config.
+ */
+static int
+rk_kms_config_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_kms_softc *sc = arg1;
+	int target = sc->config_active;
+	int error;
+
+	error = sysctl_handle_int(oidp, &target, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	sc->config_target = target;
+	switch (target) {
+	case RK_KMS_CONFIG_HDMI:
+		return (rk_kms_config_hdmi(sc));
+	case RK_KMS_CONFIG_DP:
+		return (rk_kms_config_dp(sc));
+	case RK_KMS_CONFIG_NONE:
+		/* No teardown path yet; leave whatever was active alone. */
+		return (0);
+	}
+	return (EINVAL);
+}
+
+/*
  * Run cdn_dp's full 19-stage bring-up + frame video-active arm.
  * Shared between the sysctl trigger and the altmode-entry poller.
  * Both calls are idempotent; on a link that's already trained this
@@ -2528,6 +2727,18 @@ rk_kms_attach(device_t dev)
 	    "set_video_active_first(true) without going through "
 	    "SETCRTC.  Idempotent.  Write 2 to also reset the poller "
 	    "tracker so the next tick re-fires.");
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "config",
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
+	    rk_kms_config_sysctl, "I",
+	    "Active output configuration: 0=none, 1=hdmi, 2=dp.  Writing "
+	    "a value runs that target's full self-contained bring-up "
+	    "(display_domain_sanity + VOP + framer + PHY).  Writes are "
+	    "idempotent: re-writing the active config re-runs its "
+	    "bring-up sequence.  Switching to another config overwrites "
+	    "the previous side's state as a side-effect of the new "
+	    "side's comprehensive write sequence.");
 
 	/*
 	 * Arm the Phase 11 altmode-entry poller.  No work happens
