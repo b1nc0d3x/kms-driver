@@ -1,15 +1,30 @@
-# kms
+# KMS Framework
 
-A native FreeBSD KMS framework — no LinuxKPI, pure FreeBSD primitives.
+A native FreeBSD Kernel Mode Setting (KMS) framework — no LinuxKPI, no
+`drm2`, no `drm-kmod`, no Linux compatibility shim of any kind.  Pure
+FreeBSD primitives all the way down.
 
-kms is a substrate that hardware DRM drivers (`rk_drm`, `rk_cdn_dp`,
-`rk_hdmi`, …) can consume instead of `drm2`, so a modern KMS userspace
+The KMS Framework is the substrate that hardware display drivers (the
+in-tree `rk_kms` for Rockchip RK3399 + USB-C DP, future `rk_hdmi`,
+`amdgpu_kms`, `vmwgfx_kms`, …) plug into so a modern KMS userspace
 (Xorg + modesetting DDX, Wayland compositors via libdrm) can run on
-FreeBSD/arm64 without dragging in `drm-kmod`'s Linux compatibility layer.
+FreeBSD without inheriting Linux's KPI surface.
 
-The DRM userspace ABI lives in `sys/dev/kms/uapi/drm/` — those headers
-are the Linux uapi adapted to native FreeBSD types. The framework's own
-kernel API lives in `sys/dev/kms/include/kms/`.
+It owns:
+
+- `/dev/dri/cardN` cdev + ioctl plumbing
+- mode-object model (CRTC / encoder / connector / plane / framebuffer)
+- DRM uapi structs (in `sys/dev/kms/uapi/drm/` — Linux-uapi-shape
+  adapted to native FreeBSD types) so existing userspace binaries link
+  unchanged
+- the framework-side API hardware drivers consume (in
+  `sys/dev/kms/include/kms/`)
+- legacy and atomic modeset, dumb buffers + `cdev_pager` mmap, event
+  ring, vblank API, DP AUX helpers, EDID + mode helpers
+
+Hardware drivers stay small — they fill four hook tables (CRTC funcs,
+encoder funcs, connector funcs, plane funcs), program their silicon,
+and let the framework handle everything user-facing.
 
 ## Status
 
@@ -23,7 +38,7 @@ kernel API lives in `sys/dev/kms/include/kms/`.
 | 6     | Dumb buffers + cdev_pager mmap                   | done   |
 | 7     | Legacy modeset (SETCRTC / ADDFB / PAGEFLIP)      | done   |
 | 8     | Atomic modeset                                   | done   |
-| 9     | Port `rk_drm` onto kms                     | wip (9a) |
+| 9     | `rk_kms` — first hardware consumer (RK3399 VOP + USB-C DP) | wip |
 
 Phase 2 validated live on FreeBSD/arm64 (RockPro64 / `rk3399`).
 `drm_probe` against `/dev/dri/card1` returns:
