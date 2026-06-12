@@ -58,6 +58,7 @@
 #include <drm/drm_fourcc.h>
 #include <drm/drm_mode.h>
 
+#include <kms/drm_atomic.h>
 #include <kms/drm_connector.h>
 #include <kms/drm_crtc.h>
 #include <kms/drm_device.h>
@@ -2485,6 +2486,119 @@ static const struct drm_crtc_funcs rk_kms_crtc_funcs = {
 	.set_config = rk_kms_set_config,
 };
 static const struct drm_plane_funcs rk_kms_plane_funcs = { 0 };
+
+/*
+ * Atomic-modeset hooks.  The framework hands us a fully populated
+ * drm_atomic_state (Phase 8 step 2 of the kms framework wires the
+ * property -> state-field resolver), so check + commit just walk the
+ * per-object state slots.
+ *
+ * Phase 1 scope:
+ *   atomic_check  — minimal validation; reject obviously-broken inputs
+ *                   (mode with zero hdisplay / zero clock, plane fb
+ *                   without a GEM backing).  Returns 0 otherwise.
+ *                   Does not touch hardware.
+ *   atomic_commit — when commit_modeset (the legacy debug gate) is
+ *                   non-zero AND hw_attached, walks every crtc_state
+ *                   with mode_changed set and drives
+ *                   rk_kms_vop_program_timing() with the requested
+ *                   mode + the framebuffer from the first
+ *                   plane_state routed to that CRTC.  When
+ *                   commit_modeset is zero the commit is a no-op
+ *                   apart from a DPRINTF — same shape as the legacy
+ *                   set_config path so existing operator workflows
+ *                   keep working through the atomic ioctl.
+ *
+ * The driver does not stash the state pointer; the framework owns
+ * the lifetime and frees on return.  Phase 8b will introduce state
+ * swap, at which point the driver can stash for deferred completion.
+ */
+static int
+rk_kms_atomic_check(struct drm_device *dev __unused,
+    struct drm_atomic_state *state)
+{
+	uint32_t i;
+
+	if (state == NULL)
+		return (EINVAL);
+	for (i = 0; i < state->num_crtc; i++) {
+		const struct drm_crtc_state *cs = state->crtc_states[i];
+
+		if (cs == NULL || !cs->mode_changed)
+			continue;
+		if (cs->mode.hdisplay == 0 || cs->mode.vdisplay == 0 ||
+		    cs->mode.clock == 0)
+			return (EINVAL);
+	}
+	for (i = 0; i < state->num_plane; i++) {
+		const struct drm_plane_state *ps = state->plane_states[i];
+
+		if (ps == NULL || ps->fb == NULL)
+			continue;
+		if (ps->fb->gem_objs[0] == NULL)
+			return (EINVAL);
+	}
+	return (0);
+}
+
+/*
+ * Pick the framebuffer routed to a particular CRTC out of the atomic
+ * state.  We have exactly one primary plane per CRTC in Phase 1, so
+ * the first plane_state whose crtc field matches wins.  Returns NULL
+ * if no plane is routed (e.g. blanking transition).
+ */
+static struct drm_framebuffer *
+rk_kms_atomic_pick_fb(struct drm_atomic_state *state, struct drm_crtc *crtc)
+{
+	uint32_t i;
+
+	for (i = 0; i < state->num_plane; i++) {
+		struct drm_plane_state *ps = state->plane_states[i];
+
+		if (ps != NULL && ps->crtc == crtc && ps->fb != NULL)
+			return (ps->fb);
+	}
+	return (NULL);
+}
+
+static int
+rk_kms_atomic_commit(struct drm_device *dev,
+    struct drm_atomic_state *state, bool nonblock __unused)
+{
+	struct rk_kms_softc *sc;
+	uint32_t i;
+
+	if (state == NULL)
+		return (EINVAL);
+	sc = dev->driver_priv;
+
+	for (i = 0; i < state->num_crtc; i++) {
+		struct drm_crtc_state *cs = state->crtc_states[i];
+		struct drm_framebuffer *fb;
+
+		if (cs == NULL)
+			continue;
+		fb = rk_kms_atomic_pick_fb(state, cs->crtc);
+		DPRINTF(sc, "atomic_commit: crtc=%u mode=%ux%u@%u "
+		    "active=%d fb=%u commit=%d\n",
+		    cs->crtc->base.id, cs->mode.hdisplay, cs->mode.vdisplay,
+		    cs->mode.clock, cs->active,
+		    fb != NULL ? fb->base.id : 0, sc->commit_modeset);
+		if (!cs->mode_changed && !cs->planes_changed &&
+		    !cs->connectors_changed)
+			continue;
+		if (sc->commit_modeset == 0 || !sc->hw_attached)
+			continue;
+		if (cs->active && cs->mode.hdisplay > 0)
+			rk_kms_vop_program_timing(sc, &cs->mode, fb);
+	}
+	return (0);
+}
+
+static const struct drm_mode_config_funcs rk_kms_mode_config_funcs = {
+	.atomic_check  = rk_kms_atomic_check,
+	.atomic_commit = rk_kms_atomic_commit,
+};
 static const struct drm_encoder_funcs rk_kms_encoder_funcs = { 0 };
 static const struct drm_connector_funcs rk_kms_connector_funcs = {
 	.get_modes = rk_kms_get_modes,
@@ -2712,6 +2826,16 @@ rk_kms_attach(device_t dev)
 		rk_kms_hw_detach(sc);
 		return (error);
 	}
+
+	/*
+	 * Install the atomic hooks before any topology object gets a
+	 * chance to be reached by an ATOMIC ioctl.  Setting funcs here
+	 * promotes ATOMIC from the framework's legacy property-table
+	 * fallback (which can't actually drive HW) to the real
+	 * check + commit dispatch.  Operator-facing modeset gates
+	 * (commit_modeset etc.) still apply inside the commit hook.
+	 */
+	sc->drm_dev->mode_config.funcs = &rk_kms_mode_config_funcs;
 
 	error = rk_kms_topology_init(sc);
 	if (error != 0) {
