@@ -2524,7 +2524,15 @@ rk_kms_atomic_check(struct drm_device *dev __unused,
 	for (i = 0; i < state->num_crtc; i++) {
 		const struct drm_crtc_state *cs = state->crtc_states[i];
 
-		if (cs == NULL || !cs->mode_changed)
+		if (cs == NULL)
+			continue;
+		/*
+		 * Validate the mode only when the CRTC is being driven on
+		 * with a real timing.  active=false (blank) or
+		 * mode_changed=false (only ACTIVE flipped, or only a plane
+		 * routing change) both bypass the dimension check.
+		 */
+		if (!cs->mode_changed || !cs->active)
 			continue;
 		if (cs->mode.hdisplay == 0 || cs->mode.vdisplay == 0 ||
 		    cs->mode.clock == 0)

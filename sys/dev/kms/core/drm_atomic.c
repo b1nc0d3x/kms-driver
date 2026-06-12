@@ -536,10 +536,14 @@ kms_atomic_state_set_property(struct drm_atomic_state *state,
 		if (prop == mc->prop_crtc_active) {
 			bool active = (value != 0);
 
-			if (cs->active != active) {
-				cs->active = active;
-				cs->mode_changed = true;
-			}
+			/*
+			 * ACTIVE flips the dpms bit; it does NOT itself
+			 * count as a mode change.  mode_changed is set
+			 * only by MODE_ID writes below — keeps drivers'
+			 * check hooks from rejecting an enable/disable
+			 * transition that doesn't carry a fresh mode.
+			 */
+			cs->active = active;
 			cs->enable = active;
 			return (0);
 		}
