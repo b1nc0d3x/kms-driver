@@ -32,6 +32,10 @@ struct drm_plane {
 	const struct drm_plane_funcs	*funcs;
 	enum drm_plane_type		 type;
 	uint32_t			 possible_crtcs;
+	uint32_t			 index;	/* assigned at init; indexes
+					   the parent drm_device's plane
+					   array.  Used by drm_atomic
+					   state slot lookup. */
 	struct drm_crtc			*crtc;	/* current binding */
 	struct drm_framebuffer		*fb;
 	/*

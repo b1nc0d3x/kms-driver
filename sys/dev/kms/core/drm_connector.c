@@ -53,6 +53,14 @@ kms_connector_init(struct drm_device *dev, struct drm_connector *connector,
 	connector->dev = dev;
 	connector->funcs = funcs;
 	connector->connector_type = connector_type;
+	/*
+	 * Index is the connector's slot in drm_atomic_state->
+	 * connector_states.  Assigned in registration order from the
+	 * pre-increment count snapshot — the lock around the
+	 * connector_type_id scan + register_locked below covers this
+	 * read too, so the snapshot is stable.
+	 */
+	connector->index = dev->mode_config.num_connector;
 	connector->status = connector_status_unknown;
 	connector->mm_width = 0;
 	connector->mm_height = 0;

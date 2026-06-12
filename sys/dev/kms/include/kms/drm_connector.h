@@ -49,6 +49,10 @@ struct drm_connector {
 	const struct drm_connector_funcs *funcs;
 	uint32_t			 connector_type;
 	uint32_t			 connector_type_id;
+	uint32_t			 index;	/* assigned at init; indexes
+					   the parent drm_device's connector
+					   array.  Used by drm_atomic
+					   state slot lookup. */
 	enum drm_connector_status	 status;
 	uint32_t			 mm_width;
 	uint32_t			 mm_height;

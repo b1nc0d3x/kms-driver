@@ -31,10 +31,14 @@
 #include <drm/drm.h>
 #include <drm/drm_mode.h>
 
+#include <kms/drm_atomic.h>
+#include <kms/drm_connector.h>
+#include <kms/drm_crtc.h>
 #include <kms/drm_device.h>
 #include <kms/drm_file.h>
 #include <kms/drm_mode_config.h>
 #include <kms/drm_mode_object.h>
+#include <kms/drm_plane.h>
 #include <kms/drm_property.h>
 
 #include "kms_internal.h"
@@ -336,6 +340,111 @@ kms_ioctl_mode_getpropblob(struct drm_file *file,
 	return (error);
 }
 
+/* --- atomic_state lifecycle --- */
+
+struct drm_atomic_state *
+kms_atomic_state_alloc(struct drm_device *dev)
+{
+	struct drm_mode_config *mc = &dev->mode_config;
+	struct drm_atomic_state *state;
+
+	state = malloc(sizeof(*state), M_KMS, M_WAITOK | M_ZERO);
+	state->dev = dev;
+	state->num_crtc = mc->num_crtc;
+	state->num_plane = mc->num_plane;
+	state->num_connector = mc->num_connector;
+	if (state->num_crtc > 0)
+		state->crtc_states = malloc(state->num_crtc *
+		    sizeof(*state->crtc_states), M_KMS, M_WAITOK | M_ZERO);
+	if (state->num_plane > 0)
+		state->plane_states = malloc(state->num_plane *
+		    sizeof(*state->plane_states), M_KMS, M_WAITOK | M_ZERO);
+	if (state->num_connector > 0)
+		state->connector_states = malloc(state->num_connector *
+		    sizeof(*state->connector_states), M_KMS,
+		    M_WAITOK | M_ZERO);
+	return (state);
+}
+
+void
+kms_atomic_state_free(struct drm_atomic_state *state)
+{
+	uint32_t i;
+
+	if (state == NULL)
+		return;
+	if (state->crtc_states != NULL) {
+		for (i = 0; i < state->num_crtc; i++)
+			free(state->crtc_states[i], M_KMS);
+		free(state->crtc_states, M_KMS);
+	}
+	if (state->plane_states != NULL) {
+		for (i = 0; i < state->num_plane; i++)
+			free(state->plane_states[i], M_KMS);
+		free(state->plane_states, M_KMS);
+	}
+	if (state->connector_states != NULL) {
+		for (i = 0; i < state->num_connector; i++)
+			free(state->connector_states[i], M_KMS);
+		free(state->connector_states, M_KMS);
+	}
+	free(state, M_KMS);
+}
+
+/*
+ * Lazy per-object state accessors.  index maps the object to the slot
+ * in the parent state's array — set at object init time and stable
+ * for the object's lifetime.  Returns NULL only on bounds-mismatch
+ * (object belongs to a different device than the state).
+ */
+struct drm_crtc_state *
+kms_atomic_get_crtc_state(struct drm_atomic_state *state,
+    struct drm_crtc *crtc)
+{
+	if (crtc == NULL || crtc->index >= state->num_crtc)
+		return (NULL);
+	if (state->crtc_states[crtc->index] == NULL) {
+		struct drm_crtc_state *cs;
+
+		cs = malloc(sizeof(*cs), M_KMS, M_WAITOK | M_ZERO);
+		cs->crtc = crtc;
+		state->crtc_states[crtc->index] = cs;
+	}
+	return (state->crtc_states[crtc->index]);
+}
+
+struct drm_plane_state *
+kms_atomic_get_plane_state(struct drm_atomic_state *state,
+    struct drm_plane *plane)
+{
+	if (plane == NULL || plane->index >= state->num_plane)
+		return (NULL);
+	if (state->plane_states[plane->index] == NULL) {
+		struct drm_plane_state *ps;
+
+		ps = malloc(sizeof(*ps), M_KMS, M_WAITOK | M_ZERO);
+		ps->plane = plane;
+		state->plane_states[plane->index] = ps;
+	}
+	return (state->plane_states[plane->index]);
+}
+
+struct drm_connector_state *
+kms_atomic_get_connector_state(struct drm_atomic_state *state,
+    struct drm_connector *connector)
+{
+	if (connector == NULL || connector->index >= state->num_connector)
+		return (NULL);
+	if (state->connector_states[connector->index] == NULL) {
+		struct drm_connector_state *cs;
+
+		cs = malloc(sizeof(*cs), M_KMS, M_WAITOK | M_ZERO);
+		cs->connector = connector;
+		state->connector_states[connector->index] = cs;
+	}
+	return (state->connector_states[connector->index]);
+}
+
 /* --- MODE_ATOMIC --- */
 
 int
@@ -442,7 +551,67 @@ kms_ioctl_mode_atomic(struct drm_file *file, struct drm_mode_atomic *r)
 	}
 
 	test_only = (r->flags & DRM_MODE_ATOMIC_TEST_ONLY) != 0;
-	if (!test_only) {
+
+	/*
+	 * Atomic dispatch.  When the driver has installed both hooks the
+	 * framework builds a drm_atomic_state from the batch and walks
+	 * the (obj, prop, value) tuples to populate per-object touched
+	 * slots, then hands off to atomic_check / atomic_commit.  Until
+	 * the property→state resolver lands (Phase 8 step 2) the state
+	 * carries only the "touched" markers — drivers that need
+	 * specific property values still read them out of the per-object
+	 * property table during their commit walk.  Drivers that haven't
+	 * wired the hooks (or wired only one) fall back to the legacy
+	 * property-table-write path so atomic-unaware userspace keeps
+	 * working unchanged.
+	 */
+	if (mc->funcs != NULL && mc->funcs->atomic_check != NULL &&
+	    mc->funcs->atomic_commit != NULL) {
+		struct drm_atomic_state *astate;
+		bool nonblock;
+
+		astate = kms_atomic_state_alloc(file->dev);
+		astate->flags = r->flags;
+		off = 0;
+		for (i = 0; i < r->count_objs; i++) {
+			switch (resolved[i]->type) {
+			case DRM_MODE_OBJECT_CRTC:
+				(void)kms_atomic_get_crtc_state(astate,
+				    __containerof(resolved[i],
+					struct drm_crtc, base));
+				break;
+			case DRM_MODE_OBJECT_PLANE:
+				(void)kms_atomic_get_plane_state(astate,
+				    __containerof(resolved[i],
+					struct drm_plane, base));
+				break;
+			case DRM_MODE_OBJECT_CONNECTOR:
+				(void)kms_atomic_get_connector_state(
+				    astate, __containerof(resolved[i],
+					struct drm_connector, base));
+				break;
+			default:
+				break;
+			}
+			off += counts[i];
+		}
+
+		error = mc->funcs->atomic_check(file->dev, astate);
+		if (error == 0 && !test_only) {
+			nonblock = (r->flags & DRM_MODE_ATOMIC_NONBLOCK) != 0;
+			error = mc->funcs->atomic_commit(file->dev, astate,
+			    nonblock);
+		}
+
+		/*
+		 * The driver may queue the state for deferred completion
+		 * by stashing the pointer and returning -EAGAIN today; that
+		 * lands with the state-swap work in Phase 8b.  For now the
+		 * framework always owns the lifetime — driver must not stash.
+		 */
+		kms_atomic_state_free(astate);
+	} else if (!test_only) {
+		/* Legacy fallback: write straight to the property table. */
 		sx_xlock(&mc->mutex);
 		off = 0;
 		for (i = 0; i < r->count_objs; i++) {

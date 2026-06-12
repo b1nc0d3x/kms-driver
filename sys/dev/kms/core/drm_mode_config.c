@@ -94,6 +94,8 @@ kms_mode_config_init(struct drm_mode_config *mc)
 	mc->num_encoder = 0;
 	mc->num_fb = 0;
 	mc->num_plane = 0;
+	mc->funcs = NULL;	/* drivers install atomic hooks before
+				 * kms_dev_register; NULL = legacy fallback */
 	/*
 	 * Defaults.  A real hardware driver overrides these in its
 	 * probe path before registering connectors.  Match Linux

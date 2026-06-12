@@ -63,6 +63,13 @@ kms_plane_init(struct drm_device *dev, struct drm_plane *plane,
 	plane->funcs = funcs;
 	plane->type = type;
 	plane->possible_crtcs = possible_crtcs;
+	/*
+	 * Index is the plane's slot in drm_atomic_state->plane_states.
+	 * Assigned in registration order from the pre-increment count
+	 * snapshot — the lock inside register commits the count, so
+	 * reading num_plane here is stable.
+	 */
+	plane->index = dev->mode_config.num_plane;
 	plane->crtc = NULL;
 	plane->fb = NULL;
 	plane->format_types = format_types;

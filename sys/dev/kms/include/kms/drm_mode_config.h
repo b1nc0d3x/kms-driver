@@ -13,6 +13,34 @@
 
 #include <kms/drm_mode_object.h>
 
+struct drm_atomic_state;
+struct drm_device;
+
+/*
+ * Per-device driver hooks.  All optional.
+ *
+ *   atomic_check   — validate a proposed atomic_state.  Returns 0 if
+ *                    every requested value is implementable, errno
+ *                    otherwise.  Must not mutate hardware.  Required
+ *                    for MODE_ATOMIC TEST_ONLY commits to mean
+ *                    anything beyond resolver-level sanity.
+ *   atomic_commit  — program the proposed state into the silicon.
+ *                    May be sync or deferred; `nonblock` is a hint.
+ *                    On success the framework swaps the new per-object
+ *                    state pointers in (Phase 8b).
+ *
+ * When either is NULL kms_ioctl_mode_atomic falls back to the legacy
+ * property-table-write path, so atomic-unaware userspace (one property
+ * at a time via OBJ_SETPROPERTY) still works against driver builds
+ * that have not yet wired the atomic surface.
+ */
+struct drm_mode_config_funcs {
+	int (*atomic_check)(struct drm_device *dev,
+	    struct drm_atomic_state *state);
+	int (*atomic_commit)(struct drm_device *dev,
+	    struct drm_atomic_state *state, bool nonblock);
+};
+
 /*
  * Root of a drm_device's KMS state.  One per drm_device, embedded.
  * mutex covers everything inside (object lists, counts, dimensions).
@@ -75,6 +103,14 @@ struct drm_mode_config {
 	struct drm_property		*prop_plane_src_w;
 	struct drm_property		*prop_plane_src_h;
 	struct drm_property		*prop_connector_crtc_id;
+
+	/*
+	 * Driver atomic hooks.  See struct drm_mode_config_funcs above.
+	 * Initialized to (NULL, NULL) by kms_mode_config_init; drivers
+	 * install hooks before kms_dev_register, after which a NULL
+	 * pair is treated as "use legacy property-write fallback."
+	 */
+	const struct drm_mode_config_funcs *funcs;
 };
 
 struct drm_device;
