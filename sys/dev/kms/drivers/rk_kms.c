@@ -1752,6 +1752,17 @@ rk_kms_vop_program_timing(struct rk_kms_softc *sc,
 	int error;
 
 	/*
+	 * Re-arm PD_VO / VOPB BUS_IDLE / GATEDIS_VOPB at the top of every
+	 * modeset.  attach() runs domain_sanity once but the boot fb's
+	 * power state can drift between attach and userspace's first
+	 * SETCRTC; without this re-run the very first VOP MMIO from a
+	 * SETCRTC-driven modeset has hung the AXI bus on cold boots.
+	 * Mirrors what rk_drm does on every modeset.  Idempotent: every
+	 * write is masked or value-equality-checked.
+	 */
+	rk_kms_display_domain_sanity(sc);
+
+	/*
 	 * For USB-C DP, swap in the DMT-style timing the XYM panel needs.
 	 * Mode is `const` because the framework hands us a shared pointer,
 	 * but we only mutate our local stack copy + redirect the pointer
