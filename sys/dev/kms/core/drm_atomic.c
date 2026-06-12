@@ -36,8 +36,10 @@
 #include <kms/drm_crtc.h>
 #include <kms/drm_device.h>
 #include <kms/drm_file.h>
+#include <kms/drm_framebuffer.h>
 #include <kms/drm_mode_config.h>
 #include <kms/drm_mode_object.h>
+#include <kms/drm_modes.h>
 #include <kms/drm_plane.h>
 #include <kms/drm_property.h>
 
@@ -340,6 +342,8 @@ kms_ioctl_mode_getpropblob(struct drm_file *file,
 	return (error);
 }
 
+static void kms_atomic_state_release_refs(struct drm_atomic_state *state);
+
 /* --- atomic_state lifecycle --- */
 
 struct drm_atomic_state *
@@ -373,6 +377,7 @@ kms_atomic_state_free(struct drm_atomic_state *state)
 
 	if (state == NULL)
 		return;
+	kms_atomic_state_release_refs(state);
 	if (state->crtc_states != NULL) {
 		for (i = 0; i < state->num_crtc; i++)
 			free(state->crtc_states[i], M_KMS);
@@ -443,6 +448,254 @@ kms_atomic_get_connector_state(struct drm_atomic_state *state,
 		state->connector_states[connector->index] = cs;
 	}
 	return (state->connector_states[connector->index]);
+}
+
+/* --- property → state-field resolver --- */
+
+/*
+ * Look an ID-typed property value up against the mode-object registry.
+ * Returns a new ref to the object (caller must release) or NULL on a
+ * mismatch.  Value of 0 is the well-known "no object" sentinel and
+ * returns NULL without setting *errp.
+ */
+static struct drm_mode_object *
+kms_atomic_resolve_id(struct drm_device *dev, uint64_t value,
+    uint32_t expected_type, int *errp)
+{
+	struct drm_mode_object *obj;
+
+	*errp = 0;
+	if (value == 0)
+		return (NULL);
+	if (value > UINT32_MAX) {
+		*errp = EINVAL;
+		return (NULL);
+	}
+	obj = kms_mode_object_find(dev, (uint32_t)value, expected_type);
+	if (obj == NULL) {
+		*errp = ENOENT;
+		return (NULL);
+	}
+	return (obj);
+}
+
+/*
+ * Decode a MODE_ID blob value into crtc_state->mode.  value=0 is
+ * "disable" — clears the mode and flags the CRTC as disabled.
+ * Otherwise the value is a blob id whose payload is one drm_mode_modeinfo.
+ */
+static int
+kms_atomic_apply_mode_id(struct drm_atomic_state *state,
+    struct drm_crtc_state *cs, uint64_t value)
+{
+	struct drm_property_blob *blob;
+
+	if (value == 0) {
+		memset(&cs->mode, 0, sizeof(cs->mode));
+		cs->enable = false;
+		cs->mode_changed = true;
+		return (0);
+	}
+	if (value > UINT32_MAX)
+		return (EINVAL);
+	blob = kms_property_blob_find(state->dev, (uint32_t)value);
+	if (blob == NULL)
+		return (ENOENT);
+	if (blob->length != sizeof(struct drm_mode_modeinfo)) {
+		kms_mode_object_put(&blob->base);
+		return (EINVAL);
+	}
+	kms_modeinfo_to_display_mode(
+	    (const struct drm_mode_modeinfo *)blob->data, &cs->mode);
+	cs->enable = true;
+	cs->mode_changed = true;
+	kms_mode_object_put(&blob->base);
+	return (0);
+}
+
+int
+kms_atomic_state_set_property(struct drm_atomic_state *state,
+    struct drm_mode_object *obj, struct drm_property *prop, uint64_t value)
+{
+	struct drm_mode_config *mc;
+	int error;
+
+	if (state == NULL || obj == NULL || prop == NULL)
+		return (EINVAL);
+	mc = &state->dev->mode_config;
+
+	switch (obj->type) {
+	case DRM_MODE_OBJECT_CRTC: {
+		struct drm_crtc *crtc =
+		    __containerof(obj, struct drm_crtc, base);
+		struct drm_crtc_state *cs;
+
+		cs = kms_atomic_get_crtc_state(state, crtc);
+		if (cs == NULL)
+			return (EINVAL);
+		if (prop == mc->prop_crtc_active) {
+			bool active = (value != 0);
+
+			if (cs->active != active) {
+				cs->active = active;
+				cs->mode_changed = true;
+			}
+			cs->enable = active;
+			return (0);
+		}
+		if (prop == mc->prop_crtc_mode_id)
+			return (kms_atomic_apply_mode_id(state, cs, value));
+		break;
+	}
+	case DRM_MODE_OBJECT_PLANE: {
+		struct drm_plane *plane =
+		    __containerof(obj, struct drm_plane, base);
+		struct drm_plane_state *ps;
+		struct drm_mode_object *o;
+
+		ps = kms_atomic_get_plane_state(state, plane);
+		if (ps == NULL)
+			return (EINVAL);
+		if (prop == mc->prop_plane_fb_id) {
+			o = kms_atomic_resolve_id(state->dev, value,
+			    DRM_MODE_OBJECT_FB, &error);
+			if (error != 0)
+				return (error);
+			ps->fb = (o != NULL) ?
+			    __containerof(o, struct drm_framebuffer, base) :
+			    NULL;
+			return (0);
+		}
+		if (prop == mc->prop_plane_crtc_id) {
+			o = kms_atomic_resolve_id(state->dev, value,
+			    DRM_MODE_OBJECT_CRTC, &error);
+			if (error != 0)
+				return (error);
+			ps->crtc = (o != NULL) ?
+			    __containerof(o, struct drm_crtc, base) : NULL;
+			if (ps->crtc != NULL) {
+				struct drm_crtc_state *cs =
+				    kms_atomic_get_crtc_state(state, ps->crtc);
+				if (cs != NULL) {
+					cs->plane_mask |= (1u << plane->index);
+					cs->planes_changed = true;
+				}
+			}
+			return (0);
+		}
+		if (prop == mc->prop_plane_crtc_x) {
+			ps->crtc_x = (int32_t)value;
+			return (0);
+		}
+		if (prop == mc->prop_plane_crtc_y) {
+			ps->crtc_y = (int32_t)value;
+			return (0);
+		}
+		if (prop == mc->prop_plane_crtc_w) {
+			ps->crtc_w = (uint32_t)value;
+			return (0);
+		}
+		if (prop == mc->prop_plane_crtc_h) {
+			ps->crtc_h = (uint32_t)value;
+			return (0);
+		}
+		if (prop == mc->prop_plane_src_x) {
+			ps->src_x = (uint32_t)value;
+			return (0);
+		}
+		if (prop == mc->prop_plane_src_y) {
+			ps->src_y = (uint32_t)value;
+			return (0);
+		}
+		if (prop == mc->prop_plane_src_w) {
+			ps->src_w = (uint32_t)value;
+			return (0);
+		}
+		if (prop == mc->prop_plane_src_h) {
+			ps->src_h = (uint32_t)value;
+			return (0);
+		}
+		break;
+	}
+	case DRM_MODE_OBJECT_CONNECTOR: {
+		struct drm_connector *connector =
+		    __containerof(obj, struct drm_connector, base);
+		struct drm_connector_state *cs;
+		struct drm_mode_object *o;
+
+		cs = kms_atomic_get_connector_state(state, connector);
+		if (cs == NULL)
+			return (EINVAL);
+		if (prop == mc->prop_connector_crtc_id) {
+			o = kms_atomic_resolve_id(state->dev, value,
+			    DRM_MODE_OBJECT_CRTC, &error);
+			if (error != 0)
+				return (error);
+			cs->crtc = (o != NULL) ?
+			    __containerof(o, struct drm_crtc, base) : NULL;
+			if (cs->crtc != NULL) {
+				struct drm_crtc_state *cstate =
+				    kms_atomic_get_crtc_state(state, cs->crtc);
+				if (cstate != NULL) {
+					cstate->connector_mask |=
+					    (1u << connector->index);
+					cstate->connectors_changed = true;
+				}
+			}
+			return (0);
+		}
+		break;
+	}
+	default:
+		break;
+	}
+
+	/*
+	 * Not a well-known atomic property — record on the legacy per-
+	 * object property table so OBJ_GETPROPERTIES round-trips.  Driver-
+	 * specific properties (gamma LUT IDs, vendor controls) flow through
+	 * here.
+	 */
+	(void)kms_object_property_set_value(obj, prop, value);
+	return (0);
+}
+
+/*
+ * Walk an in-flight atomic_state and release every object ref the
+ * resolver took.  Called from kms_atomic_state_free.
+ */
+static void
+kms_atomic_state_release_refs(struct drm_atomic_state *state)
+{
+	uint32_t i;
+
+	if (state->plane_states != NULL) {
+		for (i = 0; i < state->num_plane; i++) {
+			struct drm_plane_state *ps = state->plane_states[i];
+
+			if (ps == NULL)
+				continue;
+			if (ps->fb != NULL) {
+				kms_mode_object_put(&ps->fb->base);
+				ps->fb = NULL;
+			}
+			if (ps->crtc != NULL) {
+				kms_mode_object_put(&ps->crtc->base);
+				ps->crtc = NULL;
+			}
+		}
+	}
+	if (state->connector_states != NULL) {
+		for (i = 0; i < state->num_connector; i++) {
+			struct drm_connector_state *cs =
+			    state->connector_states[i];
+
+			if (cs == NULL || cs->crtc == NULL)
+				continue;
+			kms_mode_object_put(&cs->crtc->base);
+			cs->crtc = NULL;
+		}
+	}
 }
 
 /* --- MODE_ATOMIC --- */
@@ -572,31 +825,25 @@ kms_ioctl_mode_atomic(struct drm_file *file, struct drm_mode_atomic *r)
 
 		astate = kms_atomic_state_alloc(file->dev);
 		astate->flags = r->flags;
+
+		/*
+		 * Resolve every (object, property, value) tuple into the
+		 * appropriate per-object state field.  Stop at the first
+		 * error so the driver never sees a half-populated state.
+		 */
 		off = 0;
-		for (i = 0; i < r->count_objs; i++) {
-			switch (resolved[i]->type) {
-			case DRM_MODE_OBJECT_CRTC:
-				(void)kms_atomic_get_crtc_state(astate,
-				    __containerof(resolved[i],
-					struct drm_crtc, base));
-				break;
-			case DRM_MODE_OBJECT_PLANE:
-				(void)kms_atomic_get_plane_state(astate,
-				    __containerof(resolved[i],
-					struct drm_plane, base));
-				break;
-			case DRM_MODE_OBJECT_CONNECTOR:
-				(void)kms_atomic_get_connector_state(
-				    astate, __containerof(resolved[i],
-					struct drm_connector, base));
-				break;
-			default:
-				break;
+		for (i = 0; i < r->count_objs && error == 0; i++) {
+			for (j = 0; j < counts[i] && error == 0; j++) {
+				error = kms_atomic_state_set_property(
+				    astate, resolved[i],
+				    prop_resolved[off + j],
+				    values[off + j]);
 			}
 			off += counts[i];
 		}
 
-		error = mc->funcs->atomic_check(file->dev, astate);
+		if (error == 0)
+			error = mc->funcs->atomic_check(file->dev, astate);
 		if (error == 0 && !test_only) {
 			nonblock = (r->flags & DRM_MODE_ATOMIC_NONBLOCK) != 0;
 			error = mc->funcs->atomic_commit(file->dev, astate,

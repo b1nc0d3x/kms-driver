@@ -44,8 +44,8 @@
  * pass through unchanged because the kernel-side constants match the
  * uapi values for the bits Phase 7 cares about.
  */
-static void
-drm_modeinfo_to_display_mode(const struct drm_mode_modeinfo *info,
+void
+kms_modeinfo_to_display_mode(const struct drm_mode_modeinfo *info,
     struct drm_display_mode *mode)
 {
 	size_t n;
@@ -235,7 +235,7 @@ kms_ioctl_mode_setcrtc(struct drm_file *file, struct drm_mode_crtc *r)
 	 * old state or the new one, never a half-applied mix.
 	 */
 	if (r->mode_valid)
-		drm_modeinfo_to_display_mode(&r->mode, &requested_mode);
+		kms_modeinfo_to_display_mode(&r->mode, &requested_mode);
 
 	set.crtc = crtc;
 	set.fb = fb;

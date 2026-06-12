@@ -158,4 +158,27 @@ struct drm_connector_state	*kms_atomic_get_connector_state(
 				    struct drm_atomic_state *state,
 				    struct drm_connector *connector);
 
+/*
+ * Property → state-field resolver.  Looks `prop` up in the parent
+ * device's well-known-property table, identifies which field on the
+ * appropriate per-object state slot it maps to, allocates the slot if
+ * needed, and stores the value.  For ID-typed properties (fb_id,
+ * crtc_id, mode_id-blob) the resolver dereferences the ID against
+ * the mode-object registry and stores the resulting pointer; the ref
+ * is held until kms_atomic_state_free runs.
+ *
+ * Returns 0 on a known prop (regardless of whether the value
+ * round-trips to a real object), ENOENT when a referenced ID doesn't
+ * resolve, EINVAL when the (object-type, property) pair is invalid,
+ * and 0 silently when the property isn't a well-known atomic prop —
+ * the framework records it on the per-object property table as a
+ * fall-back so OBJ_GETPROPERTIES still round-trips.
+ */
+struct drm_mode_object;
+struct drm_property;
+
+int	kms_atomic_state_set_property(struct drm_atomic_state *state,
+	    struct drm_mode_object *obj, struct drm_property *prop,
+	    uint64_t value);
+
 #endif /* _KMS_DRM_ATOMIC_H_ */

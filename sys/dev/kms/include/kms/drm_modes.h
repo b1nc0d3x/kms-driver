@@ -106,4 +106,12 @@ void	kms_mode_set_name(struct drm_display_mode *mode);
 void	kms_display_mode_to_modeinfo(const struct drm_display_mode *mode,
 	    struct drm_mode_modeinfo *info);
 
+/*
+ * Inverse of the above: convert a uapi drm_mode_modeinfo (carried by
+ * SETCRTC's mode field or a MODE_ID atomic-property blob) into the
+ * kernel drm_display_mode.  Pure data shuffle.
+ */
+void	kms_modeinfo_to_display_mode(const struct drm_mode_modeinfo *info,
+	    struct drm_display_mode *mode);
+
 #endif /* _KMS_DRM_MODES_H_ */
