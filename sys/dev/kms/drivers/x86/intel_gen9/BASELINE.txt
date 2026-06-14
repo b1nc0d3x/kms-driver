@@ -1,14 +1,41 @@
 fbsdx86 (Intel HD 630, Kabylake-S GT2, PCI 8086:5912)
 Initial post-boot live MMIO state captured 2026-06-10 via dev.intel_gen9.0.re scaffold.
-Firmware/loader has Pipe A scanning out; DDI_A is the active port; DDI_B parked; C/D/E cold.
 
-CDCLK_CTL      0x46000  = 0x0c000544   CD2X div=3, freq_decimal=0x144 (low-power tier)
-PIPE_A CONF    0x70008  = 0xc0000000   bit31 ENABLE + bit30 STATE -> Pipe A active
-PIPE_B CONF    0x71008  = 0x00000000   disabled
-PIPE_C CONF    0x72008  = 0x00000000   disabled
-DDI_BUF_CTL_A  0x64000  = 0x00000081   enabled + init complete -> live port
-DDI_BUF_CTL_B  0x64100  = 0x80000000   IDLE_STATUS, parked
-DDI_BUF_CTL_C  0x64200  = 0x00000000   cold
-DDI_BUF_CTL_D  0x64300  = 0x00000000   cold
-DDI_BUF_CTL_E  0x64400  = 0x00000000   cold
-NORTH_GMBUS    0xc6014  = 0x2a480000   prescaler region
+Firmware/loader has Pipe A scanning out 1920x1080@60 8bpc HDMI on DDI_B
+via Transcoder A.  No other pipe / transcoder / DDI is active.
+
+# Pipe + power
+CDCLK_CTL          0x46000  = 0x0c000544   CD2X div=3, freq_decimal=0x144
+PIPE_A CONF        0x70008  = 0xc0000000   bit31 ENABLE + bit30 STATE -> Pipe A active
+PIPE_B CONF        0x71008  = 0x00000000   disabled
+PIPE_C CONF        0x72008  = 0x00000000   disabled
+
+# Transcoder A timing (decoded HTOTAL/HSYNC/VTOTAL/VSYNC = +1 encoded)
+TRANS_A HTOTAL     0x60000  = 0x0897077f   HTOTAL=2200, HACTIVE=1920
+TRANS_A HSYNC      0x60008  = 0x080307d7   HSYNC_START=2008, HSYNC_END=2052 (width 44)
+TRANS_A VTOTAL     0x6000c  = 0x04640437   VTOTAL=1125, VACTIVE=1080
+TRANS_A VSYNC      0x60014  = 0x043e0439   VSYNC_START=1082, VSYNC_END=1087 (width 5)
+Derived mode:                              1920x1080@60 (148.5 MHz pixclk, CEA-VIC 16)
+
+# Transcoder DDI function control
+TRANS_DDI_FUNC_A   0x60400  = 0x90030000   ENABLE | PORT_SEL=1 (DDI_B) | MODE=HDMI |
+                                           8bpc | PVSYNC | PHSYNC
+TRANS_DDI_FUNC_B   0x61400  = 0x00030000   PVSYNC|PHSYNC sticky, no enable
+TRANS_DDI_FUNC_C   0x62400  = 0x00030000   PVSYNC|PHSYNC sticky, no enable
+TRANS_DDI_FUNC_EDP 0x6F400  = 0x00030000   PVSYNC|PHSYNC sticky, no enable
+
+# DDI buffer state
+DDI_BUF_CTL_A      0x64000  = 0x00000081   bit7 IDLE_STATUS set, bit0 set; ENABLE=0 -> parked
+DDI_BUF_CTL_B      0x64100  = 0x80000000   bit31 ENABLE=1, no IDLE bit -> live port (HDMI)
+DDI_BUF_CTL_C      0x64200  = 0x00000000   cold
+DDI_BUF_CTL_D      0x64300  = 0x00000000   cold
+DDI_BUF_CTL_E      0x64400  = 0x00000000   cold
+
+# Misc
+NORTH_GMBUS        0xc6014  = 0x2a480000   prescaler region
+
+Decoded conclusions for next bring-up steps:
+  - target port for first EDID read = DDI_B (HDMI on physical HDMI header)
+  - GMBus port number for HDMI/DDC on DDI_B = 4 (NORTH_GMBUS) per BSpec
+  - active mode is the classic 1080p60 CEA-VIC 16; safe target to re-program
+  - 8bpc, HDMI mode; no DP link training needed for round-trip
