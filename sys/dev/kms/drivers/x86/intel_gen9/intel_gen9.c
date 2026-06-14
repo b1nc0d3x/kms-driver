@@ -1067,6 +1067,52 @@ intel_gen9_sysctl_vbt_dump(SYSCTL_HANDLER_ARGS)
 #define	  PIPE_CONF_ENABLE	(1u << 31)
 #define	  PIPE_CONF_STATE	(1u << 30)
 
+/*
+ * SKL+ universal-plane primary registers (plane 1 of each pipe).
+ * Plane banks are 0x100 apart inside each pipe block.  Pipe stride is
+ * 0x1000.  Universal plane 1 of pipe A = 0x70180.
+ */
+#define	PLANE_CTL(p)		(0x70180 + (p) * 0x1000)
+#define	  PLANE_CTL_ENABLE	(1u << 31)
+#define	  PLANE_CTL_GAMMA_ENA	(1u << 30)
+#define	  PLANE_CTL_FORMAT_SHIFT 24
+#define	  PLANE_CTL_FORMAT_MASK	(0xf << 24)
+#define	  PLANE_CTL_TILED_SHIFT	10
+#define	  PLANE_CTL_TILED_MASK	(0x7 << 10)
+#define	PLANE_STRIDE(p)		(0x70188 + (p) * 0x1000)
+#define	PLANE_POS(p)		(0x7018c + (p) * 0x1000)
+#define	PLANE_SIZE(p)		(0x70190 + (p) * 0x1000)
+#define	PLANE_SURF(p)		(0x7019c + (p) * 0x1000)
+#define	PLANE_OFFSET(p)		(0x701a4 + (p) * 0x1000)
+
+static const char *
+intel_gen9_plane_format_name(uint32_t f)
+{
+	switch (f) {
+	case 0x0: return "YUV422-8";
+	case 0x1: return "XRGB2101010";
+	case 0x2: return "XRGB16161616F";
+	case 0x4: return "XRGB8888";
+	case 0x6: return "XBGR2101010";
+	case 0x8: return "RGB565";
+	case 0xc: return "XBGR8888";
+	case 0xe: return "Y210/Y212/Y216";
+	default:  return "?";
+	}
+}
+
+static const char *
+intel_gen9_plane_tiling_name(uint32_t t)
+{
+	switch (t) {
+	case 0: return "linear";
+	case 1: return "X-tile";
+	case 4: return "Y-tile";
+	case 5: return "Yf-tile";
+	default: return "?";
+	}
+}
+
 static void
 intel_gen9_read_pipe_mode(struct intel_gen9_softc *sc, int pipe,
     struct drm_display_mode *m)
@@ -1125,6 +1171,27 @@ intel_gen9_sysctl_current_mode(SYSCTL_HANDLER_ARGS)
 		    m.hdisplay, m.vdisplay, m.htotal, m.vtotal,
 		    m.hsync_start, m.hsync_end,
 		    m.vsync_start, m.vsync_end, m.flags);
+
+		uint32_t pctl  = intel_gen9_r32(sc, PLANE_CTL(pipe));
+		uint32_t psurf = intel_gen9_r32(sc, PLANE_SURF(pipe));
+		uint32_t pstr  = intel_gen9_r32(sc, PLANE_STRIDE(pipe));
+		uint32_t psize = intel_gen9_r32(sc, PLANE_SIZE(pipe));
+		uint32_t poff  = intel_gen9_r32(sc, PLANE_OFFSET(pipe));
+		uint32_t fmt   = (pctl & PLANE_CTL_FORMAT_MASK) >>
+		    PLANE_CTL_FORMAT_SHIFT;
+		uint32_t tile  = (pctl & PLANE_CTL_TILED_MASK) >>
+		    PLANE_CTL_TILED_SHIFT;
+		uint32_t w = (psize & 0x1fff) + 1;
+		uint32_t h = ((psize >> 16) & 0x1fff) + 1;
+		device_printf(sc->dev,
+		    "  plane1: CTL=0x%08x  en=%d  fmt=%s  tile=%s\n",
+		    pctl, !!(pctl & PLANE_CTL_ENABLE),
+		    intel_gen9_plane_format_name(fmt),
+		    intel_gen9_plane_tiling_name(tile));
+		device_printf(sc->dev,
+		    "          SURF=0x%08x  STRIDE=%u (raw=0x%x)"
+		    "  SIZE=%ux%u  OFFSET=0x%08x\n",
+		    psurf, pstr * 64, pstr, w, h, poff);
 	}
 	return (0);
 }
