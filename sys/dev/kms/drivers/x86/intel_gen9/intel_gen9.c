@@ -54,6 +54,7 @@
 #include <kms/drm_encoder.h>
 #include <kms/drm_mode_config.h>
 #include <kms/drm_modes.h>
+#include <kms/drm_framebuffer.h>
 #include <kms/drm_plane.h>
 
 #define	INTEL_PCI_VENDOR	0x8086
@@ -112,6 +113,20 @@ MALLOC_DECLARE(M_KMS);
 struct intel_gen9_test_fb;	/* defined further down */
 
 /*
+ * Driver-owned drm_framebuffer wrapper.  The persistent scanout_fb gets
+ * exposed to userspace via this -- ADDFB-style external creation is the
+ * eventual general path; for now expose_scanout_fb sysctl wires the
+ * already-allocated test_fb into the framework's mode-object table.
+ */
+struct intel_gen9_owned_fb {
+	struct drm_framebuffer	 base;
+	struct intel_gen9_test_fb *test_fb;	/* not owned; back-ref */
+};
+
+static void intel_gen9_owned_fb_destroy(struct drm_framebuffer *fb);
+static const struct drm_framebuffer_funcs intel_gen9_owned_fb_funcs;
+
+/*
  * MMIO ranges we care about on gen9 display.  Bracket the regions, not
  * the full 16 MiB BAR — saves snapshot/diff memory and keeps the diff
  * signal-to-noise high.  Add ranges here as bring-up uncovers new state.
@@ -159,6 +174,7 @@ struct intel_gen9_softc {
 
 	/* Minimal KMS topology — one of each, all stubs. */
 	struct drm_crtc		 crtc;
+	struct drm_plane	 primary;
 	struct drm_encoder	 encoder;
 	struct drm_connector	 connector;
 
@@ -415,6 +431,7 @@ static int	intel_gen9_sysctl_gtt_alloc_test(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_test_fb_make(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_test_fb_flip(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_scanout_hold(SYSCTL_HANDLER_ARGS);
+static int	intel_gen9_sysctl_expose_scanout_fb(SYSCTL_HANDLER_ARGS);
 static void	intel_gen9_edid_to_mode(const uint8_t *dtd,
 		    struct drm_display_mode *m);
 static int	intel_gen9_attach_edid_modes(struct intel_gen9_softc *sc);
@@ -513,6 +530,12 @@ intel_gen9_re_sysctls_init(struct intel_gen9_softc *sc)
 	    sc, 0, intel_gen9_sysctl_scanout_hold, "I",
 	    "1 = checker, 2 = diagnostic gradient+grid, both flip PLANE_SURF"
 	    " and HOLD;  0 = restore firmware FB + free");
+	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "expose_scanout_fb",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, intel_gen9_sysctl_expose_scanout_fb, "I",
+	    "write 1 to allocate + register a driver-owned drm_framebuffer"
+	    " for userspace MODE_ATOMIC; prints FB_ID, CRTC_ID, PLANE_ID");
 }
 
 static void
@@ -1336,6 +1359,77 @@ intel_gen9_anim_stop(struct intel_gen9_softc *sc)
 }
 
 /*
+ * expose_scanout_fb: allocate a test_fb (if not already there), wrap it
+ * in a driver-owned drm_framebuffer, and register with the framework
+ * so userspace can reference it by FB_ID in an atomic_commit.  Prints
+ * the assigned FB_ID + the CRTC + plane IDs needed to use it.
+ *
+ * One-shot: subsequent triggers print the existing FB_ID without
+ * allocating again.  Cleared on detach.
+ */
+static struct intel_gen9_owned_fb *intel_gen9_exposed_fb = NULL;
+
+static int
+intel_gen9_sysctl_expose_scanout_fb(SYSCTL_HANDLER_ARGS)
+{
+	struct intel_gen9_softc *sc = arg1;
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+
+	if (error || req->newptr == NULL || trigger == 0)
+		return (error);
+
+	if (intel_gen9_exposed_fb != NULL) {
+		device_printf(sc->dev,
+		    "expose_scanout_fb: already exposed as FB_ID=%u"
+		    "  CRTC_ID=%u  PLANE_ID=%u\n",
+		    intel_gen9_exposed_fb->base.base.id,
+		    sc->crtc.base.id, sc->primary.base.id);
+		return (0);
+	}
+
+	struct intel_gen9_owned_fb *ofb = malloc(sizeof(*ofb), M_KMS,
+	    M_WAITOK | M_ZERO);
+	struct intel_gen9_test_fb *tfb = malloc(sizeof(*tfb), M_KMS,
+	    M_WAITOK | M_ZERO);
+	error = intel_gen9_test_fb_alloc(sc, tfb, 1920, 1080);
+	if (error != 0) {
+		device_printf(sc->dev,
+		    "expose_scanout_fb: alloc failed %d\n", error);
+		free(tfb, M_KMS);
+		free(ofb, M_KMS);
+		return (0);
+	}
+	intel_gen9_test_fb_fill_diag(tfb);
+	ofb->test_fb = tfb;
+
+	ofb->base.width  = tfb->width;
+	ofb->base.height = tfb->height;
+	ofb->base.format = 0x34325258;	/* XR24 */
+	ofb->base.pitches[0] = tfb->stride;
+	error = kms_framebuffer_init(sc->drm_dev, &ofb->base,
+	    &intel_gen9_owned_fb_funcs);
+	if (error != 0) {
+		device_printf(sc->dev,
+		    "expose_scanout_fb: framebuffer_init failed %d\n", error);
+		intel_gen9_test_fb_free(sc, tfb);
+		free(tfb, M_KMS);
+		free(ofb, M_KMS);
+		return (0);
+	}
+	intel_gen9_exposed_fb = ofb;
+
+	device_printf(sc->dev,
+	    "expose_scanout_fb: exposed FB_ID=%u  CRTC_ID=%u  PLANE_ID=%u\n",
+	    ofb->base.base.id, sc->crtc.base.id, sc->primary.base.id);
+	device_printf(sc->dev,
+	    "  format=XR24  pitch=%u  size=%ux%u  GTT byte offset=0x%llx\n",
+	    tfb->stride, tfb->width, tfb->height,
+	    (unsigned long long)tfb->gtt_first_idx * PAGE_SIZE);
+	return (0);
+}
+
+/*
  * scanout_hold: persistent flip.  Write 1 to allocate + flip; write 0
  * to restore + free.  Lets userspace observe arbitrary work happening
  * over the static checker buffer.  Idempotent in both directions.
@@ -1943,8 +2037,19 @@ static const struct drm_driver intel_gen9_driver = {
 };
 
 static const struct drm_crtc_funcs intel_gen9_crtc_funcs = { 0 };
+static const struct drm_plane_funcs intel_gen9_plane_funcs = { 0 };
 static const struct drm_encoder_funcs intel_gen9_encoder_funcs = { 0 };
 static const struct drm_connector_funcs intel_gen9_connector_funcs = { 0 };
+
+static void intel_gen9_owned_fb_destroy(struct drm_framebuffer *fb) { (void)fb; }
+
+static const struct drm_framebuffer_funcs intel_gen9_owned_fb_funcs = {
+	.destroy = intel_gen9_owned_fb_destroy,
+};
+
+static const uint32_t intel_gen9_plane_formats[] = {
+	0x34325258,	/* 'XR24' = DRM_FORMAT_XRGB8888 */
+};
 
 /*
  * Driver atomic hooks.  Trivial first-cut so MODE_ATOMIC against this
@@ -2002,6 +2107,41 @@ intel_gen9_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 		device_printf(sc->dev,
 		    "atomic_commit: pipe %u — requested matches live"
 		    " %ux%u  (no-op)\n", i, live.hdisplay, live.vdisplay);
+	}
+
+	/*
+	 * Plane swap: if userspace pointed our primary plane at one of our
+	 * own owned framebuffers, write PLANE_SURF to its GTT offset.
+	 * Setting plane->fb = NULL (disable) is the caller's way to clear
+	 * the user buffer — we restore the firmware FB rather than
+	 * blanking, to keep the user from accidentally losing their tty.
+	 */
+	for (uint32_t i = 0; i < state->num_plane; i++) {
+		struct drm_plane_state *ps = state->plane_states[i];
+
+		if (ps == NULL || ps->plane != &sc->primary)
+			continue;
+
+		if (ps->fb != NULL && ps->fb->funcs == &intel_gen9_owned_fb_funcs) {
+			struct intel_gen9_owned_fb *ofb = __containerof(
+			    ps->fb, struct intel_gen9_owned_fb, base);
+			uint32_t new_surf = ofb->test_fb->gtt_first_idx *
+			    PAGE_SIZE;
+			if (!sc->scanout_held)
+				sc->scanout_prev_surf =
+				    intel_gen9_r32(sc, PLANE_SURF(0));
+			intel_gen9_w32(sc, PLANE_SURF(0), new_surf);
+			sc->scanout_held = true;
+			device_printf(sc->dev,
+			    "atomic_commit: plane FB_ID %u -> PLANE_SURF=0x%08x\n",
+			    ps->fb->base.id, new_surf);
+		} else if (ps->fb == NULL && sc->scanout_held) {
+			intel_gen9_w32(sc, PLANE_SURF(0), sc->scanout_prev_surf);
+			sc->scanout_held = false;
+			device_printf(sc->dev,
+			    "atomic_commit: plane fb=NULL -> PLANE_SURF"
+			    " restored to 0x%08x\n", sc->scanout_prev_surf);
+		}
 	}
 	return (0);
 }
@@ -2102,6 +2242,11 @@ intel_gen9_attach(device_t dev)
 	 */
 	error = kms_crtc_init(sc->drm_dev, &sc->crtc, &intel_gen9_crtc_funcs);
 	if (error == 0)
+		error = kms_plane_init(sc->drm_dev, &sc->primary,
+		    &intel_gen9_plane_funcs, DRM_PLANE_TYPE_PRIMARY,
+		    1u, intel_gen9_plane_formats,
+		    nitems(intel_gen9_plane_formats));
+	if (error == 0)
 		error = kms_encoder_init(sc->drm_dev, &sc->encoder,
 		    &intel_gen9_encoder_funcs, DRM_MODE_ENCODER_DAC);
 	if (error == 0)
@@ -2139,10 +2284,23 @@ intel_gen9_detach(device_t dev)
 		sc->scanout_fb = NULL;
 		sc->scanout_held = false;
 	}
+	if (intel_gen9_exposed_fb != NULL) {
+		if (sc->scanout_held) {
+			intel_gen9_w32(sc, PLANE_SURF(0),
+			    sc->scanout_prev_surf);
+			sc->scanout_held = false;
+		}
+		kms_framebuffer_cleanup(&intel_gen9_exposed_fb->base);
+		intel_gen9_test_fb_free(sc, intel_gen9_exposed_fb->test_fb);
+		free(intel_gen9_exposed_fb->test_fb, M_KMS);
+		free(intel_gen9_exposed_fb, M_KMS);
+		intel_gen9_exposed_fb = NULL;
+	}
 	if (sc->drm_dev != NULL) {
 		intel_gen9_re_sysctls_fini(sc);
 		kms_connector_cleanup(&sc->connector);
 		kms_encoder_cleanup(&sc->encoder);
+		kms_plane_cleanup(&sc->primary);
 		kms_crtc_cleanup(&sc->crtc);
 		kms_dev_unregister(sc->drm_dev);
 		sc->drm_dev = NULL;
