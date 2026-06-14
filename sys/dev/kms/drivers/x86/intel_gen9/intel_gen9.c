@@ -384,6 +384,8 @@ intel_gen9_sysctl_bit_scan(SYSCTL_HANDLER_ARGS)
 	return (0);
 }
 
+static int	intel_gen9_sysctl_edid_read_b(SYSCTL_HANDLER_ARGS);
+
 static void
 intel_gen9_re_sysctls_init(struct intel_gen9_softc *sc)
 {
@@ -431,6 +433,11 @@ intel_gen9_re_sysctls_init(struct intel_gen9_softc *sc)
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
 	    sc, 0, intel_gen9_sysctl_bit_scan, "I",
 	    "write 1 to scan bit_scan_addr and diff side-effects");
+	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "edid_read_b",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, intel_gen9_sysctl_edid_read_b, "I",
+	    "write 1 to GMBus-read 128 bytes of EDID block 0 from DDI_B");
 }
 
 static void
@@ -443,6 +450,206 @@ intel_gen9_re_sysctls_fini(struct intel_gen9_softc *sc)
 		sc->snapshot_valid = false;
 	}
 	sx_destroy(&sc->re_lock);
+}
+
+/* ---------------------------- GMBus / EDID -------------------------------- */
+
+/*
+ * SKL/KBL PCH GMBus.  Lives in display south block at PCH_DISPLAY_BASE +
+ * 0x5100 = 0xc5100.  All DDI DDC paths funnel through this one controller;
+ * which physical DDI is reached depends on the GMBUS0 port-number field
+ * (pin pair).  i915's pin-pair numbering for SKL+ north display:
+ *   1 = SSC   (panel sense)
+ *   2 = VGADDC
+ *   3 = PANEL
+ *   4 = DDI_C   (HDMI-C / DP-C)
+ *   5 = DDI_B   (HDMI-B / DP-B / SDVO)
+ *   6 = DDI_D   (HDMI-D / DP-D)
+ */
+
+#define	GMBUS0			0x000c5100
+#define	GMBUS1			0x000c5104
+#define	GMBUS2			0x000c5108
+#define	GMBUS3			0x000c510c
+#define	GMBUS4			0x000c5110
+#define	GMBUS5			0x000c5120
+
+#define	GMBUS_RATE_100KHZ	(0 << 8)
+#define	GMBUS_PIN_DDI_C		4
+#define	GMBUS_PIN_DDI_B		5
+#define	GMBUS_PIN_DDI_D		6
+
+#define	GMBUS_SW_CLR_INT	(1u << 31)
+#define	GMBUS_SW_RDY		(1u << 30)
+#define	GMBUS_CYCLE_WAIT	(1u << 25)	/* wait for next phase */
+#define	GMBUS_CYCLE_STOP	(4u << 25)	/* stop on completion */
+#define	GMBUS_BYTE_COUNT_SHIFT	16
+#define	GMBUS_SLAVE_ADDR_SHIFT	1
+#define	GMBUS_SLAVE_READ	1
+#define	GMBUS_SLAVE_WRITE	0
+
+#define	GMBUS_HW_RDY		(1u << 11)
+#define	GMBUS_HW_WAIT		(1u << 14)
+#define	GMBUS_NAK		(1u << 10)
+#define	GMBUS_ACTIVE		(1u << 9)
+#define	GMBUS_INUSE		(1u << 15)
+
+#define	EDID_SLAVE		0x50
+
+static int
+intel_gen9_gmbus_wait(struct intel_gen9_softc *sc, uint32_t bit)
+{
+	uint32_t s;
+
+	for (int spin = 0; spin < 50000; spin++) {
+		s = intel_gen9_r32(sc, GMBUS2);
+		if (s & GMBUS_NAK)
+			return (EIO);
+		if (s & bit)
+			return (0);
+		DELAY(10);
+	}
+	return (ETIMEDOUT);
+}
+
+static int
+intel_gen9_gmbus_read_block(struct intel_gen9_softc *sc, uint32_t pin,
+    uint8_t slave, uint8_t offset, uint8_t *buf, size_t len)
+{
+	uint32_t cmd, val;
+	int error;
+	size_t got = 0;
+
+	if (len == 0 || len > 256)
+		return (EINVAL);
+
+	/*
+	 * Quiesce the controller: clear any stuck interrupt, ensure 2-byte
+	 * index off, then park GMBUS0=0 before reprogramming the pin.
+	 * GMBUS2 INUSE is write-1-to-clear; without explicitly W1C-ing it
+	 * a failed prior transaction (or BIOS hand-off) wedges every
+	 * subsequent xfer at HW_RDY because the bus stays "in use".
+	 */
+	intel_gen9_w32(sc, GMBUS0, 0);
+	intel_gen9_w32(sc, GMBUS4, 0);
+	intel_gen9_w32(sc, GMBUS5, 0);
+	intel_gen9_w32(sc, GMBUS1, GMBUS_SW_CLR_INT);
+	intel_gen9_w32(sc, GMBUS1, 0);
+	if (intel_gen9_r32(sc, GMBUS2) & GMBUS_INUSE) {
+		device_printf(sc->dev, "gmbus: INUSE stuck, clearing\n");
+		intel_gen9_w32(sc, GMBUS2, GMBUS_INUSE);
+	}
+	intel_gen9_w32(sc, GMBUS0, pin | GMBUS_RATE_100KHZ);
+
+	/*
+	 * Phase 1: write the EDID byte offset (segment 0).  CYCLE_WAIT
+	 * keeps the bus owned past this transaction so the read phase
+	 * issues a repeated START rather than a fresh STOP/START.
+	 */
+	cmd = GMBUS_SW_RDY | GMBUS_CYCLE_WAIT |
+	    ((uint32_t)1 << GMBUS_BYTE_COUNT_SHIFT) |
+	    ((uint32_t)slave << GMBUS_SLAVE_ADDR_SHIFT) |
+	    GMBUS_SLAVE_WRITE;
+	intel_gen9_w32(sc, GMBUS3, offset);
+	intel_gen9_w32(sc, GMBUS1, cmd);
+	error = intel_gen9_gmbus_wait(sc, GMBUS_HW_WAIT);
+	if (error != 0) {
+		device_printf(sc->dev, "gmbus: wait HW_WAIT after addr: %d\n",
+		    error);
+		goto out;
+	}
+
+	/* Phase 2: read `len` bytes. */
+	cmd = GMBUS_SW_RDY | GMBUS_CYCLE_STOP |
+	    ((uint32_t)len << GMBUS_BYTE_COUNT_SHIFT) |
+	    ((uint32_t)slave << GMBUS_SLAVE_ADDR_SHIFT) |
+	    GMBUS_SLAVE_READ;
+	intel_gen9_w32(sc, GMBUS1, cmd);
+
+	while (got < len) {
+		error = intel_gen9_gmbus_wait(sc, GMBUS_HW_RDY);
+		if (error != 0) {
+			uint32_t s = intel_gen9_r32(sc, GMBUS2);
+			device_printf(sc->dev,
+			    "gmbus: wait HW_RDY at %zu/%zu: %d  GMBUS2=0x%08x\n",
+			    got, len, error, s);
+			goto out;
+		}
+		val = intel_gen9_r32(sc, GMBUS3);
+		for (int i = 0; i < 4 && got < len; i++)
+			buf[got++] = (val >> (i * 8)) & 0xff;
+	}
+out:
+	/* Tri-state bus + clear status. */
+	intel_gen9_w32(sc, GMBUS0, 0);
+	intel_gen9_w32(sc, GMBUS1, GMBUS_SW_CLR_INT);
+	intel_gen9_w32(sc, GMBUS1, 0);
+	return (error);
+}
+
+static int
+intel_gen9_sysctl_edid_read_b(SYSCTL_HANDLER_ARGS)
+{
+	struct intel_gen9_softc *sc = arg1;
+	uint8_t edid[128];
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+
+	if (error || req->newptr == NULL)
+		return (error);
+	if (trigger == 0)
+		return (0);
+
+	/*
+	 * Pin sweep: try every GMBUS pin in [1..9] with the EDID slave.
+	 * The first pin that completes without NAK is the one wired to the
+	 * physical DDC line of the active connector.  This bypasses any
+	 * static assumption about port->pin mapping.
+	 */
+	if (trigger == 2) {
+		for (uint32_t pin = 1; pin <= 9; pin++) {
+			memset(edid, 0, sizeof(edid));
+			error = intel_gen9_gmbus_read_block(sc, pin, EDID_SLAVE,
+			    0, edid, 16);
+			device_printf(sc->dev,
+			    "pin %u: err=%d  first16: %02x %02x %02x %02x"
+			    " %02x %02x %02x %02x  %02x %02x %02x %02x"
+			    " %02x %02x %02x %02x\n", pin, error,
+			    edid[0], edid[1], edid[2], edid[3],
+			    edid[4], edid[5], edid[6], edid[7],
+			    edid[8], edid[9], edid[10], edid[11],
+			    edid[12], edid[13], edid[14], edid[15]);
+		}
+		return (0);
+	}
+
+	memset(edid, 0, sizeof(edid));
+	error = intel_gen9_gmbus_read_block(sc, GMBUS_PIN_DDI_B, EDID_SLAVE,
+	    0, edid, sizeof(edid));
+	if (error != 0) {
+		device_printf(sc->dev,
+		    "edid_read_b: gmbus failed: %d  partial: "
+		    "%02x %02x %02x %02x %02x %02x %02x %02x\n", error,
+		    edid[0], edid[1], edid[2], edid[3],
+		    edid[4], edid[5], edid[6], edid[7]);
+		return (0);
+	}
+	device_printf(sc->dev, "edid_read_b: 128 bytes read:\n");
+	for (int row = 0; row < 16; row++) {
+		device_printf(sc->dev,
+		    "  %02x: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+		    row * 8,
+		    edid[row*8+0], edid[row*8+1], edid[row*8+2], edid[row*8+3],
+		    edid[row*8+4], edid[row*8+5], edid[row*8+6], edid[row*8+7]);
+	}
+	/* Quick sanity decode: bytes 8-9 = manufacturer, 54+ = first DTD. */
+	device_printf(sc->dev,
+	    "  header OK=%d  mfg=%02x%02x  prod=%02x%02x  serial=%02x%02x%02x%02x\n",
+	    (edid[0] == 0x00 && edid[1] == 0xff && edid[2] == 0xff &&
+	     edid[7] == 0x00),
+	    edid[8], edid[9], edid[10], edid[11],
+	    edid[12], edid[13], edid[14], edid[15]);
+	return (0);
 }
 
 /* ----------------------------- driver glue -------------------------------- */

@@ -36,6 +36,19 @@ NORTH_GMBUS        0xc6014  = 0x2a480000   prescaler region
 
 Decoded conclusions for next bring-up steps:
   - target port for first EDID read = DDI_B (HDMI on physical HDMI header)
-  - GMBus port number for HDMI/DDC on DDI_B = 4 (NORTH_GMBUS) per BSpec
+  - GMBus port number for HDMI/DDC on DDI_B = 5 (SKL+ GMBUS_PIN_DPB=5,
+    not 4 as I first mis-read; DPC=4 / DPD=6)
   - active mode is the classic 1080p60 CEA-VIC 16; safe target to re-program
   - 8bpc, HDMI mode; no DP link training needed for round-trip
+
+GMBus xfer status 2026-06-10:
+  Controller is reachable (PCH GMBus at 0xc5100 responds to writes; INUSE
+  W1C visible).  GMBus state machine completes electrically only on pin 4
+  (DDI_C) with NAK at EDID slave 0x50; pins 1/2/3/5/6/7/8/9 all timeout
+  on the address-write phase.  Pin 5 (DDI_B) being dead is in conflict
+  with TRANS_DDI_FUNC_CTL_A pointing PORT_SEL=1; firmware may have routed
+  to DDI_B logically but the physical DDC line is unplugged / disabled.
+  Likely fix: enable DDI_BUF_CTL_n bit 31 for the target port before
+  GMBus xfer to wake DDC power gate.  Validated GMBus protocol stack
+  (clear INUSE W1C, CYCLE_WAIT addr-phase, CYCLE_STOP read-phase, 4-byte
+  DWORD slicing of GMBUS3) is correct on the controller side.
