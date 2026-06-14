@@ -2234,6 +2234,16 @@ rk_kms_config_hdmi(struct rk_kms_softc *sc)
 	rk_kms_display_domain_sanity(sc);
 	rk_kms_vop_program_timing(sc, &mode, NULL);
 	sc->config_active = RK_KMS_CONFIG_HDMI;
+	/*
+	 * Drop commit_modeset back to 0 now that our bring-up has
+	 * latched.  Userspace SETCRTC / ATOMIC paths use the same gate,
+	 * and an unchanged 0x6f would let a subsequent mode=NULL
+	 * (Xorg's blank-before-set, slim/Wayland teardown, etc.) write
+	 * VOP STANDBY and darken the panel we just lit.  The user can
+	 * still flip commit_modeset by hand to opt back into real
+	 * userspace modesets once the proper SETCRTC mode flow is wired.
+	 */
+	sc->commit_modeset = 0;
 	DPRINTF(sc, "config_hdmi: done\n");
 	return (0);
 }
@@ -2265,6 +2275,8 @@ rk_kms_config_dp(struct rk_kms_softc *sc)
 	rk_kms_display_domain_sanity(sc);
 	rk_kms_vop_program_timing(sc, &mode, NULL);
 	sc->config_active = RK_KMS_CONFIG_DP;
+	/* See config_hdmi for the commit_modeset reset rationale. */
+	sc->commit_modeset = 0;
 	DPRINTF(sc, "config_dp: done\n");
 	return (0);
 }

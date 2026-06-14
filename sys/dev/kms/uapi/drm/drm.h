@@ -1355,6 +1355,23 @@ struct drm_event {
  * The event payload is a struct drm_event_crtc_sequence.
  */
 #define DRM_EVENT_CRTC_SEQUENCE	0x03
+/**
+ * DRM_EVENT_CONNECTOR_HOTPLUG - connector hot-plug / status-change event
+ *
+ * Posted by the framework when a hardware driver calls
+ * kms_connector_hotplug() to signal that a connector's hot-plug-detect
+ * line transitioned (sink plugged / unplugged) or its detected status
+ * otherwise changed.  Userspace re-runs DRM_IOCTL_MODE_GETCONNECTOR
+ * against the named connector to pick up the fresh status + mode list.
+ *
+ * Delivered to every drm_file currently open on the device whose
+ * connector this is.  Also broadcast via devd as
+ *   system=kms subsystem=cardN type=hotplug data="connector=ID status=N"
+ * so non-fd-based consumers (rc scripts, devd actions) can react.
+ *
+ * The event payload is struct drm_event_connector_hotplug.
+ */
+#define DRM_EVENT_CONNECTOR_HOTPLUG 0x04
 
 struct drm_event_vblank {
 	struct drm_event base;
@@ -1373,6 +1390,19 @@ struct drm_event_crtc_sequence {
 	__u64			user_data;
 	__s64			time_ns;
 	__u64			sequence;
+};
+
+/*
+ * Connector hot-plug / status-change event payload.  `connector_id`
+ * is the same mode-object id GETCONNECTOR uses; `connector_status`
+ * carries the new connector_status enum value (1=connected, 2=
+ * disconnected, 3=unknown) so userspace can decide whether to re-probe
+ * modes without round-tripping a GETCONNECTOR for the trivial case.
+ */
+struct drm_event_connector_hotplug {
+	struct drm_event	base;
+	__u32			connector_id;
+	__u32			connector_status;
 };
 
 /* typedef area */

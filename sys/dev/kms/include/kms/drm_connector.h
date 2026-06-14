@@ -85,6 +85,26 @@ int	kms_connector_attach_encoder(struct drm_connector *connector,
 	    struct drm_encoder *encoder);
 
 /*
+ * Driver-facing hotplug notification.  A hardware driver calls this
+ * when its HPD-detection path observes a sink plug / unplug or any
+ * other event that changes the connector's detected status.  The
+ * framework updates connector->status atomically, then delivers a
+ * DRM_EVENT_CONNECTOR_HOTPLUG to every drm_file currently open on
+ * the device and broadcasts a devd-readable
+ *   system=kms subsystem=cardN type=hotplug
+ *   data="connector=ID status=N"
+ * notification.
+ *
+ * Lock context: must be called from sleep-safe context (a callout or
+ * worker scheduled from the actual HPD IRQ handler).  Takes
+ * dev->dev_lock shared to walk the per-device file list, then each
+ * file's event_mtx briefly to queue the per-fd event.  Do not call
+ * from a hard-interrupt thread.
+ */
+void	kms_connector_hotplug(struct drm_connector *connector,
+	    enum drm_connector_status new_status);
+
+/*
  * Append a mode to the connector's mode list.  Connector takes
  * ownership of the storage — the mode is freed during
  * kms_connector_cleanup or kms_connector_modes_clear.

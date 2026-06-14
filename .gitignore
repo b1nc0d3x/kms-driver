@@ -5,9 +5,18 @@
 *.kld
 *.pieo
 .depend.*
-machine
-x86
-i386
+# Kernel-build symlinks the module-build cwd to sys/${ARCH}/include/
+# under these names — ignore the symlinks but DO keep tracking real
+# source directories that happen to share the name (e.g.
+# sys/dev/kms/drivers/x86/).
+/machine
+/i386
+/sys/modules/*/machine
+/sys/modules/*/x86
+/sys/modules/*/i386
+/sys/modules/*/*/machine
+/sys/modules/*/*/x86
+/sys/modules/*/*/i386
 opt_global.h
 opt_platform.h
 opt_splash.h
@@ -16,6 +25,7 @@ opt_teken.h
 bus_if.h
 device_if.h
 ofw_bus_if.h
+pci_if.h
 export_syms
 drm_probe
 drm_probe.full

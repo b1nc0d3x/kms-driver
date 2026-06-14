@@ -6,16 +6,21 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
-
+#include <sys/devctl.h>
 #include <sys/sx.h>
+
+#include <drm/drm.h>
 
 #include <kms/drm_connector.h>
 #include <kms/drm_device.h>
 #include <kms/drm_encoder.h>
+#include <kms/drm_file.h>
 #include <kms/drm_mode_config.h>
 #include <kms/drm_mode_object.h>
 #include <kms/drm_modes.h>
 #include <kms/drm_property.h>
+
+#include "kms_internal.h"
 
 #include "kms_internal.h"
 
@@ -149,4 +154,62 @@ kms_connector_modes_clear(struct drm_connector *connector)
 	}
 	connector->mode_count = 0;
 	sx_xunlock(&connector->dev->mode_config.mutex);
+}
+
+void
+kms_connector_hotplug(struct drm_connector *connector,
+    enum drm_connector_status new_status)
+{
+	struct drm_device *dev;
+	struct drm_event_connector_hotplug ev;
+	struct drm_file *file;
+	char devd_subsystem[32];
+	char devd_data[64];
+
+	if (connector == NULL)
+		return;
+	dev = connector->dev;
+	if (dev == NULL)
+		return;
+
+	/*
+	 * Update the cached status under mode_config.mutex so any
+	 * concurrent GETCONNECTOR sees one self-consistent snapshot —
+	 * old status with old modes, or new status (modes are refreshed
+	 * lazily on the next GETCONNECTOR via the driver's get_modes
+	 * hook).
+	 */
+	sx_xlock(&dev->mode_config.mutex);
+	if (connector->status == new_status) {
+		sx_xunlock(&dev->mode_config.mutex);
+		return;
+	}
+	connector->status = new_status;
+	sx_xunlock(&dev->mode_config.mutex);
+
+	/*
+	 * Build the per-fd event payload once.  Same struct goes to
+	 * every drm_file currently open on the device — kms_send_event
+	 * copies the data into per-file storage so there's no aliasing.
+	 */
+	memset(&ev, 0, sizeof(ev));
+	ev.base.type = DRM_EVENT_CONNECTOR_HOTPLUG;
+	ev.base.length = sizeof(ev);
+	ev.connector_id = connector->base.id;
+	ev.connector_status = (uint32_t)new_status;
+
+	sx_slock(&dev->dev_lock);
+	TAILQ_FOREACH(file, &dev->files, link)
+		(void)kms_send_event(file, &ev, sizeof(ev));
+	sx_sunlock(&dev->dev_lock);
+
+	/*
+	 * Broadcast via devd too — non-fd consumers (rc scripts, udev-
+	 * alike actions) re-probe by listening on devd's kms-system
+	 * channel.  Subsystem = cardN.
+	 */
+	snprintf(devd_subsystem, sizeof(devd_subsystem), "card%d", dev->minor);
+	snprintf(devd_data, sizeof(devd_data), "connector=%u status=%u",
+	    connector->base.id, (uint32_t)new_status);
+	devctl_notify("kms", devd_subsystem, "hotplug", devd_data);
 }
