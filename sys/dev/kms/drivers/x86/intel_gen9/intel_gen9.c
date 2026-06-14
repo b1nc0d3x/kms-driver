@@ -390,6 +390,7 @@ intel_gen9_sysctl_bit_scan(SYSCTL_HANDLER_ARGS)
 static int	intel_gen9_sysctl_edid_read_b(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_vbt_dump(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_hpd_dump(SYSCTL_HANDLER_ARGS);
+static int	intel_gen9_sysctl_current_mode(SYSCTL_HANDLER_ARGS);
 static void	intel_gen9_edid_to_mode(const uint8_t *dtd,
 		    struct drm_display_mode *m);
 static int	intel_gen9_attach_edid_modes(struct intel_gen9_softc *sc);
@@ -456,6 +457,11 @@ intel_gen9_re_sysctls_init(struct intel_gen9_softc *sc)
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
 	    sc, 0, intel_gen9_sysctl_hpd_dump, "I",
 	    "write 1 to dump SFUSE_STRAP / SHOTPLUG_CTL_DDI / SDEISR live HPD");
+	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "current_mode",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, intel_gen9_sysctl_current_mode, "I",
+	    "write 1 to read back live pipe/transcoder timing as a mode");
 }
 
 static void
@@ -1038,6 +1044,91 @@ intel_gen9_sysctl_vbt_dump(SYSCTL_HANDLER_ARGS)
 	return (0);
 }
 
+/* -------------------------- pipe/transcoder readback ---------------------- */
+
+/*
+ * Transcoder timing registers per pipe.  HTOTAL / HBLANK / HSYNC / VTOTAL
+ * / VBLANK / VSYNC layout (per i915 + BSpec):
+ *   bits[28:16] = "(end + 1) - 1"        (e.g. HTOTAL field = htotal-1)
+ *   bits[12:0]  = "(start + 1) - 1"      (e.g. HACTIVE field = hactive-1)
+ *
+ * So decoded value = raw field + 1.
+ *
+ * Each transcoder bank starts at 0x60000 + (transcoder * 0x1000).
+ */
+#define	TRANS_HTOTAL(t)		(0x60000 + (t) * 0x1000)
+#define	TRANS_HBLANK(t)		(0x60004 + (t) * 0x1000)
+#define	TRANS_HSYNC(t)		(0x60008 + (t) * 0x1000)
+#define	TRANS_VTOTAL(t)		(0x6000c + (t) * 0x1000)
+#define	TRANS_VBLANK(t)		(0x60010 + (t) * 0x1000)
+#define	TRANS_VSYNC(t)		(0x60014 + (t) * 0x1000)
+#define	TRANS_DDI_FUNC_CTL(t)	(0x60400 + (t) * 0x1000)
+#define	PIPE_CONF(p)		(0x70008 + (p) * 0x1000)
+#define	  PIPE_CONF_ENABLE	(1u << 31)
+#define	  PIPE_CONF_STATE	(1u << 30)
+
+static void
+intel_gen9_read_pipe_mode(struct intel_gen9_softc *sc, int pipe,
+    struct drm_display_mode *m)
+{
+	uint32_t htotal = intel_gen9_r32(sc, TRANS_HTOTAL(pipe));
+	uint32_t hsync  = intel_gen9_r32(sc, TRANS_HSYNC(pipe));
+	uint32_t vtotal = intel_gen9_r32(sc, TRANS_VTOTAL(pipe));
+	uint32_t vsync  = intel_gen9_r32(sc, TRANS_VSYNC(pipe));
+	uint32_t fctl   = intel_gen9_r32(sc, TRANS_DDI_FUNC_CTL(pipe));
+
+	memset(m, 0, sizeof(*m));
+	m->hdisplay    = (htotal & 0x1fff) + 1;
+	m->htotal      = ((htotal >> 16) & 0x1fff) + 1;
+	m->hsync_start = (hsync & 0x1fff) + 1;
+	m->hsync_end   = ((hsync >> 16) & 0x1fff) + 1;
+	m->vdisplay    = (vtotal & 0x1fff) + 1;
+	m->vtotal      = ((vtotal >> 16) & 0x1fff) + 1;
+	m->vsync_start = (vsync & 0x1fff) + 1;
+	m->vsync_end   = ((vsync >> 16) & 0x1fff) + 1;
+	/* Sync polarity from TRANS_DDI_FUNC_CTL bits 17 (PVSYNC) / 16 (PHSYNC). */
+	m->flags  = (fctl & (1u << 16)) ? KMS_MODE_FLAG_PHSYNC : KMS_MODE_FLAG_NHSYNC;
+	m->flags |= (fctl & (1u << 17)) ? KMS_MODE_FLAG_PVSYNC : KMS_MODE_FLAG_NVSYNC;
+	/*
+	 * Pixclk from a register isn't trivial on gen9 (needs CDCLK +
+	 * DPLL_CTRL2 decode).  Leave 0 for now; userspace tools fall back
+	 * to vrefresh-from-totals if it's the only mode available.
+	 */
+	m->clock = 0;
+	m->vrefresh = 0;
+}
+
+static int
+intel_gen9_sysctl_current_mode(SYSCTL_HANDLER_ARGS)
+{
+	struct intel_gen9_softc *sc = arg1;
+	struct drm_display_mode m;
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+
+	if (error || req->newptr == NULL || trigger == 0)
+		return (error);
+
+	for (int pipe = 0; pipe < 3; pipe++) {
+		uint32_t pconf = intel_gen9_r32(sc, PIPE_CONF(pipe));
+		bool active = (pconf & (PIPE_CONF_ENABLE | PIPE_CONF_STATE))
+		    == (PIPE_CONF_ENABLE | PIPE_CONF_STATE);
+		device_printf(sc->dev,
+		    "pipe %c: PIPE_CONF=0x%08x  %s\n",
+		    'A' + pipe, pconf, active ? "ACTIVE" : "idle");
+		if (!active)
+			continue;
+		intel_gen9_read_pipe_mode(sc, pipe, &m);
+		device_printf(sc->dev,
+		    "  %ux%u  htotal=%u  vtotal=%u  hs=%u..%u  vs=%u..%u"
+		    "  flags=0x%x\n",
+		    m.hdisplay, m.vdisplay, m.htotal, m.vtotal,
+		    m.hsync_start, m.hsync_end,
+		    m.vsync_start, m.vsync_end, m.flags);
+	}
+	return (0);
+}
+
 /* -------------------------- EDID -> connector mode ------------------------ */
 
 /*
@@ -1227,10 +1318,51 @@ intel_gen9_atomic_check(struct drm_device *dev __unused,
 	return (0);
 }
 
+/*
+ * Atomic commit: today this driver only safely handles "the requested
+ * timing matches what firmware already programmed."  That's the
+ * stand-the-display-up case after EDID-on-attach.  Real modeset (DDI
+ * voltage swing, DPLL/CDCLK, port-width, transcoder timing writes) is
+ * still TODO — until then, fall through to no-op for matching modes
+ * and decline mismatches rather than half-program them.
+ */
 static int
-intel_gen9_atomic_commit(struct drm_device *dev __unused,
-    struct drm_atomic_state *state __unused, bool nonblock __unused)
+intel_gen9_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
+    bool nonblock __unused)
 {
+	struct intel_gen9_softc *sc = dev->driver_priv;
+
+	for (uint32_t i = 0; i < state->num_crtc; i++) {
+		struct drm_crtc_state *cs = state->crtc_states[i];
+		struct drm_display_mode live;
+
+		if (cs == NULL || !cs->mode_changed)
+			continue;
+		if (!cs->active) {
+			/* Pipe-off: also TODO, but logging is harmless. */
+			device_printf(sc->dev,
+			    "atomic_commit: pipe %u off-request (no-op)\n", i);
+			continue;
+		}
+		intel_gen9_read_pipe_mode(sc, 0, &live);
+		if (cs->mode.hdisplay != live.hdisplay ||
+		    cs->mode.vdisplay != live.vdisplay ||
+		    cs->mode.htotal != live.htotal ||
+		    cs->mode.vtotal != live.vtotal) {
+			device_printf(sc->dev,
+			    "atomic_commit: requested %ux%u (htotal=%u vtotal=%u)"
+			    " != live %ux%u (htotal=%u vtotal=%u);"
+			    " full modeset not yet implemented\n",
+			    cs->mode.hdisplay, cs->mode.vdisplay,
+			    cs->mode.htotal, cs->mode.vtotal,
+			    live.hdisplay, live.vdisplay,
+			    live.htotal, live.vtotal);
+			return (ENOTSUP);
+		}
+		device_printf(sc->dev,
+		    "atomic_commit: pipe %u — requested matches live"
+		    " %ux%u  (no-op)\n", i, live.hdisplay, live.vdisplay);
+	}
 	return (0);
 }
 
