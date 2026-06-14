@@ -256,6 +256,7 @@ struct intel_gen9_softc {
 						 * by poke_value sysctl */
 	uint32_t		 bit_scan_addr;
 	uint32_t		 bit_scan_skip; /* per-cycle skip count */
+	uint32_t		 wrpll_target_khz;
 	struct sysctl_ctx_list	 re_sysctl_ctx;
 	struct sysctl_oid	*re_sysctl_tree;
 };
@@ -478,6 +479,8 @@ intel_gen9_sysctl_bit_scan(SYSCTL_HANDLER_ARGS)
 static int	intel_gen9_sysctl_edid_read_b(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_vbt_dump(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_hpd_dump(SYSCTL_HANDLER_ARGS);
+static int	intel_gen9_sysctl_cap_dump(SYSCTL_HANDLER_ARGS);
+static int	intel_gen9_sysctl_wrpll_calc(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_current_mode(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_clock_state(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS);
@@ -565,6 +568,20 @@ intel_gen9_re_sysctls_init(struct intel_gen9_softc *sc)
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
 	    sc, 0, intel_gen9_sysctl_hpd_dump, "I",
 	    "write 1 to dump SFUSE_STRAP / SHOTPLUG_CTL_DDI / SDEISR live HPD");
+	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "cap_dump",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, intel_gen9_sysctl_cap_dump, "I",
+	    "write 1 to print per-DDI capability table (VBT x SFUSE x HPD)");
+	SYSCTL_ADD_UINT(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "wrpll_target_khz", CTLFLAG_RW, &sc->wrpll_target_khz, 0,
+	    "WRPLL solver target pixel clock in kHz");
+	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "wrpll_calc",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, intel_gen9_sysctl_wrpll_calc, "I",
+	    "write 1 to solve WRPLL (DCO_INT/DCO_FRAC/P0/P1/P2) for"
+	    " wrpll_target_khz");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "current_mode",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
@@ -2168,6 +2185,145 @@ intel_gen9_sysctl_hpd_dump(SYSCTL_HANDLER_ARGS)
 	return (0);
 }
 
+/* --------------------------- silicon capability table --------------------- */
+
+/*
+ * Per-DDI capability summary.  Tied to three independent oracles:
+ *   1) VBT child_device_config -- what the board manufacturer wired this
+ *      port for (eDP / HDMI / DP / dual)
+ *   2) SFUSE_STRAP -- which DDIs the silicon fused on for this SKU (some
+ *      KBL desktop parts ship with DDI_D fused off)
+ *   3) SDEISR HPD live -- which DDIs currently see a connected sink
+ *
+ * The intersection of (1) and (2) is what's *available* on this board;
+ * (3) is what's *connected right now*.  Captured on fbsdx86 2026-06-13
+ * as the canonical 8086:5912 / HD 630 / KBL-S desktop result:
+ *
+ *   DDI  silicon  VBT-type        live-HPD  notes
+ *   ---  -------  --------------  --------  -----------------------------
+ *   A    n/a      eDP             0         no internal panel on desktop
+ *   B    yes      HDMI            1         firmware-driven XYM 1080p60
+ *   C    yes      DP+HDMI(dual)   0         available, no sink connected
+ *   D    FUSED    DP+HDMI(dual)   0         SFUSE_STRAP bit 1 == 0
+ *   E    n/a      DP              0         no PCH route on this SKU
+ *
+ * Conclusion: max 2 concurrent displays on this SKU (DDI_B + DDI_C).
+ */
+static int
+intel_gen9_sysctl_cap_dump(SYSCTL_HANDLER_ARGS)
+{
+	struct intel_gen9_softc *sc = arg1;
+	uint32_t asls, sfuse, sde;
+	void *va;
+	uint8_t *blob;
+	struct vbt_header *vbt;
+	struct bdb_header *bdb;
+	uint16_t per_ddi_type[5] = { 0, 0, 0, 0, 0 };
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+
+	if (error || req->newptr == NULL || trigger == 0)
+		return (error);
+
+	sfuse = intel_gen9_r32(sc, SFUSE_STRAP);
+	sde   = intel_gen9_r32(sc, SDEISR);
+
+	/*
+	 * Walk the VBT to fill per_ddi_type[].  We map dvo_port back to a
+	 * DDI index: HDMI-B=1/DP-B=7 -> DDI_B(1), HDMI-C=2/DP-C=8 -> DDI_C(2),
+	 * HDMI-D=3/DP-D=9 -> DDI_D(3), HDMI-A=0/DP-A=10 -> DDI_A(0),
+	 * HDMI-E=12/DP-E=11 -> DDI_E(4).
+	 */
+	asls = pci_read_config(sc->dev, ASLS_PCI_CFG, 4);
+	if (asls != 0 && asls != 0xffffffff &&
+	    (va = pmap_mapdev(asls, OPREGION_SIZE)) != NULL) {
+		blob = (uint8_t *)va;
+		vbt = (struct vbt_header *)(blob + OPREGION_VBT_OFFSET);
+		if (memcmp(vbt->signature, "$VBT", 4) == 0) {
+			bdb = (struct bdb_header *)((uint8_t *)vbt +
+			    vbt->bdb_offset);
+			if (memcmp(bdb->signature, "BIOS_DATA_BLOCK", 15) == 0) {
+				uint8_t *p = (uint8_t *)bdb + bdb->header_size;
+				uint8_t *end = (uint8_t *)bdb + bdb->bdb_size;
+				while (p + 3 <= end) {
+					uint8_t id = p[0];
+					uint16_t sz = p[1] | (p[2] << 8);
+					uint8_t *body = p + 3;
+
+					if (id == BDB_GENERAL_DEFINITIONS) {
+						struct bdb_general_definitions
+						    *gd = (void *)body;
+						uint8_t *dev = gd->devices;
+						uint8_t *dend = body + sz;
+						while (dev + gd->child_dev_size
+						    <= dend) {
+							struct
+							    child_device_config
+							    *cd = (void *)dev;
+							int ddi = -1;
+							switch (cd->dvo_port) {
+							case 0:
+							case 10: ddi = 0; break;
+							case 1:
+							case 7:  ddi = 1; break;
+							case 2:
+							case 8:  ddi = 2; break;
+							case 3:
+							case 9:  ddi = 3; break;
+							case 11:
+							case 12: ddi = 4; break;
+							}
+							if (ddi >= 0 &&
+							    cd->device_type != 0
+							    && per_ddi_type[
+							    ddi] == 0)
+								per_ddi_type[
+								    ddi] =
+								    cd->
+								    device_type;
+							dev += gd->
+							    child_dev_size;
+						}
+						break;
+					}
+					p = body + sz;
+				}
+			}
+		}
+		pmap_unmapdev(va, OPREGION_SIZE);
+	}
+
+	device_printf(sc->dev,
+	    "cap: SFUSE_STRAP=0x%08x  SDEISR=0x%08x\n", sfuse, sde);
+	device_printf(sc->dev,
+	    "cap: DDI  silicon  VBT-type            live-HPD\n");
+	for (int ddi = 0; ddi < 5; ddi++) {
+		int silicon = 0;
+		int hpd = 0;
+		const char *vtype = per_ddi_type[ddi] ?
+		    intel_gen9_device_type_name(per_ddi_type[ddi]) : "(none)";
+
+		switch (ddi) {
+		case 1: silicon = (sfuse >> 2) & 1; break;	/* DDI_B */
+		case 2: silicon = (sfuse >> 1) & 1; break;	/* DDI_C */
+		case 3: silicon = (sfuse >> 0) & 1; break;	/* DDI_D */
+		default: silicon = -1;				/* not strapped */
+		}
+		switch (ddi) {
+		case 1: hpd = (sde >> 21) & 1; break;
+		case 2: hpd = (sde >> 22) & 1; break;
+		case 3: hpd = (sde >> 23) & 1; break;
+		case 4: hpd = (sde >> 24) & 1; break;
+		}
+		device_printf(sc->dev,
+		    "cap: %c    %-7s  %-18s  %d\n",
+		    'A' + ddi,
+		    silicon < 0 ? "n/a" : (silicon ? "yes" : "FUSED"),
+		    vtype, hpd);
+	}
+	return (0);
+}
+
 /* --------------------------- CDCLK / DPLL readback ------------------------ */
 
 /*
@@ -2253,6 +2409,184 @@ intel_gen9_sysctl_clock_state(SYSCTL_HANDLER_ARGS)
 		    "  DDI_%c: %s  DPLL_SEL=%u\n",
 		    'A' + port, off ? "CLOCK_OFF" : "clock-on", sel);
 	}
+	return (0);
+}
+
+/* --------------------------- WRPLL solver --------------------------------- */
+
+/*
+ * SKL+ WRPLL (DPLL2 / DPLL3) -- fractional-N synthesizer for arbitrary
+ * HDMI pixel clocks.  Solved from BSpec / i915 skl_ddi_calculate_wrpll.
+ *
+ * Reference clock     : 24 MHz
+ * VCO target window   : 8.4 GHz to 9.0 GHz
+ * Output chain        : VCO / 5 / (P0 * P1 * P2)
+ * Programmed via CFGCR1 (DCO_INTEGER + DCO_FRACTION) and
+ *                CFGCR2 (P0_QDIV, P1_KDIV, P2_PDIV encodings).
+ *
+ * Algorithm:
+ *   1) Compute the total divider 'd' such that pll_clock = pixel * 5
+ *      and VCO = pll_clock * d lands in [8400, 9000] MHz.
+ *   2) Decompose d into (P0, P1, P2) using i915's even/odd table.
+ *   3) DCO_INTEGER = VCO_kHz / 24000;
+ *      DCO_FRACTION = ((VCO_kHz % 24000) << 15) / 24000.
+ *
+ * P0 codes: 1->0, 2->1, 3->2, 7->4   (P0_QDIV in CFGCR2)
+ * P2 codes: 5->0, 2->1, 3->2, 1->3   (P2_PDIV in CFGCR2)
+ * P1 is the K-divider, 1..8 raw.
+ */
+#define	WRPLL_VCO_MIN_KHZ	8400000
+#define	WRPLL_VCO_MAX_KHZ	9000000
+#define	WRPLL_REF_KHZ		24000
+
+static const uint8_t wrpll_even_dividers[] = {
+	4, 6, 8, 10, 12, 14, 16, 18, 20, 24, 28, 30, 32, 36, 40, 42,
+	44, 48, 52, 54, 56, 60, 64, 66, 68, 70, 72, 76, 78, 80, 84,
+	88, 90, 92, 96, 98
+};
+static const uint8_t wrpll_odd_dividers[] = { 3, 5, 7, 9, 15, 21, 35 };
+
+static bool
+intel_gen9_wrpll_decompose(uint32_t d, uint8_t *p0, uint8_t *p1, uint8_t *p2)
+{
+	if ((d % 2) == 0) {
+		uint32_t half = d / 2;
+
+		if (half == 1 || half == 2 || half == 3 || half == 5) {
+			*p0 = 2;
+			*p1 = 1;
+			*p2 = (uint8_t)half;
+		} else if ((half % 2) == 0) {
+			*p0 = 2;
+			*p1 = (uint8_t)(half / 2);
+			*p2 = 2;
+		} else if ((half % 3) == 0) {
+			*p0 = 3;
+			*p1 = (uint8_t)(half / 3);
+			*p2 = 2;
+		} else if ((half % 7) == 0) {
+			*p0 = 7;
+			*p1 = (uint8_t)(half / 7);
+			*p2 = 2;
+		} else {
+			return (false);
+		}
+		return (true);
+	}
+	switch (d) {
+	case 3:  *p0 = 3; *p1 = 1; *p2 = 1; return (true);
+	case 5:  *p0 = 5; *p1 = 1; *p2 = 1; return (true);
+	case 7:  *p0 = 7; *p1 = 1; *p2 = 1; return (true);
+	case 9:  *p0 = 3; *p1 = 1; *p2 = 3; return (true);
+	case 15: *p0 = 3; *p1 = 1; *p2 = 5; return (true);
+	case 21: *p0 = 7; *p1 = 1; *p2 = 3; return (true);
+	case 35: *p0 = 7; *p1 = 1; *p2 = 5; return (true);
+	}
+	return (false);
+}
+
+static bool
+intel_gen9_wrpll_solve(uint32_t pixel_khz, uint8_t *out_p0, uint8_t *out_p1,
+    uint8_t *out_p2, uint16_t *out_dco_int, uint16_t *out_dco_frac,
+    uint64_t *out_vco_khz)
+{
+	uint32_t pll_khz = pixel_khz * 5;
+	uint32_t best_d = 0;
+	uint64_t best_vco = 0;
+	uint64_t best_dev = UINT64_MAX;
+	uint64_t center = ((uint64_t)WRPLL_VCO_MIN_KHZ +
+	    WRPLL_VCO_MAX_KHZ) / 2;
+	uint8_t p0 = 0, p1 = 0, p2 = 0;
+
+	for (size_t i = 0; i < nitems(wrpll_even_dividers); i++) {
+		uint32_t d = wrpll_even_dividers[i];
+		uint64_t vco = (uint64_t)pll_khz * d;
+		uint8_t a, b, c;
+		uint64_t dev;
+
+		if (vco < WRPLL_VCO_MIN_KHZ || vco > WRPLL_VCO_MAX_KHZ)
+			continue;
+		if (!intel_gen9_wrpll_decompose(d, &a, &b, &c))
+			continue;
+		dev = vco > center ? vco - center : center - vco;
+		if (dev < best_dev) {
+			best_dev = dev;
+			best_d = d;
+			best_vco = vco;
+			p0 = a;
+			p1 = b;
+			p2 = c;
+		}
+	}
+	for (size_t i = 0; i < nitems(wrpll_odd_dividers); i++) {
+		uint32_t d = wrpll_odd_dividers[i];
+		uint64_t vco = (uint64_t)pll_khz * d;
+		uint8_t a, b, c;
+		uint64_t dev;
+
+		if (vco < WRPLL_VCO_MIN_KHZ || vco > WRPLL_VCO_MAX_KHZ)
+			continue;
+		if (!intel_gen9_wrpll_decompose(d, &a, &b, &c))
+			continue;
+		dev = vco > center ? vco - center : center - vco;
+		if (dev < best_dev) {
+			best_dev = dev;
+			best_d = d;
+			best_vco = vco;
+			p0 = a;
+			p1 = b;
+			p2 = c;
+		}
+	}
+	if (best_d == 0)
+		return (false);
+
+	*out_p0 = p0;
+	*out_p1 = p1;
+	*out_p2 = p2;
+	*out_dco_int = (uint16_t)(best_vco / WRPLL_REF_KHZ);
+	*out_dco_frac = (uint16_t)(((best_vco % WRPLL_REF_KHZ) << 15) /
+	    WRPLL_REF_KHZ);
+	*out_vco_khz = best_vco;
+	return (true);
+}
+
+static int
+intel_gen9_sysctl_wrpll_calc(SYSCTL_HANDLER_ARGS)
+{
+	struct intel_gen9_softc *sc = arg1;
+	uint8_t p0, p1, p2;
+	uint16_t dco_int, dco_frac;
+	uint64_t vco;
+	uint32_t pixel_khz;
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+
+	if (error || req->newptr == NULL || trigger == 0)
+		return (error);
+
+	pixel_khz = sc->wrpll_target_khz;
+	if (pixel_khz == 0) {
+		device_printf(sc->dev,
+		    "wrpll: set dev.intel_gen9.0.re.wrpll_target_khz first\n");
+		return (0);
+	}
+	if (!intel_gen9_wrpll_solve(pixel_khz, &p0, &p1, &p2,
+	    &dco_int, &dco_frac, &vco)) {
+		device_printf(sc->dev,
+		    "wrpll: no solution for %u kHz (VCO out of range)\n",
+		    pixel_khz);
+		return (0);
+	}
+	device_printf(sc->dev,
+	    "wrpll: target=%u kHz  VCO=%llu kHz  div=%u (P0=%u P1=%u P2=%u)\n",
+	    pixel_khz, (unsigned long long)vco, p0 * p1 * p2, p0, p1, p2);
+	device_printf(sc->dev,
+	    "wrpll: DCO_INTEGER=%u (0x%03x)  DCO_FRACTION=%u (0x%04x)\n",
+	    dco_int, dco_int, dco_frac, dco_frac);
+	device_printf(sc->dev,
+	    "wrpll: verify pixel = VCO / 5 / div = %llu kHz\n",
+	    (unsigned long long)(vco / 5 / (p0 * p1 * p2)));
 	return (0);
 }
 
