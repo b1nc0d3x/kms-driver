@@ -391,6 +391,7 @@ static int	intel_gen9_sysctl_edid_read_b(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_vbt_dump(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_hpd_dump(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_current_mode(SYSCTL_HANDLER_ARGS);
+static int	intel_gen9_sysctl_gtt_dump(SYSCTL_HANDLER_ARGS);
 static void	intel_gen9_edid_to_mode(const uint8_t *dtd,
 		    struct drm_display_mode *m);
 static int	intel_gen9_attach_edid_modes(struct intel_gen9_softc *sc);
@@ -462,6 +463,11 @@ intel_gen9_re_sysctls_init(struct intel_gen9_softc *sc)
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
 	    sc, 0, intel_gen9_sysctl_current_mode, "I",
 	    "write 1 to read back live pipe/transcoder timing as a mode");
+	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "gtt_dump",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, intel_gen9_sysctl_gtt_dump, "I",
+	    "write 1 to scan first 2048 GTT PTEs and print first 8");
 }
 
 static void
@@ -1041,6 +1047,77 @@ intel_gen9_sysctl_vbt_dump(SYSCTL_HANDLER_ARGS)
 	}
 
 	pmap_unmapdev(va, OPREGION_SIZE);
+	return (0);
+}
+
+/* ------------------------------- GTT -------------------------------------- */
+
+/*
+ * Graphics Translation Table — lives at BAR0 + 0x800000 on gen9.  Each
+ * PTE is 8 bytes (64-bit), gen8+ layout:
+ *   bit 0:        VALID/PRESENT
+ *   bit 1:        WRITEABLE
+ *   bits[3:2]:    PAT_INDEX
+ *   bit 11:       LLC_CACHEABLE
+ *   bits[63:12]:  physical page frame number (PFN)
+ *
+ * 8 MiB / 8 B per entry = 1 Mi entries × 4 KiB page = 4 GiB GTT-addressable.
+ */
+#define	GTT_BASE		0x00800000
+#define	GTT_PTE_SIZE		8
+#define	GTT_PTE_VALID		(1u << 0)
+#define	GTT_PTE_WRITEABLE	(1u << 1)
+
+static uint64_t
+intel_gen9_gtt_read(struct intel_gen9_softc *sc, uint32_t entry_idx)
+{
+	uint32_t off = GTT_BASE + entry_idx * GTT_PTE_SIZE;
+	uint32_t lo = intel_gen9_r32(sc, off);
+	uint32_t hi = intel_gen9_r32(sc, off + 4);
+	return ((uint64_t)hi << 32) | lo;
+}
+
+static int
+intel_gen9_sysctl_gtt_dump(SYSCTL_HANDLER_ARGS)
+{
+	struct intel_gen9_softc *sc = arg1;
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+
+	if (error || req->newptr == NULL || trigger == 0)
+		return (error);
+
+	uint32_t valid_count = 0, last_pfn = 0, runs = 0;
+	uint64_t first_pfn = 0;
+	for (uint32_t i = 0; i < 2048; i++) {	/* first 8 MiB of GTT */
+		uint64_t pte = intel_gen9_gtt_read(sc, i);
+		if (pte & GTT_PTE_VALID) {
+			uint64_t pfn = (pte >> 12);
+			if (valid_count == 0)
+				first_pfn = pfn;
+			if (valid_count == 0 || pfn != last_pfn + 1)
+				runs++;
+			last_pfn = pfn;
+			valid_count++;
+		}
+	}
+	device_printf(sc->dev,
+	    "gtt: in first 2048 PTEs: %u valid, %u contiguous runs,"
+	    " first PFN=0x%llx (phys 0x%llx)\n",
+	    valid_count, runs,
+	    (unsigned long long)first_pfn,
+	    (unsigned long long)(first_pfn << 12));
+
+	/* Pretty-print the first 8 PTEs verbatim. */
+	for (uint32_t i = 0; i < 8; i++) {
+		uint64_t pte = intel_gen9_gtt_read(sc, i);
+		device_printf(sc->dev,
+		    "  GTT[%u] = 0x%016llx  %s%s  PFN=0x%llx\n",
+		    i, (unsigned long long)pte,
+		    (pte & GTT_PTE_VALID) ? "V" : "-",
+		    (pte & GTT_PTE_WRITEABLE) ? "W" : "-",
+		    (unsigned long long)(pte >> 12));
+	}
 	return (0);
 }
 
