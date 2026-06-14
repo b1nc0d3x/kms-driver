@@ -772,7 +772,7 @@ intel_gen9_gmbus_read_block(struct intel_gen9_softc *sc, uint32_t pin,
 	intel_gen9_w32(sc, GMBUS1, GMBUS_SW_CLR_INT);
 	intel_gen9_w32(sc, GMBUS1, 0);
 	if (intel_gen9_r32(sc, GMBUS2) & GMBUS_INUSE) {
-		device_printf(sc->dev, "gmbus: INUSE stuck, clearing\n");
+		DPRINTF(sc, 1, "gmbus: INUSE stuck, clearing\n");
 		intel_gen9_w32(sc, GMBUS2, GMBUS_INUSE);
 	}
 	intel_gen9_w32(sc, GMBUS0, pin | GMBUS_RATE_100KHZ);
@@ -790,8 +790,7 @@ intel_gen9_gmbus_read_block(struct intel_gen9_softc *sc, uint32_t pin,
 	intel_gen9_w32(sc, GMBUS1, cmd);
 	error = intel_gen9_gmbus_wait(sc, GMBUS_HW_WAIT);
 	if (error != 0) {
-		device_printf(sc->dev, "gmbus: wait HW_WAIT after addr: %d\n",
-		    error);
+		DPRINTF(sc, 1, "gmbus: wait HW_WAIT after addr: %d\n", error);
 		goto out;
 	}
 	/*
@@ -817,7 +816,7 @@ intel_gen9_gmbus_read_block(struct intel_gen9_softc *sc, uint32_t pin,
 		error = intel_gen9_gmbus_wait(sc, GMBUS_HW_RDY);
 		if (error != 0) {
 			uint32_t s = intel_gen9_r32(sc, GMBUS2);
-			device_printf(sc->dev,
+			DPRINTF(sc, 1,
 			    "gmbus: wait HW_RDY at %zu/%zu: %d  GMBUS2=0x%08x\n",
 			    got, len, error, s);
 			goto out;
@@ -2100,7 +2099,7 @@ intel_gen9_attach_edid_modes(struct intel_gen9_softc *sc)
 			return (ENOMEM);
 		intel_gen9_edid_to_mode(&edid[i], m);
 		kms_connector_add_mode(&sc->connector, m);
-		device_printf(sc->dev,
+		DPRINTF(sc, 0,
 		    "edid: added mode %s @%u kHz  %u Hz  flags=0x%x\n",
 		    m->name, m->clock, m->vrefresh, m->flags);
 	}
@@ -2646,7 +2645,7 @@ intel_gen9_irq_setup(struct intel_gen9_softc *sc)
 	intel_gen9_w32(sc, GEN8_MASTER_IRQ,
 	    GEN8_MASTER_IRQ_CONTROL | GEN8_DE_PIPE_A_IRQ);
 	(void)intel_gen9_r32(sc, GEN8_MASTER_IRQ);
-	device_printf(sc->dev, "irq: MSI armed, Pipe A vblank enabled\n");
+	DPRINTF(sc, 0, "irq: MSI armed, Pipe A vblank enabled\n");
 	return (0);
 }
 
