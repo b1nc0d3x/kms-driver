@@ -13,6 +13,7 @@
 #include <kms/drm_device.h>
 #include <kms/drm_drv.h>
 #include <kms/drm_file.h>
+#include <kms/drm_prime.h>
 
 #include "kms_internal.h"
 
@@ -212,6 +213,12 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 	case DRM_IOCTL_MODE_DESTROY_DUMB:
 		return (kms_ioctl_mode_destroy_dumb(file,
 		    (struct drm_mode_destroy_dumb *)data));
+	case DRM_IOCTL_PRIME_HANDLE_TO_FD:
+		return (kms_ioctl_prime_handle_to_fd(file,
+		    (struct drm_prime_handle *)data));
+	case DRM_IOCTL_PRIME_FD_TO_HANDLE:
+		return (kms_ioctl_prime_fd_to_handle(file,
+		    (struct drm_prime_handle *)data));
 	case DRM_IOCTL_MODE_ADDFB:
 		return (kms_ioctl_mode_addfb(file,
 		    (struct drm_mode_fb_cmd *)data));

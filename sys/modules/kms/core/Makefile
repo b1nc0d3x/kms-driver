@@ -16,6 +16,7 @@ SRCS=	drm_atomic.c \
 	drm_framebuffer.c \
 	drm_gem.c \
 	drm_gem_dumb.c \
+	drm_prime.c \
 	drm_ioctl.c \
 	drm_mode_config.c \
 	drm_mode_ioctl.c \
