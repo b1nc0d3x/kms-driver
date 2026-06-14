@@ -14,7 +14,7 @@
  *
  * Usage: flip_test <FB_ID> <CRTC_ID> [hold_seconds] [/dev/dri/cardN]
  *
- *   FB_ID    -- assigned by `sysctl dev.intel_gen9.0.re.expose_scanout_fb=1`
+ *   FB_ID    -- assigned by `sysctl dev.igen9.0.re.expose_scanout_fb=1`
  *   CRTC_ID  -- printed by the same sysctl
  *
  * Raw ioctls — no libdrm.

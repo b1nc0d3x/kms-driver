@@ -1,8 +1,8 @@
-.PATH: ${SRCTOP}/sys/dev/kms/drivers/x86/intel_gen9
+.PATH: ${SRCTOP}/sys/dev/kms/drivers/x86/igen9
 
-KMOD=	intel_gen9
+KMOD=	igen9
 
-SRCS=	intel_gen9.c \
+SRCS=	igen9.c \
 	bus_if.h device_if.h pci_if.h \
 	opt_platform.h
 

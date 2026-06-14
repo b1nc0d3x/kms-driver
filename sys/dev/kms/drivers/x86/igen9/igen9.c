@@ -73,7 +73,7 @@
 static const struct {
 	uint16_t	id;
 	const char	*desc;
-} intel_gen9_ids[] = {
+} igen9_ids[] = {
 	{ 0x1902, "Intel HD 510 (Skylake GT1)" },
 	{ 0x1906, "Intel HD 510 (Skylake GT1 ULT)" },
 	{ 0x190b, "Intel HD 510 (Skylake GT1 Halo)" },
@@ -121,7 +121,7 @@ MALLOC_DECLARE(M_KMS);
  *   level 2  per-frame (vblank, page flip rate)
  *   level 3  hex dumps (snapshot diffs, register sweeps)
  * Gated on the softc's sc_debug counter so the cold path is one branch.
- * Settable at runtime via dev.intel_gen9.<n>.debug or boot-time via the
+ * Settable at runtime via dev.igen9.<n>.debug or boot-time via the
  * matching loader tunable.
  */
 #define	DPRINTF(sc, level, ...)						\
@@ -130,7 +130,7 @@ MALLOC_DECLARE(M_KMS);
 			device_printf((sc)->dev, __VA_ARGS__);		\
 	} while (0)
 
-struct intel_gen9_test_fb;	/* defined further down */
+struct igen9_test_fb;	/* defined further down */
 
 /*
  * User-FB GTT slot cache: each ADDFB2 dumb buffer gets one slot of
@@ -147,13 +147,13 @@ struct intel_gen9_test_fb;	/* defined further down */
  * eventual general path; for now expose_scanout_fb sysctl wires the
  * already-allocated test_fb into the framework's mode-object table.
  */
-struct intel_gen9_owned_fb {
+struct igen9_owned_fb {
 	struct drm_framebuffer	 base;
-	struct intel_gen9_test_fb *test_fb;	/* not owned; back-ref */
+	struct igen9_test_fb *test_fb;	/* not owned; back-ref */
 };
 
-static void intel_gen9_owned_fb_destroy(struct drm_framebuffer *fb);
-static const struct drm_framebuffer_funcs intel_gen9_owned_fb_funcs;
+static void igen9_owned_fb_destroy(struct drm_framebuffer *fb);
+static const struct drm_framebuffer_funcs igen9_owned_fb_funcs;
 
 /*
  * MMIO ranges we care about on gen9 display.  Bracket the regions, not
@@ -163,13 +163,13 @@ static const struct drm_framebuffer_funcs intel_gen9_owned_fb_funcs;
  * Stride is 4 bytes (32-bit registers) for every range; gen9 doesn't have
  * any 8/16-bit-only MMIO that matters for display.
  */
-struct intel_gen9_range {
+struct igen9_range {
 	uint32_t	start;
 	uint32_t	end;	/* inclusive */
 	const char	*name;
 };
 
-static const struct intel_gen9_range intel_gen9_ranges[] = {
+static const struct igen9_range igen9_ranges[] = {
 	{ 0x00044000, 0x00044100, "INT/HOTPLUG" },
 	{ 0x00045000, 0x000455ff, "PWR/DC_STATE" },
 	{ 0x00046000, 0x000460ff, "CDCLK/DPLL_CTRL" },
@@ -190,7 +190,7 @@ static const struct intel_gen9_range intel_gen9_ranges[] = {
 	{ 0x000c6000, 0x000c61ff, "PCH_GMBUS" },
 };
 
-struct intel_gen9_softc {
+struct igen9_softc {
 	device_t		 dev;
 	struct drm_device	*drm_dev;
 	uint16_t		 pci_id;
@@ -225,7 +225,7 @@ struct intel_gen9_softc {
 	 * calls so PLANE_SURF can stay pointed at it until the user releases.
 	 * Cleaned up on detach.
 	 */
-	struct intel_gen9_test_fb *scanout_fb;
+	struct igen9_test_fb *scanout_fb;
 	uint32_t		 scanout_prev_surf;
 	bool			 scanout_held;
 
@@ -266,30 +266,30 @@ struct intel_gen9_softc {
 /* ----------------------------- MMIO RE helpers ---------------------------- */
 
 static inline uint32_t
-intel_gen9_r32(struct intel_gen9_softc *sc, uint32_t off)
+igen9_r32(struct igen9_softc *sc, uint32_t off)
 {
 	return (bus_read_4(sc->mmio_res, off));
 }
 
 static inline void
-intel_gen9_w32(struct intel_gen9_softc *sc, uint32_t off, uint32_t val)
+igen9_w32(struct igen9_softc *sc, uint32_t off, uint32_t val)
 {
 	bus_write_4(sc->mmio_res, off, val);
 }
 
 /*
- * Compute how many 32-bit words a full snapshot of intel_gen9_ranges[]
+ * Compute how many 32-bit words a full snapshot of igen9_ranges[]
  * occupies.  Caller-relative offset of register `addr` within the
- * snapshot is the prefix-sum walk in intel_gen9_snapshot_index().
+ * snapshot is the prefix-sum walk in igen9_snapshot_index().
  */
 static size_t
-intel_gen9_snapshot_total_words(void)
+igen9_snapshot_total_words(void)
 {
 	size_t words = 0;
 
-	for (size_t i = 0; i < nitems(intel_gen9_ranges); i++) {
-		words += (intel_gen9_ranges[i].end -
-		    intel_gen9_ranges[i].start) / 4 + 1;
+	for (size_t i = 0; i < nitems(igen9_ranges); i++) {
+		words += (igen9_ranges[i].end -
+		    igen9_ranges[i].start) / 4 + 1;
 	}
 	return (words);
 }
@@ -300,12 +300,12 @@ intel_gen9_snapshot_total_words(void)
  * range table — N is ~20 so this is fine in sysctl/debug paths.
  */
 static ssize_t
-intel_gen9_snapshot_index(uint32_t addr)
+igen9_snapshot_index(uint32_t addr)
 {
 	size_t base = 0;
 
-	for (size_t i = 0; i < nitems(intel_gen9_ranges); i++) {
-		const struct intel_gen9_range *r = &intel_gen9_ranges[i];
+	for (size_t i = 0; i < nitems(igen9_ranges); i++) {
+		const struct igen9_range *r = &igen9_ranges[i];
 		size_t words = (r->end - r->start) / 4 + 1;
 
 		if (addr >= r->start && addr <= r->end)
@@ -316,19 +316,19 @@ intel_gen9_snapshot_index(uint32_t addr)
 }
 
 static void
-intel_gen9_snapshot_save(struct intel_gen9_softc *sc)
+igen9_snapshot_save(struct igen9_softc *sc)
 {
 	sx_xlock(&sc->re_lock);
 	if (sc->snapshot == NULL) {
-		sc->snapshot_words = intel_gen9_snapshot_total_words();
+		sc->snapshot_words = igen9_snapshot_total_words();
 		sc->snapshot = malloc(sc->snapshot_words * sizeof(uint32_t),
 		    M_KMS, M_WAITOK | M_ZERO);
 	}
 	size_t idx = 0;
-	for (size_t i = 0; i < nitems(intel_gen9_ranges); i++) {
-		const struct intel_gen9_range *r = &intel_gen9_ranges[i];
+	for (size_t i = 0; i < nitems(igen9_ranges); i++) {
+		const struct igen9_range *r = &igen9_ranges[i];
 		for (uint32_t a = r->start; a <= r->end; a += 4)
-			sc->snapshot[idx++] = intel_gen9_r32(sc, a);
+			sc->snapshot[idx++] = igen9_r32(sc, a);
 	}
 	sc->snapshot_valid = true;
 	sx_xunlock(&sc->re_lock);
@@ -337,7 +337,7 @@ intel_gen9_snapshot_save(struct intel_gen9_softc *sc)
 }
 
 static void
-intel_gen9_snapshot_diff(struct intel_gen9_softc *sc)
+igen9_snapshot_diff(struct igen9_softc *sc)
 {
 	uint32_t changes = 0;
 
@@ -349,10 +349,10 @@ intel_gen9_snapshot_diff(struct intel_gen9_softc *sc)
 		return;
 	}
 	size_t idx = 0;
-	for (size_t i = 0; i < nitems(intel_gen9_ranges); i++) {
-		const struct intel_gen9_range *r = &intel_gen9_ranges[i];
+	for (size_t i = 0; i < nitems(igen9_ranges); i++) {
+		const struct igen9_range *r = &igen9_ranges[i];
 		for (uint32_t a = r->start; a <= r->end; a += 4, idx++) {
-			uint32_t cur = intel_gen9_r32(sc, a);
+			uint32_t cur = igen9_r32(sc, a);
 
 			if (cur != sc->snapshot[idx]) {
 				device_printf(sc->dev,
@@ -373,19 +373,19 @@ intel_gen9_snapshot_diff(struct intel_gen9_softc *sc)
  * landing, plus side-effect discovery for poorly documented bits.
  */
 static void
-intel_gen9_bit_scan(struct intel_gen9_softc *sc)
+igen9_bit_scan(struct igen9_softc *sc)
 {
 	uint32_t addr = sc->bit_scan_addr;
 	uint32_t orig, observed, bit_mask;
 
-	if (intel_gen9_snapshot_index(addr) < 0) {
+	if (igen9_snapshot_index(addr) < 0) {
 		device_printf(sc->dev,
 		    "bit_scan: 0x%08x not in any tracked range\n", addr);
 		return;
 	}
-	intel_gen9_snapshot_save(sc);
+	igen9_snapshot_save(sc);
 	sx_xlock(&sc->re_lock);
-	orig = intel_gen9_r32(sc, addr);
+	orig = igen9_r32(sc, addr);
 	device_printf(sc->dev,
 	    "bit_scan @0x%08x: orig=0x%08x (will toggle 32 bits)\n",
 	    addr, orig);
@@ -393,56 +393,56 @@ intel_gen9_bit_scan(struct intel_gen9_softc *sc)
 		if (sc->bit_scan_skip & (1u << bit))
 			continue;
 		bit_mask = 1u << bit;
-		intel_gen9_w32(sc, addr, orig ^ bit_mask);
-		observed = intel_gen9_r32(sc, addr);
+		igen9_w32(sc, addr, orig ^ bit_mask);
+		observed = igen9_r32(sc, addr);
 		device_printf(sc->dev,
 		    "  bit %2d: wrote 0x%08x, readback 0x%08x %s\n",
 		    bit, orig ^ bit_mask, observed,
 		    ((observed ^ orig) & bit_mask) ? "RW" : "RO/clamped");
-		intel_gen9_w32(sc, addr, orig);
+		igen9_w32(sc, addr, orig);
 	}
 	sx_xunlock(&sc->re_lock);
 	device_printf(sc->dev, "bit_scan done; running side-effect diff:\n");
-	intel_gen9_snapshot_diff(sc);
+	igen9_snapshot_diff(sc);
 }
 
 static int
-intel_gen9_sysctl_snapshot_save(SYSCTL_HANDLER_ARGS)
+igen9_sysctl_snapshot_save(SYSCTL_HANDLER_ARGS)
 {
-	struct intel_gen9_softc *sc = arg1;
+	struct igen9_softc *sc = arg1;
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
 
 	if (error || req->newptr == NULL)
 		return (error);
 	if (trigger != 0)
-		intel_gen9_snapshot_save(sc);
+		igen9_snapshot_save(sc);
 	return (0);
 }
 
 static int
-intel_gen9_sysctl_snapshot_diff(SYSCTL_HANDLER_ARGS)
+igen9_sysctl_snapshot_diff(SYSCTL_HANDLER_ARGS)
 {
-	struct intel_gen9_softc *sc = arg1;
+	struct igen9_softc *sc = arg1;
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
 
 	if (error || req->newptr == NULL)
 		return (error);
 	if (trigger != 0)
-		intel_gen9_snapshot_diff(sc);
+		igen9_snapshot_diff(sc);
 	return (0);
 }
 
 static int
-intel_gen9_sysctl_mmio_read(SYSCTL_HANDLER_ARGS)
+igen9_sysctl_mmio_read(SYSCTL_HANDLER_ARGS)
 {
-	struct intel_gen9_softc *sc = arg1;
+	struct igen9_softc *sc = arg1;
 	uint32_t addr = sc->poke_addr;
 	uint32_t val;
 	int error;
 
-	val = intel_gen9_r32(sc, addr);
+	val = igen9_r32(sc, addr);
 	error = sysctl_handle_int(oidp, &val, 0, req);
 	if (req->newptr != NULL)
 		return (EPERM);
@@ -450,9 +450,9 @@ intel_gen9_sysctl_mmio_read(SYSCTL_HANDLER_ARGS)
 }
 
 static int
-intel_gen9_sysctl_mmio_write(SYSCTL_HANDLER_ARGS)
+igen9_sysctl_mmio_write(SYSCTL_HANDLER_ARGS)
 {
-	struct intel_gen9_softc *sc = arg1;
+	struct igen9_softc *sc = arg1;
 	uint32_t val = 0;
 	int error = sysctl_handle_int(oidp, &val, 0, req);
 
@@ -460,55 +460,55 @@ intel_gen9_sysctl_mmio_write(SYSCTL_HANDLER_ARGS)
 		return (error);
 	device_printf(sc->dev, "mmio_write: 0x%08x <- 0x%08x\n",
 	    sc->poke_addr, val);
-	intel_gen9_w32(sc, sc->poke_addr, val);
+	igen9_w32(sc, sc->poke_addr, val);
 	return (0);
 }
 
 static int
-intel_gen9_sysctl_bit_scan(SYSCTL_HANDLER_ARGS)
+igen9_sysctl_bit_scan(SYSCTL_HANDLER_ARGS)
 {
-	struct intel_gen9_softc *sc = arg1;
+	struct igen9_softc *sc = arg1;
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
 
 	if (error || req->newptr == NULL)
 		return (error);
 	if (trigger != 0)
-		intel_gen9_bit_scan(sc);
+		igen9_bit_scan(sc);
 	return (0);
 }
 
-static int	intel_gen9_sysctl_edid_read_b(SYSCTL_HANDLER_ARGS);
-static int	intel_gen9_sysctl_vbt_dump(SYSCTL_HANDLER_ARGS);
-static int	intel_gen9_sysctl_hpd_dump(SYSCTL_HANDLER_ARGS);
-static int	intel_gen9_sysctl_cap_dump(SYSCTL_HANDLER_ARGS);
-static int	intel_gen9_sysctl_wrpll_calc(SYSCTL_HANDLER_ARGS);
-static int	intel_gen9_sysctl_wrpll_program(SYSCTL_HANDLER_ARGS);
-static int	intel_gen9_sysctl_wrpll_dump(SYSCTL_HANDLER_ARGS);
-static int	intel_gen9_sysctl_wrpll_enable(SYSCTL_HANDLER_ARGS);
-static int	intel_gen9_sysctl_wrpll_disable(SYSCTL_HANDLER_ARGS);
-static int	intel_gen9_sysctl_wrpll_route(SYSCTL_HANDLER_ARGS);
-static int	intel_gen9_sysctl_wrpll_unroute(SYSCTL_HANDLER_ARGS);
-static int	intel_gen9_sysctl_wrpll_force_clear(SYSCTL_HANDLER_ARGS);
-static int	intel_gen9_sysctl_current_mode(SYSCTL_HANDLER_ARGS);
-static int	intel_gen9_sysctl_clock_state(SYSCTL_HANDLER_ARGS);
-static int	intel_gen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS);
-static int	intel_gen9_sysctl_gtt_dump(SYSCTL_HANDLER_ARGS);
-static int	intel_gen9_sysctl_gtt_alloc_test(SYSCTL_HANDLER_ARGS);
-static int	intel_gen9_sysctl_test_fb_make(SYSCTL_HANDLER_ARGS);
-static int	intel_gen9_sysctl_test_fb_flip(SYSCTL_HANDLER_ARGS);
-static int	intel_gen9_sysctl_scanout_hold(SYSCTL_HANDLER_ARGS);
-static int	intel_gen9_sysctl_expose_scanout_fb(SYSCTL_HANDLER_ARGS);
-static void	intel_gen9_edid_to_mode(const uint8_t *dtd,
+static int	igen9_sysctl_edid_read_b(SYSCTL_HANDLER_ARGS);
+static int	igen9_sysctl_vbt_dump(SYSCTL_HANDLER_ARGS);
+static int	igen9_sysctl_hpd_dump(SYSCTL_HANDLER_ARGS);
+static int	igen9_sysctl_cap_dump(SYSCTL_HANDLER_ARGS);
+static int	igen9_sysctl_wrpll_calc(SYSCTL_HANDLER_ARGS);
+static int	igen9_sysctl_wrpll_program(SYSCTL_HANDLER_ARGS);
+static int	igen9_sysctl_wrpll_dump(SYSCTL_HANDLER_ARGS);
+static int	igen9_sysctl_wrpll_enable(SYSCTL_HANDLER_ARGS);
+static int	igen9_sysctl_wrpll_disable(SYSCTL_HANDLER_ARGS);
+static int	igen9_sysctl_wrpll_route(SYSCTL_HANDLER_ARGS);
+static int	igen9_sysctl_wrpll_unroute(SYSCTL_HANDLER_ARGS);
+static int	igen9_sysctl_wrpll_force_clear(SYSCTL_HANDLER_ARGS);
+static int	igen9_sysctl_current_mode(SYSCTL_HANDLER_ARGS);
+static int	igen9_sysctl_clock_state(SYSCTL_HANDLER_ARGS);
+static int	igen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS);
+static int	igen9_sysctl_gtt_dump(SYSCTL_HANDLER_ARGS);
+static int	igen9_sysctl_gtt_alloc_test(SYSCTL_HANDLER_ARGS);
+static int	igen9_sysctl_test_fb_make(SYSCTL_HANDLER_ARGS);
+static int	igen9_sysctl_test_fb_flip(SYSCTL_HANDLER_ARGS);
+static int	igen9_sysctl_scanout_hold(SYSCTL_HANDLER_ARGS);
+static int	igen9_sysctl_expose_scanout_fb(SYSCTL_HANDLER_ARGS);
+static void	igen9_edid_to_mode(const uint8_t *dtd,
 		    struct drm_display_mode *m);
-static int	intel_gen9_attach_edid_modes(struct intel_gen9_softc *sc);
+static int	igen9_attach_edid_modes(struct igen9_softc *sc);
 
 static void
-intel_gen9_re_sysctls_init(struct intel_gen9_softc *sc)
+igen9_re_sysctls_init(struct igen9_softc *sc)
 {
 	struct sysctl_oid_list *children;
 
-	sx_init(&sc->re_lock, "intel_gen9_re");
+	sx_init(&sc->re_lock, "igen9_re");
 	sysctl_ctx_init(&sc->re_sysctl_ctx);
 	sc->re_sysctl_tree = SYSCTL_ADD_NODE(&sc->re_sysctl_ctx,
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(sc->dev)),
@@ -518,7 +518,7 @@ intel_gen9_re_sysctls_init(struct intel_gen9_softc *sc)
 
 	/*
 	 * Debug verbosity at the device root (not under .re/) so the
-	 * tunable name dev.intel_gen9.<n>.debug matches the cross-driver
+	 * tunable name dev.igen9.<n>.debug matches the cross-driver
 	 * convention.  CTLFLAG_RWTUN makes it settable both at boot via
 	 * loader.conf and at runtime via sysctl.
 	 */
@@ -531,12 +531,12 @@ intel_gen9_re_sysctls_init(struct intel_gen9_softc *sc)
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "mmio_snapshot_save",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, intel_gen9_sysctl_snapshot_save, "I",
+	    sc, 0, igen9_sysctl_snapshot_save, "I",
 	    "write 1 to snapshot all tracked MMIO ranges");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "mmio_snapshot_diff",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, intel_gen9_sysctl_snapshot_diff, "I",
+	    sc, 0, igen9_sysctl_snapshot_diff, "I",
 	    "write 1 to log changes since last snapshot");
 	SYSCTL_ADD_UINT(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "mmio_addr", CTLFLAG_RW, &sc->poke_addr, 0,
@@ -544,12 +544,12 @@ intel_gen9_re_sysctls_init(struct intel_gen9_softc *sc)
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "mmio_read",
 	    CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, intel_gen9_sysctl_mmio_read, "IU",
+	    sc, 0, igen9_sysctl_mmio_read, "IU",
 	    "read [mmio_addr] (32-bit)");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "mmio_write",
 	    CTLTYPE_UINT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, intel_gen9_sysctl_mmio_write, "IU",
+	    sc, 0, igen9_sysctl_mmio_write, "IU",
 	    "write value to [mmio_addr] (32-bit)");
 	SYSCTL_ADD_UINT(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "bit_scan_addr", CTLFLAG_RW, &sc->bit_scan_addr, 0,
@@ -560,27 +560,27 @@ intel_gen9_re_sysctls_init(struct intel_gen9_softc *sc)
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "bit_scan",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, intel_gen9_sysctl_bit_scan, "I",
+	    sc, 0, igen9_sysctl_bit_scan, "I",
 	    "write 1 to scan bit_scan_addr and diff side-effects");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "edid_read_b",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, intel_gen9_sysctl_edid_read_b, "I",
+	    sc, 0, igen9_sysctl_edid_read_b, "I",
 	    "write 1 to GMBus-read 128 bytes of EDID block 0 from DDI_B");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "vbt_dump",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, intel_gen9_sysctl_vbt_dump, "I",
+	    sc, 0, igen9_sysctl_vbt_dump, "I",
 	    "write 1 to map OpRegion via ASLS and walk VBT child devices");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "hpd_dump",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, intel_gen9_sysctl_hpd_dump, "I",
+	    sc, 0, igen9_sysctl_hpd_dump, "I",
 	    "write 1 to dump SFUSE_STRAP / SHOTPLUG_CTL_DDI / SDEISR live HPD");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "cap_dump",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, intel_gen9_sysctl_cap_dump, "I",
+	    sc, 0, igen9_sysctl_cap_dump, "I",
 	    "write 1 to print per-DDI capability table (VBT x SFUSE x HPD)");
 	SYSCTL_ADD_UINT(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "wrpll_target_khz", CTLFLAG_RW, &sc->wrpll_target_khz, 0,
@@ -588,7 +588,7 @@ intel_gen9_re_sysctls_init(struct intel_gen9_softc *sc)
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "wrpll_calc",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, intel_gen9_sysctl_wrpll_calc, "I",
+	    sc, 0, igen9_sysctl_wrpll_calc, "I",
 	    "write 1 to solve WRPLL (DCO_INT/DCO_FRAC/P0/P1/P2) for"
 	    " wrpll_target_khz");
 	sc->wrpll_dpll_id = 2;
@@ -598,12 +598,12 @@ intel_gen9_re_sysctls_init(struct intel_gen9_softc *sc)
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "wrpll_dump",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, intel_gen9_sysctl_wrpll_dump, "I",
+	    sc, 0, igen9_sysctl_wrpll_dump, "I",
 	    "write 1 to print CFGCR1/CFGCR2 of wrpll_dpll_id (decoded)");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "wrpll_program",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, intel_gen9_sysctl_wrpll_program, "I",
+	    sc, 0, igen9_sysctl_wrpll_program, "I",
 	    "write 1 to solve wrpll_target_khz and program CFGCR1/CFGCR2"
 	    " of wrpll_dpll_id (does NOT enable PLL or re-mux DDIs)");
 	sc->wrpll_route_port = 2;	/* DDI_C */
@@ -613,78 +613,78 @@ intel_gen9_re_sysctls_init(struct intel_gen9_softc *sc)
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "wrpll_enable",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, intel_gen9_sysctl_wrpll_enable, "I",
+	    sc, 0, igen9_sysctl_wrpll_enable, "I",
 	    "write 1 to enable wrpll_dpll_id (CTRL1 HDMI_MODE + ENABLE +"
 	    " poll LOCK)");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "wrpll_disable",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, intel_gen9_sysctl_wrpll_disable, "I",
+	    sc, 0, igen9_sysctl_wrpll_disable, "I",
 	    "write 1 to disable wrpll_dpll_id");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "wrpll_route",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, intel_gen9_sysctl_wrpll_route, "I",
+	    sc, 0, igen9_sysctl_wrpll_route, "I",
 	    "write 1 to route DDI[wrpll_route_port] clock to wrpll_dpll_id"
 	    " (CTRL2 OFF=0 SEL=id OVERRIDE=1)");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "wrpll_unroute",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, intel_gen9_sysctl_wrpll_unroute, "I",
+	    sc, 0, igen9_sysctl_wrpll_unroute, "I",
 	    "write 1 to gate DDI[wrpll_route_port] clock off (CTRL2 OFF=1)");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "wrpll_force_clear",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, intel_gen9_sysctl_wrpll_force_clear, "I",
+	    sc, 0, igen9_sysctl_wrpll_force_clear, "I",
 	    "emergency: write 1 to unconditionally clear ENABLE of"
 	    " wrpll_dpll_id (no liveness check)");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "current_mode",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, intel_gen9_sysctl_current_mode, "I",
+	    sc, 0, igen9_sysctl_current_mode, "I",
 	    "write 1 to read back live pipe/transcoder timing as a mode");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "clock_state",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, intel_gen9_sysctl_clock_state, "I",
+	    sc, 0, igen9_sysctl_clock_state, "I",
 	    "write 1 to dump CDCLK / LCPLL / DPLL / DDI clock-on-off state");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "try_pipe_resume",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, intel_gen9_sysctl_try_pipe_resume, "I",
+	    sc, 0, igen9_sysctl_try_pipe_resume, "I",
 	    "write 1 to write BASELINE timing/format and enable Pipe A ->"
 	    " DDI_B (HDMI 1920x1080@60); upstream clocks must be alive");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "gtt_dump",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, intel_gen9_sysctl_gtt_dump, "I",
+	    sc, 0, igen9_sysctl_gtt_dump, "I",
 	    "write 1 to scan first 2048 GTT PTEs and print first 8");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "gtt_alloc_test",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, intel_gen9_sysctl_gtt_alloc_test, "I",
+	    sc, 0, igen9_sysctl_gtt_alloc_test, "I",
 	    "write 1 to alloc 1 page, map at GTT[2048], read back, free");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "test_fb_make",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, intel_gen9_sysctl_test_fb_make, "I",
+	    sc, 0, igen9_sysctl_test_fb_make, "I",
 	    "write 1 to alloc + GTT-map + checker-fill an 8 MiB 1920x1080 FB");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "test_fb_flip",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, intel_gen9_sysctl_test_fb_flip, "I",
+	    sc, 0, igen9_sysctl_test_fb_flip, "I",
 	    "write N (seconds 1..10) to flip PLANE_SURF to our checker FB"
 	    " then restore");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "scanout_hold",
 	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, intel_gen9_sysctl_scanout_hold, "I",
+	    sc, 0, igen9_sysctl_scanout_hold, "I",
 	    "1 = checker, 2 = diagnostic gradient+grid, both flip PLANE_SURF"
 	    " and HOLD;  0 = restore firmware FB + free");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "expose_scanout_fb",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, intel_gen9_sysctl_expose_scanout_fb, "I",
+	    sc, 0, igen9_sysctl_expose_scanout_fb, "I",
 	    "write 1 to allocate + register a driver-owned drm_framebuffer"
 	    " for userspace MODE_ATOMIC; prints FB_ID, CRTC_ID, PLANE_ID");
 	SYSCTL_ADD_U64(&sc->re_sysctl_ctx, children, OID_AUTO,
@@ -696,7 +696,7 @@ intel_gen9_re_sysctls_init(struct intel_gen9_softc *sc)
 }
 
 static void
-intel_gen9_re_sysctls_fini(struct intel_gen9_softc *sc)
+igen9_re_sysctls_fini(struct igen9_softc *sc)
 {
 	sysctl_ctx_free(&sc->re_sysctl_ctx);
 	if (sc->snapshot != NULL) {
@@ -771,9 +771,9 @@ intel_gen9_re_sysctls_fini(struct intel_gen9_softc *sc)
 #define	DDI_BUF_IS_IDLE		(1u << 7)
 
 static void
-intel_gen9_ddi_buf_wake(struct intel_gen9_softc *sc, uint32_t buf_ctl_reg)
+igen9_ddi_buf_wake(struct igen9_softc *sc, uint32_t buf_ctl_reg)
 {
-	uint32_t v = intel_gen9_r32(sc, buf_ctl_reg);
+	uint32_t v = igen9_r32(sc, buf_ctl_reg);
 
 	device_printf(sc->dev, "ddi_buf 0x%05x: pre=0x%08x (idle=%d)\n",
 	    buf_ctl_reg, v, (v & DDI_BUF_IS_IDLE) != 0);
@@ -783,9 +783,9 @@ intel_gen9_ddi_buf_wake(struct intel_gen9_softc *sc, uint32_t buf_ctl_reg)
 	 * the DDC line.  Then poll for !IDLE.  IDLE clear ~500us after
 	 * ENABLE rises per BSpec.
 	 */
-	intel_gen9_w32(sc, buf_ctl_reg, v | DDI_BUF_CTL_ENABLE);
+	igen9_w32(sc, buf_ctl_reg, v | DDI_BUF_CTL_ENABLE);
 	for (int i = 0; i < 100; i++) {
-		v = intel_gen9_r32(sc, buf_ctl_reg);
+		v = igen9_r32(sc, buf_ctl_reg);
 		if ((v & DDI_BUF_IS_IDLE) == 0)
 			break;
 		DELAY(10);
@@ -795,12 +795,12 @@ intel_gen9_ddi_buf_wake(struct intel_gen9_softc *sc, uint32_t buf_ctl_reg)
 }
 
 static int
-intel_gen9_gmbus_wait(struct intel_gen9_softc *sc, uint32_t bit)
+igen9_gmbus_wait(struct igen9_softc *sc, uint32_t bit)
 {
 	uint32_t s;
 
 	for (int spin = 0; spin < 50000; spin++) {
-		s = intel_gen9_r32(sc, GMBUS2);
+		s = igen9_r32(sc, GMBUS2);
 		if (s & GMBUS_NAK)
 			return (EIO);
 		if (s & bit)
@@ -811,7 +811,7 @@ intel_gen9_gmbus_wait(struct intel_gen9_softc *sc, uint32_t bit)
 }
 
 static int
-intel_gen9_gmbus_read_block(struct intel_gen9_softc *sc, uint32_t pin,
+igen9_gmbus_read_block(struct igen9_softc *sc, uint32_t pin,
     uint8_t slave, uint8_t offset, uint8_t *buf, size_t len)
 {
 	uint32_t cmd, val;
@@ -827,9 +827,9 @@ intel_gen9_gmbus_read_block(struct intel_gen9_softc *sc, uint32_t pin,
 	 * controller in a transient state that causes the next xfer to
 	 * NAK or wedge.  Power cost is negligible for a polled DDC path.
 	 */
-	uint32_t gate = intel_gen9_r32(sc, SOUTH_DSPCLK_GATE_D);
+	uint32_t gate = igen9_r32(sc, SOUTH_DSPCLK_GATE_D);
 	if ((gate & PCH_GMBUSUNIT_CLK_GATE_DIS) == 0)
-		intel_gen9_w32(sc, SOUTH_DSPCLK_GATE_D,
+		igen9_w32(sc, SOUTH_DSPCLK_GATE_D,
 		    gate | PCH_GMBUSUNIT_CLK_GATE_DIS);
 
 	/*
@@ -839,16 +839,16 @@ intel_gen9_gmbus_read_block(struct intel_gen9_softc *sc, uint32_t pin,
 	 * a failed prior transaction (or BIOS hand-off) wedges every
 	 * subsequent xfer at HW_RDY because the bus stays "in use".
 	 */
-	intel_gen9_w32(sc, GMBUS0, 0);
-	intel_gen9_w32(sc, GMBUS4, 0);
-	intel_gen9_w32(sc, GMBUS5, 0);
-	intel_gen9_w32(sc, GMBUS1, GMBUS_SW_CLR_INT);
-	intel_gen9_w32(sc, GMBUS1, 0);
-	if (intel_gen9_r32(sc, GMBUS2) & GMBUS_INUSE) {
+	igen9_w32(sc, GMBUS0, 0);
+	igen9_w32(sc, GMBUS4, 0);
+	igen9_w32(sc, GMBUS5, 0);
+	igen9_w32(sc, GMBUS1, GMBUS_SW_CLR_INT);
+	igen9_w32(sc, GMBUS1, 0);
+	if (igen9_r32(sc, GMBUS2) & GMBUS_INUSE) {
 		DPRINTF(sc, 1, "gmbus: INUSE stuck, clearing\n");
-		intel_gen9_w32(sc, GMBUS2, GMBUS_INUSE);
+		igen9_w32(sc, GMBUS2, GMBUS_INUSE);
 	}
-	intel_gen9_w32(sc, GMBUS0, pin | GMBUS_RATE_100KHZ);
+	igen9_w32(sc, GMBUS0, pin | GMBUS_RATE_100KHZ);
 
 	/*
 	 * Phase 1: write the EDID byte offset (segment 0).  CYCLE_WAIT
@@ -859,9 +859,9 @@ intel_gen9_gmbus_read_block(struct intel_gen9_softc *sc, uint32_t pin,
 	    ((uint32_t)1 << GMBUS_BYTE_COUNT_SHIFT) |
 	    ((uint32_t)slave << GMBUS_SLAVE_ADDR_SHIFT) |
 	    GMBUS_SLAVE_WRITE;
-	intel_gen9_w32(sc, GMBUS3, offset);
-	intel_gen9_w32(sc, GMBUS1, cmd);
-	error = intel_gen9_gmbus_wait(sc, GMBUS_HW_WAIT);
+	igen9_w32(sc, GMBUS3, offset);
+	igen9_w32(sc, GMBUS1, cmd);
+	error = igen9_gmbus_wait(sc, GMBUS_HW_WAIT);
 	if (error != 0) {
 		DPRINTF(sc, 1, "gmbus: wait HW_WAIT after addr: %d\n", error);
 		goto out;
@@ -883,18 +883,18 @@ intel_gen9_gmbus_read_block(struct intel_gen9_softc *sc, uint32_t pin,
 	    ((uint32_t)len << GMBUS_BYTE_COUNT_SHIFT) |
 	    ((uint32_t)slave << GMBUS_SLAVE_ADDR_SHIFT) |
 	    GMBUS_SLAVE_READ;
-	intel_gen9_w32(sc, GMBUS1, cmd);
+	igen9_w32(sc, GMBUS1, cmd);
 
 	while (got < len) {
-		error = intel_gen9_gmbus_wait(sc, GMBUS_HW_RDY);
+		error = igen9_gmbus_wait(sc, GMBUS_HW_RDY);
 		if (error != 0) {
-			uint32_t s = intel_gen9_r32(sc, GMBUS2);
+			uint32_t s = igen9_r32(sc, GMBUS2);
 			DPRINTF(sc, 1,
 			    "gmbus: wait HW_RDY at %zu/%zu: %d  GMBUS2=0x%08x\n",
 			    got, len, error, s);
 			goto out;
 		}
-		val = intel_gen9_r32(sc, GMBUS3);
+		val = igen9_r32(sc, GMBUS3);
 		for (int i = 0; i < 4 && got < len; i++)
 			buf[got++] = (val >> (i * 8)) & 0xff;
 	}
@@ -905,19 +905,19 @@ out:
 	 * even on success.  Then tri-state pin, W1C INUSE, leave the
 	 * clock-gate disabled for the next xfer.
 	 */
-	intel_gen9_w32(sc, GMBUS1, GMBUS_SW_RDY | GMBUS_CYCLE_STOP);
-	(void)intel_gen9_gmbus_wait(sc, GMBUS_HW_WAIT);
-	intel_gen9_w32(sc, GMBUS0, 0);
-	intel_gen9_w32(sc, GMBUS1, GMBUS_SW_CLR_INT);
-	intel_gen9_w32(sc, GMBUS1, 0);
-	intel_gen9_w32(sc, GMBUS2, GMBUS_INUSE);
+	igen9_w32(sc, GMBUS1, GMBUS_SW_RDY | GMBUS_CYCLE_STOP);
+	(void)igen9_gmbus_wait(sc, GMBUS_HW_WAIT);
+	igen9_w32(sc, GMBUS0, 0);
+	igen9_w32(sc, GMBUS1, GMBUS_SW_CLR_INT);
+	igen9_w32(sc, GMBUS1, 0);
+	igen9_w32(sc, GMBUS2, GMBUS_INUSE);
 	return (error);
 }
 
 static int
-intel_gen9_sysctl_edid_read_b(SYSCTL_HANDLER_ARGS)
+igen9_sysctl_edid_read_b(SYSCTL_HANDLER_ARGS)
 {
-	struct intel_gen9_softc *sc = arg1;
+	struct igen9_softc *sc = arg1;
 	uint8_t edid[128];
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
@@ -937,37 +937,37 @@ intel_gen9_sysctl_edid_read_b(SYSCTL_HANDLER_ARGS)
 			uint32_t cmd, val, snap;
 			error = 0;
 
-			intel_gen9_w32(sc, GMBUS0, 0);
-			intel_gen9_w32(sc, GMBUS4, 0);
-			intel_gen9_w32(sc, GMBUS5, 0);
-			intel_gen9_w32(sc, GMBUS1, GMBUS_SW_CLR_INT);
-			intel_gen9_w32(sc, GMBUS1, 0);
-			if (intel_gen9_r32(sc, GMBUS2) & GMBUS_INUSE)
-				intel_gen9_w32(sc, GMBUS2, GMBUS_INUSE);
-			intel_gen9_w32(sc, GMBUS0, 4 | GMBUS_RATE_100KHZ);
+			igen9_w32(sc, GMBUS0, 0);
+			igen9_w32(sc, GMBUS4, 0);
+			igen9_w32(sc, GMBUS5, 0);
+			igen9_w32(sc, GMBUS1, GMBUS_SW_CLR_INT);
+			igen9_w32(sc, GMBUS1, 0);
+			if (igen9_r32(sc, GMBUS2) & GMBUS_INUSE)
+				igen9_w32(sc, GMBUS2, GMBUS_INUSE);
+			igen9_w32(sc, GMBUS0, 4 | GMBUS_RATE_100KHZ);
 
 			cmd = GMBUS_SW_RDY | GMBUS_CYCLE_STOP |
 			    ((uint32_t)1 << GMBUS_BYTE_COUNT_SHIFT) |
 			    ((uint32_t)s << GMBUS_SLAVE_ADDR_SHIFT) |
 			    GMBUS_SLAVE_READ;
-			intel_gen9_w32(sc, GMBUS1, cmd);
+			igen9_w32(sc, GMBUS1, cmd);
 
 			for (int spin = 0; spin < 5000; spin++) {
-				snap = intel_gen9_r32(sc, GMBUS2);
+				snap = igen9_r32(sc, GMBUS2);
 				if (snap & (GMBUS_NAK | GMBUS_HW_RDY |
 				    GMBUS_HW_WAIT))
 					break;
 				DELAY(10);
 			}
 			val = (snap & GMBUS_HW_RDY) ?
-			    intel_gen9_r32(sc, GMBUS3) : 0;
+			    igen9_r32(sc, GMBUS3) : 0;
 			one = val & 0xff;
 			if ((snap & GMBUS_NAK) == 0) {
 				device_printf(sc->dev,
 				    "scan: slave 0x%02x ACK!  GMBUS2=0x%08x"
 				    "  byte0=0x%02x\n", s, snap, one);
 			}
-			intel_gen9_w32(sc, GMBUS0, 0);
+			igen9_w32(sc, GMBUS0, 0);
 		}
 		device_printf(sc->dev, "scan done\n");
 		return (0);
@@ -980,11 +980,11 @@ intel_gen9_sysctl_edid_read_b(SYSCTL_HANDLER_ARGS)
 	 * set passively.  Fallback to pin 4 if pin 5 still times out.
 	 */
 	if (trigger == 3) {
-		intel_gen9_ddi_buf_wake(sc, DDI_BUF_CTL_B);
+		igen9_ddi_buf_wake(sc, DDI_BUF_CTL_B);
 		DELAY(2000);
 		for (uint32_t pin = 5; pin >= 4; pin--) {
 			memset(edid, 0, sizeof(edid));
-			error = intel_gen9_gmbus_read_block(sc, pin,
+			error = igen9_gmbus_read_block(sc, pin,
 			    EDID_SLAVE, 0, edid, 16);
 			device_printf(sc->dev,
 			    "post-wake pin %u: err=%d  first16:"
@@ -1010,7 +1010,7 @@ intel_gen9_sysctl_edid_read_b(SYSCTL_HANDLER_ARGS)
 	if (trigger == 2) {
 		for (uint32_t pin = 1; pin <= 9; pin++) {
 			memset(edid, 0, sizeof(edid));
-			error = intel_gen9_gmbus_read_block(sc, pin, EDID_SLAVE,
+			error = igen9_gmbus_read_block(sc, pin, EDID_SLAVE,
 			    0, edid, 16);
 			device_printf(sc->dev,
 			    "pin %u: err=%d  first16: %02x %02x %02x %02x"
@@ -1025,7 +1025,7 @@ intel_gen9_sysctl_edid_read_b(SYSCTL_HANDLER_ARGS)
 	}
 
 	memset(edid, 0, sizeof(edid));
-	error = intel_gen9_gmbus_read_block(sc, GMBUS_PIN_DDI_B, EDID_SLAVE,
+	error = igen9_gmbus_read_block(sc, GMBUS_PIN_DDI_B, EDID_SLAVE,
 	    0, edid, sizeof(edid));
 	if (error != 0) {
 		device_printf(sc->dev,
@@ -1134,7 +1134,7 @@ struct child_device_config {
 } __packed;
 
 static const char *
-intel_gen9_dvo_port_name(uint8_t p)
+igen9_dvo_port_name(uint8_t p)
 {
 	switch (p) {
 	case 0:  return "HDMI-A";
@@ -1155,7 +1155,7 @@ intel_gen9_dvo_port_name(uint8_t p)
 }
 
 static const char *
-intel_gen9_device_type_name(uint16_t t)
+igen9_device_type_name(uint16_t t)
 {
 	switch (t) {
 	case 0x1806: return "eDP";
@@ -1169,9 +1169,9 @@ intel_gen9_device_type_name(uint16_t t)
 }
 
 static int
-intel_gen9_sysctl_vbt_dump(SYSCTL_HANDLER_ARGS)
+igen9_sysctl_vbt_dump(SYSCTL_HANDLER_ARGS)
 {
-	struct intel_gen9_softc *sc = arg1;
+	struct igen9_softc *sc = arg1;
 	uint32_t asls;
 	void *va;
 	uint8_t *blob;
@@ -1255,10 +1255,10 @@ intel_gen9_sysctl_vbt_dump(SYSCTL_HANDLER_ARGS)
 					    "  ddc_pin=%u  aux_ch=0x%02x"
 					    "\n",
 					    n, cd->handle, cd->device_type,
-					    intel_gen9_device_type_name(
+					    igen9_device_type_name(
 						cd->device_type),
 					    cd->dvo_port,
-					    intel_gen9_dvo_port_name(
+					    igen9_dvo_port_name(
 						cd->dvo_port),
 					    cd->ddc_pin, cd->aux_channel);
 				}
@@ -1304,21 +1304,21 @@ intel_gen9_sysctl_vbt_dump(SYSCTL_HANDLER_ARGS)
 #define	PIPE_FRMCOUNT(p)	(0x70040 + (p) * 0x1000)
 
 static uint64_t
-intel_gen9_gtt_read(struct intel_gen9_softc *sc, uint32_t entry_idx)
+igen9_gtt_read(struct igen9_softc *sc, uint32_t entry_idx)
 {
 	uint32_t off = GTT_BASE + entry_idx * GTT_PTE_SIZE;
-	uint32_t lo = intel_gen9_r32(sc, off);
-	uint32_t hi = intel_gen9_r32(sc, off + 4);
+	uint32_t lo = igen9_r32(sc, off);
+	uint32_t hi = igen9_r32(sc, off + 4);
 	return ((uint64_t)hi << 32) | lo;
 }
 
 static void
-intel_gen9_gtt_write(struct intel_gen9_softc *sc, uint32_t entry_idx,
+igen9_gtt_write(struct igen9_softc *sc, uint32_t entry_idx,
     uint64_t pte)
 {
 	uint32_t off = GTT_BASE + entry_idx * GTT_PTE_SIZE;
-	intel_gen9_w32(sc, off, (uint32_t)pte);
-	intel_gen9_w32(sc, off + 4, (uint32_t)(pte >> 32));
+	igen9_w32(sc, off, (uint32_t)pte);
+	igen9_w32(sc, off + 4, (uint32_t)(pte >> 32));
 }
 
 /*
@@ -1326,7 +1326,7 @@ intel_gen9_gtt_write(struct intel_gen9_softc *sc, uint32_t entry_idx,
  * offset.  Lives on the softc so a follow-up page-flip sysctl can swap
  * PLANE_SURF to test_fb.gtt_offset and back to 0.
  */
-struct intel_gen9_test_fb {
+struct igen9_test_fb {
 	void		*va;
 	vm_paddr_t	 pa;
 	size_t		 size;
@@ -1358,7 +1358,7 @@ struct intel_gen9_test_fb {
  * reused for the next user FB.  Single active scanout buffer at a time.
  */
 static uint32_t
-intel_gen9_gtt_bind_user_fb(struct intel_gen9_softc *sc,
+igen9_gtt_bind_user_fb(struct igen9_softc *sc,
     struct drm_framebuffer *fb)
 {
 	struct drm_gem_object *obj = fb->gem_objs[0];
@@ -1393,7 +1393,7 @@ intel_gen9_gtt_bind_user_fb(struct intel_gen9_softc *sc,
 		vm_paddr_t pa = VM_PAGE_TO_PHYS(obj->pages[i]);
 		uint64_t pte = (pa & ~0xfffULL) | GTT_PTE_VALID |
 		    GTT_PTE_WRITEABLE;
-		intel_gen9_gtt_write(sc, first_idx + i, pte);
+		igen9_gtt_write(sc, first_idx + i, pte);
 	}
 	uint32_t surf = first_idx * PAGE_SIZE;
 	sc->user_fb_slots[slot].fb = fb;
@@ -1402,8 +1402,8 @@ intel_gen9_gtt_bind_user_fb(struct intel_gen9_softc *sc,
 }
 
 static int
-intel_gen9_test_fb_alloc(struct intel_gen9_softc *sc,
-    struct intel_gen9_test_fb *fb, uint32_t w, uint32_t h)
+igen9_test_fb_alloc(struct igen9_softc *sc,
+    struct igen9_test_fb *fb, uint32_t w, uint32_t h)
 {
 	fb->width = w;
 	fb->height = h;
@@ -1422,19 +1422,19 @@ intel_gen9_test_fb_alloc(struct intel_gen9_softc *sc,
 	for (uint32_t i = 0; i < fb->gtt_count; i++) {
 		uint64_t pte = ((fb->pa + (uint64_t)i * PAGE_SIZE) & ~0xfffULL)
 		    | GTT_PTE_VALID | GTT_PTE_WRITEABLE;
-		intel_gen9_gtt_write(sc, fb->gtt_first_idx + i, pte);
+		igen9_gtt_write(sc, fb->gtt_first_idx + i, pte);
 	}
 	fb->mapped = true;
 	return (0);
 }
 
 static void
-intel_gen9_test_fb_free(struct intel_gen9_softc *sc,
-    struct intel_gen9_test_fb *fb)
+igen9_test_fb_free(struct igen9_softc *sc,
+    struct igen9_test_fb *fb)
 {
 	if (fb->mapped) {
 		for (uint32_t i = 0; i < fb->gtt_count; i++)
-			intel_gen9_gtt_write(sc, fb->gtt_first_idx + i, 0);
+			igen9_gtt_write(sc, fb->gtt_first_idx + i, 0);
 		fb->mapped = false;
 	}
 	if (fb->va != NULL) {
@@ -1445,7 +1445,7 @@ intel_gen9_test_fb_free(struct intel_gen9_softc *sc,
 
 /* 64×64 checkerboard, two-color, in XRGB8888. */
 static void
-intel_gen9_test_fb_fill_checker(struct intel_gen9_test_fb *fb,
+igen9_test_fb_fill_checker(struct igen9_test_fb *fb,
     uint32_t color_a, uint32_t color_b)
 {
 	uint32_t *px = (uint32_t *)fb->va;
@@ -1468,7 +1468,7 @@ intel_gen9_test_fb_fill_checker(struct intel_gen9_test_fb *fb,
  *     (immediately recognisable as "this is our buffer not the desktop")
  */
 static void
-intel_gen9_test_fb_fill_diag(struct intel_gen9_test_fb *fb)
+igen9_test_fb_fill_diag(struct igen9_test_fb *fb)
 {
 	uint32_t *px = (uint32_t *)fb->va;
 	uint32_t row_stride_px = fb->stride / 4;
@@ -1505,14 +1505,14 @@ intel_gen9_test_fb_fill_diag(struct intel_gen9_test_fb *fb)
  * scanout rate.
  */
 static void
-intel_gen9_anim_thread(void *arg)
+igen9_anim_thread(void *arg)
 {
-	struct intel_gen9_softc *sc = arg;
+	struct igen9_softc *sc = arg;
 	uint32_t frame = 0;
 	uint32_t prev_x = 0, prev_y = 0;
 
 	while (!sc->anim_stop && sc->scanout_held && sc->scanout_fb != NULL) {
-		struct intel_gen9_test_fb *fb = sc->scanout_fb;
+		struct igen9_test_fb *fb = sc->scanout_fb;
 		uint32_t *px = (uint32_t *)fb->va;
 		uint32_t row_stride_px = fb->stride / 4;
 
@@ -1551,13 +1551,13 @@ intel_gen9_anim_thread(void *arg)
 }
 
 static void
-intel_gen9_anim_start(struct intel_gen9_softc *sc)
+igen9_anim_start(struct igen9_softc *sc)
 {
 	if (sc->anim_active)
 		return;
 	sc->anim_stop = false;
 	sc->anim_active = true;
-	if (kthread_add(intel_gen9_anim_thread, sc, NULL, &sc->anim_td,
+	if (kthread_add(igen9_anim_thread, sc, NULL, &sc->anim_td,
 	    0, 0, "gen9anim") != 0) {
 		sc->anim_active = false;
 		device_printf(sc->dev, "anim: kthread_add failed\n");
@@ -1565,7 +1565,7 @@ intel_gen9_anim_start(struct intel_gen9_softc *sc)
 }
 
 static void
-intel_gen9_anim_stop(struct intel_gen9_softc *sc)
+igen9_anim_stop(struct igen9_softc *sc)
 {
 	if (!sc->anim_active)
 		return;
@@ -1583,32 +1583,32 @@ intel_gen9_anim_stop(struct intel_gen9_softc *sc)
  * One-shot: subsequent triggers print the existing FB_ID without
  * allocating again.  Cleared on detach.
  */
-static struct intel_gen9_owned_fb *intel_gen9_exposed_fb = NULL;
+static struct igen9_owned_fb *igen9_exposed_fb = NULL;
 
 static int
-intel_gen9_sysctl_expose_scanout_fb(SYSCTL_HANDLER_ARGS)
+igen9_sysctl_expose_scanout_fb(SYSCTL_HANDLER_ARGS)
 {
-	struct intel_gen9_softc *sc = arg1;
+	struct igen9_softc *sc = arg1;
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
 
 	if (error || req->newptr == NULL || trigger == 0)
 		return (error);
 
-	if (intel_gen9_exposed_fb != NULL) {
+	if (igen9_exposed_fb != NULL) {
 		device_printf(sc->dev,
 		    "expose_scanout_fb: already exposed as FB_ID=%u"
 		    "  CRTC_ID=%u  PLANE_ID=%u\n",
-		    intel_gen9_exposed_fb->base.base.id,
+		    igen9_exposed_fb->base.base.id,
 		    sc->crtc.base.id, sc->primary.base.id);
 		return (0);
 	}
 
-	struct intel_gen9_owned_fb *ofb = malloc(sizeof(*ofb), M_KMS,
+	struct igen9_owned_fb *ofb = malloc(sizeof(*ofb), M_KMS,
 	    M_WAITOK | M_ZERO);
-	struct intel_gen9_test_fb *tfb = malloc(sizeof(*tfb), M_KMS,
+	struct igen9_test_fb *tfb = malloc(sizeof(*tfb), M_KMS,
 	    M_WAITOK | M_ZERO);
-	error = intel_gen9_test_fb_alloc(sc, tfb, 1920, 1080);
+	error = igen9_test_fb_alloc(sc, tfb, 1920, 1080);
 	if (error != 0) {
 		device_printf(sc->dev,
 		    "expose_scanout_fb: alloc failed %d\n", error);
@@ -1616,7 +1616,7 @@ intel_gen9_sysctl_expose_scanout_fb(SYSCTL_HANDLER_ARGS)
 		free(ofb, M_KMS);
 		return (0);
 	}
-	intel_gen9_test_fb_fill_diag(tfb);
+	igen9_test_fb_fill_diag(tfb);
 	ofb->test_fb = tfb;
 
 	ofb->base.width  = tfb->width;
@@ -1624,16 +1624,16 @@ intel_gen9_sysctl_expose_scanout_fb(SYSCTL_HANDLER_ARGS)
 	ofb->base.format = 0x34325258;	/* XR24 */
 	ofb->base.pitches[0] = tfb->stride;
 	error = kms_framebuffer_init(sc->drm_dev, &ofb->base,
-	    &intel_gen9_owned_fb_funcs);
+	    &igen9_owned_fb_funcs);
 	if (error != 0) {
 		device_printf(sc->dev,
 		    "expose_scanout_fb: framebuffer_init failed %d\n", error);
-		intel_gen9_test_fb_free(sc, tfb);
+		igen9_test_fb_free(sc, tfb);
 		free(tfb, M_KMS);
 		free(ofb, M_KMS);
 		return (0);
 	}
-	intel_gen9_exposed_fb = ofb;
+	igen9_exposed_fb = ofb;
 
 	device_printf(sc->dev,
 	    "expose_scanout_fb: exposed FB_ID=%u  CRTC_ID=%u  PLANE_ID=%u\n",
@@ -1651,9 +1651,9 @@ intel_gen9_sysctl_expose_scanout_fb(SYSCTL_HANDLER_ARGS)
  * over the static checker buffer.  Idempotent in both directions.
  */
 static int
-intel_gen9_sysctl_scanout_hold(SYSCTL_HANDLER_ARGS)
+igen9_sysctl_scanout_hold(SYSCTL_HANDLER_ARGS)
 {
-	struct intel_gen9_softc *sc = arg1;
+	struct igen9_softc *sc = arg1;
 	int hold = sc->scanout_held ? 1 : 0;
 	int error = sysctl_handle_int(oidp, &hold, 0, req);
 
@@ -1663,7 +1663,7 @@ intel_gen9_sysctl_scanout_hold(SYSCTL_HANDLER_ARGS)
 	if (hold && !sc->scanout_held) {
 		sc->scanout_fb = malloc(sizeof(*sc->scanout_fb),
 		    M_KMS, M_WAITOK | M_ZERO);
-		error = intel_gen9_test_fb_alloc(sc, sc->scanout_fb,
+		error = igen9_test_fb_alloc(sc, sc->scanout_fb,
 		    1920, 1080);
 		if (error != 0) {
 			device_printf(sc->dev,
@@ -1680,14 +1680,14 @@ intel_gen9_sysctl_scanout_hold(SYSCTL_HANDLER_ARGS)
 		 * Anything else > 0 -> checker.
 		 */
 		if (hold == 2 || hold == 3)
-			intel_gen9_test_fb_fill_diag(sc->scanout_fb);
+			igen9_test_fb_fill_diag(sc->scanout_fb);
 		else
-			intel_gen9_test_fb_fill_checker(sc->scanout_fb,
+			igen9_test_fb_fill_checker(sc->scanout_fb,
 			    0x00ff0000, 0x000000ff);
 
-		sc->scanout_prev_surf = intel_gen9_r32(sc, PLANE_SURF(0));
+		sc->scanout_prev_surf = igen9_r32(sc, PLANE_SURF(0));
 		uint32_t new_surf = sc->scanout_fb->gtt_first_idx * PAGE_SIZE;
-		intel_gen9_w32(sc, PLANE_SURF(0), new_surf);
+		igen9_w32(sc, PLANE_SURF(0), new_surf);
 		sc->scanout_held = true;
 
 		DPRINTF(sc, 0,
@@ -1695,12 +1695,12 @@ intel_gen9_sysctl_scanout_hold(SYSCTL_HANDLER_ARGS)
 		    sc->scanout_prev_surf, new_surf);
 
 		if (hold == 3)
-			intel_gen9_anim_start(sc);
+			igen9_anim_start(sc);
 	} else if (!hold && sc->scanout_held) {
-		intel_gen9_anim_stop(sc);
-		intel_gen9_w32(sc, PLANE_SURF(0), sc->scanout_prev_surf);
+		igen9_anim_stop(sc);
+		igen9_w32(sc, PLANE_SURF(0), sc->scanout_prev_surf);
 		pause("gen9rst", hz / 20);
-		intel_gen9_test_fb_free(sc, sc->scanout_fb);
+		igen9_test_fb_free(sc, sc->scanout_fb);
 		free(sc->scanout_fb, M_KMS);
 		sc->scanout_fb = NULL;
 		sc->scanout_held = false;
@@ -1712,9 +1712,9 @@ intel_gen9_sysctl_scanout_hold(SYSCTL_HANDLER_ARGS)
 }
 
 static int
-intel_gen9_sysctl_test_fb_flip(SYSCTL_HANDLER_ARGS)
+igen9_sysctl_test_fb_flip(SYSCTL_HANDLER_ARGS)
 {
-	struct intel_gen9_softc *sc = arg1;
+	struct igen9_softc *sc = arg1;
 	int hold_sec = 0;
 	int error = sysctl_handle_int(oidp, &hold_sec, 0, req);
 
@@ -1725,14 +1725,14 @@ intel_gen9_sysctl_test_fb_flip(SYSCTL_HANDLER_ARGS)
 	if (hold_sec > 10)
 		hold_sec = 10;
 
-	struct intel_gen9_test_fb fb = { 0 };
-	error = intel_gen9_test_fb_alloc(sc, &fb, 1920, 1080);
+	struct igen9_test_fb fb = { 0 };
+	error = igen9_test_fb_alloc(sc, &fb, 1920, 1080);
 	if (error != 0) {
 		device_printf(sc->dev, "test_fb_flip: alloc failed: %d\n",
 		    error);
 		return (0);
 	}
-	intel_gen9_test_fb_fill_checker(&fb, 0x00ff0000, 0x000000ff);
+	igen9_test_fb_fill_checker(&fb, 0x00ff0000, 0x000000ff);
 
 	/*
 	 * Flip plane 1 of pipe A to scan from our buffer.  Our FB matches
@@ -1741,10 +1741,10 @@ intel_gen9_sysctl_test_fb_flip(SYSCTL_HANDLER_ARGS)
 	 * write is the entire change.  PLANE_SURF is the "armed" register —
 	 * the change takes effect at the next vblank.
 	 */
-	uint32_t prev_surf = intel_gen9_r32(sc, PLANE_SURF(0));
+	uint32_t prev_surf = igen9_r32(sc, PLANE_SURF(0));
 	uint32_t new_surf  = fb.gtt_first_idx * PAGE_SIZE;
-	uint32_t live_before = intel_gen9_r32(sc, PLANE_SURFLIVE(0));
-	uint32_t frm_before  = intel_gen9_r32(sc, PIPE_FRMCOUNT(0));
+	uint32_t live_before = igen9_r32(sc, PLANE_SURFLIVE(0));
+	uint32_t frm_before  = igen9_r32(sc, PIPE_FRMCOUNT(0));
 
 	device_printf(sc->dev,
 	    "test_fb_flip: PLANE_SURF 0x%08x -> 0x%08x (hold %d s)\n",
@@ -1753,7 +1753,7 @@ intel_gen9_sysctl_test_fb_flip(SYSCTL_HANDLER_ARGS)
 	    "  pre:   SURFLIVE=0x%08x  FRMCOUNT=%u\n",
 	    live_before, frm_before);
 
-	intel_gen9_w32(sc, PLANE_SURF(0), new_surf);
+	igen9_w32(sc, PLANE_SURF(0), new_surf);
 
 	/*
 	 * Sample SURFLIVE shortly after the arm to confirm HW latched it
@@ -1761,19 +1761,19 @@ intel_gen9_sysctl_test_fb_flip(SYSCTL_HANDLER_ARGS)
 	 * 50 ms of pause is plenty.
 	 */
 	pause("gen9arm", hz / 20);
-	uint32_t live_armed = intel_gen9_r32(sc, PLANE_SURFLIVE(0));
+	uint32_t live_armed = igen9_r32(sc, PLANE_SURFLIVE(0));
 	device_printf(sc->dev,
 	    "  armed: SURFLIVE=0x%08x  %s\n", live_armed,
 	    ((live_armed & 0xfffff000) == new_surf) ?
 	    "FLIP TOOK" : "FLIP DID NOT TAKE");
 
 	pause("gen9flp", hold_sec * hz);
-	uint32_t live_end = intel_gen9_r32(sc, PLANE_SURFLIVE(0));
-	uint32_t frm_end  = intel_gen9_r32(sc, PIPE_FRMCOUNT(0));
+	uint32_t live_end = igen9_r32(sc, PLANE_SURFLIVE(0));
+	uint32_t frm_end  = igen9_r32(sc, PIPE_FRMCOUNT(0));
 
-	intel_gen9_w32(sc, PLANE_SURF(0), prev_surf);
+	igen9_w32(sc, PLANE_SURF(0), prev_surf);
 	pause("gen9rst", hz / 20);
-	uint32_t live_restored = intel_gen9_r32(sc, PLANE_SURFLIVE(0));
+	uint32_t live_restored = igen9_r32(sc, PLANE_SURFLIVE(0));
 
 	device_printf(sc->dev,
 	    "  during: SURFLIVE=0x%08x  FRMCOUNT=%u  (advanced %u frames)\n",
@@ -1783,29 +1783,29 @@ intel_gen9_sysctl_test_fb_flip(SYSCTL_HANDLER_ARGS)
 	    live_restored,
 	    ((live_restored & 0xfffff000) == (prev_surf & 0xfffff000)) ?
 	    "RESTORED OK" : "RESTORE FAILED");
-	intel_gen9_test_fb_free(sc, &fb);
+	igen9_test_fb_free(sc, &fb);
 	return (0);
 }
 
 static int
-intel_gen9_sysctl_test_fb_make(SYSCTL_HANDLER_ARGS)
+igen9_sysctl_test_fb_make(SYSCTL_HANDLER_ARGS)
 {
-	struct intel_gen9_softc *sc = arg1;
+	struct igen9_softc *sc = arg1;
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
 
 	if (error || req->newptr == NULL || trigger == 0)
 		return (error);
 
-	struct intel_gen9_test_fb fb = { 0 };
-	error = intel_gen9_test_fb_alloc(sc, &fb, 1920, 1080);
+	struct igen9_test_fb fb = { 0 };
+	error = igen9_test_fb_alloc(sc, &fb, 1920, 1080);
 	if (error != 0) {
 		device_printf(sc->dev,
 		    "test_fb: alloc failed (%d) — need %u KiB contig\n",
 		    error, 1920 * 1080 * 4 / 1024);
 		return (0);
 	}
-	intel_gen9_test_fb_fill_checker(&fb, 0x00ff0000, 0x000000ff);
+	igen9_test_fb_fill_checker(&fb, 0x00ff0000, 0x000000ff);
 
 	uint32_t *first = (uint32_t *)fb.va;
 	device_printf(sc->dev,
@@ -1822,9 +1822,9 @@ intel_gen9_sysctl_test_fb_make(SYSCTL_HANDLER_ARGS)
 	device_printf(sc->dev,
 	    "  GTT[%u] readback = 0x%016llx (expect VALID+WRITEABLE + pa)\n",
 	    fb.gtt_first_idx,
-	    (unsigned long long)intel_gen9_gtt_read(sc, fb.gtt_first_idx));
+	    (unsigned long long)igen9_gtt_read(sc, fb.gtt_first_idx));
 
-	intel_gen9_test_fb_free(sc, &fb);
+	igen9_test_fb_free(sc, &fb);
 	device_printf(sc->dev, "test_fb: freed cleanly\n");
 	return (0);
 }
@@ -1836,9 +1836,9 @@ intel_gen9_sysctl_test_fb_make(SYSCTL_HANDLER_ARGS)
  * works before we build the page-flip logic on top.
  */
 static int
-intel_gen9_sysctl_gtt_alloc_test(SYSCTL_HANDLER_ARGS)
+igen9_sysctl_gtt_alloc_test(SYSCTL_HANDLER_ARGS)
 {
-	struct intel_gen9_softc *sc = arg1;
+	struct igen9_softc *sc = arg1;
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
 
@@ -1861,9 +1861,9 @@ intel_gen9_sysctl_gtt_alloc_test(SYSCTL_HANDLER_ARGS)
 	vm_paddr_t pa = pmap_kextract((vm_offset_t)va);
 	uint64_t pte = (pa & ~0xfffULL) | GTT_PTE_VALID | GTT_PTE_WRITEABLE;
 
-	uint64_t before = intel_gen9_gtt_read(sc, test_idx);
-	intel_gen9_gtt_write(sc, test_idx, pte);
-	uint64_t after = intel_gen9_gtt_read(sc, test_idx);
+	uint64_t before = igen9_gtt_read(sc, test_idx);
+	igen9_gtt_write(sc, test_idx, pte);
+	uint64_t after = igen9_gtt_read(sc, test_idx);
 
 	device_printf(sc->dev,
 	    "gtt_alloc_test: va=%p  pa=0x%llx  wrote PTE=0x%llx\n",
@@ -1879,15 +1879,15 @@ intel_gen9_sysctl_gtt_alloc_test(SYSCTL_HANDLER_ARGS)
 	 * dangling-ref it AND any firmware mapping that happened to live
 	 * here stays intact.
 	 */
-	intel_gen9_gtt_write(sc, test_idx, before);
+	igen9_gtt_write(sc, test_idx, before);
 	contigfree(va, PAGE_SIZE, M_KMS);
 	return (0);
 }
 
 static int
-intel_gen9_sysctl_gtt_dump(SYSCTL_HANDLER_ARGS)
+igen9_sysctl_gtt_dump(SYSCTL_HANDLER_ARGS)
 {
-	struct intel_gen9_softc *sc = arg1;
+	struct igen9_softc *sc = arg1;
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
 
@@ -1897,7 +1897,7 @@ intel_gen9_sysctl_gtt_dump(SYSCTL_HANDLER_ARGS)
 	uint32_t valid_count = 0, last_pfn = 0, runs = 0;
 	uint64_t first_pfn = 0;
 	for (uint32_t i = 0; i < 2048; i++) {	/* first 8 MiB of GTT */
-		uint64_t pte = intel_gen9_gtt_read(sc, i);
+		uint64_t pte = igen9_gtt_read(sc, i);
 		if (pte & GTT_PTE_VALID) {
 			uint64_t pfn = (pte >> 12);
 			if (valid_count == 0)
@@ -1917,7 +1917,7 @@ intel_gen9_sysctl_gtt_dump(SYSCTL_HANDLER_ARGS)
 
 	/* Pretty-print the first 8 PTEs verbatim. */
 	for (uint32_t i = 0; i < 8; i++) {
-		uint64_t pte = intel_gen9_gtt_read(sc, i);
+		uint64_t pte = igen9_gtt_read(sc, i);
 		device_printf(sc->dev,
 		    "  GTT[%u] = 0x%016llx  %s%s  PFN=0x%llx\n",
 		    i, (unsigned long long)pte,
@@ -1969,7 +1969,7 @@ intel_gen9_sysctl_gtt_dump(SYSCTL_HANDLER_ARGS)
 #define	PLANE_OFFSET(p)		(0x701a4 + (p) * 0x1000)
 
 static const char *
-intel_gen9_plane_format_name(uint32_t f)
+igen9_plane_format_name(uint32_t f)
 {
 	switch (f) {
 	case 0x0: return "YUV422-8";
@@ -1985,7 +1985,7 @@ intel_gen9_plane_format_name(uint32_t f)
 }
 
 static const char *
-intel_gen9_plane_tiling_name(uint32_t t)
+igen9_plane_tiling_name(uint32_t t)
 {
 	switch (t) {
 	case 0: return "linear";
@@ -1997,14 +1997,14 @@ intel_gen9_plane_tiling_name(uint32_t t)
 }
 
 static void
-intel_gen9_read_pipe_mode(struct intel_gen9_softc *sc, int pipe,
+igen9_read_pipe_mode(struct igen9_softc *sc, int pipe,
     struct drm_display_mode *m)
 {
-	uint32_t htotal = intel_gen9_r32(sc, TRANS_HTOTAL(pipe));
-	uint32_t hsync  = intel_gen9_r32(sc, TRANS_HSYNC(pipe));
-	uint32_t vtotal = intel_gen9_r32(sc, TRANS_VTOTAL(pipe));
-	uint32_t vsync  = intel_gen9_r32(sc, TRANS_VSYNC(pipe));
-	uint32_t fctl   = intel_gen9_r32(sc, TRANS_DDI_FUNC_CTL(pipe));
+	uint32_t htotal = igen9_r32(sc, TRANS_HTOTAL(pipe));
+	uint32_t hsync  = igen9_r32(sc, TRANS_HSYNC(pipe));
+	uint32_t vtotal = igen9_r32(sc, TRANS_VTOTAL(pipe));
+	uint32_t vsync  = igen9_r32(sc, TRANS_VSYNC(pipe));
+	uint32_t fctl   = igen9_r32(sc, TRANS_DDI_FUNC_CTL(pipe));
 
 	memset(m, 0, sizeof(*m));
 	m->hdisplay    = (htotal & 0x1fff) + 1;
@@ -2028,9 +2028,9 @@ intel_gen9_read_pipe_mode(struct intel_gen9_softc *sc, int pipe,
 }
 
 static int
-intel_gen9_sysctl_current_mode(SYSCTL_HANDLER_ARGS)
+igen9_sysctl_current_mode(SYSCTL_HANDLER_ARGS)
 {
-	struct intel_gen9_softc *sc = arg1;
+	struct igen9_softc *sc = arg1;
 	struct drm_display_mode m;
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
@@ -2039,7 +2039,7 @@ intel_gen9_sysctl_current_mode(SYSCTL_HANDLER_ARGS)
 		return (error);
 
 	for (int pipe = 0; pipe < 3; pipe++) {
-		uint32_t pconf = intel_gen9_r32(sc, PIPE_CONF(pipe));
+		uint32_t pconf = igen9_r32(sc, PIPE_CONF(pipe));
 		bool active = (pconf & (PIPE_CONF_ENABLE | PIPE_CONF_STATE))
 		    == (PIPE_CONF_ENABLE | PIPE_CONF_STATE);
 		device_printf(sc->dev,
@@ -2047,7 +2047,7 @@ intel_gen9_sysctl_current_mode(SYSCTL_HANDLER_ARGS)
 		    'A' + pipe, pconf, active ? "ACTIVE" : "idle");
 		if (!active)
 			continue;
-		intel_gen9_read_pipe_mode(sc, pipe, &m);
+		igen9_read_pipe_mode(sc, pipe, &m);
 		device_printf(sc->dev,
 		    "  %ux%u  htotal=%u  vtotal=%u  hs=%u..%u  vs=%u..%u"
 		    "  flags=0x%x\n",
@@ -2055,11 +2055,11 @@ intel_gen9_sysctl_current_mode(SYSCTL_HANDLER_ARGS)
 		    m.hsync_start, m.hsync_end,
 		    m.vsync_start, m.vsync_end, m.flags);
 
-		uint32_t pctl  = intel_gen9_r32(sc, PLANE_CTL(pipe));
-		uint32_t psurf = intel_gen9_r32(sc, PLANE_SURF(pipe));
-		uint32_t pstr  = intel_gen9_r32(sc, PLANE_STRIDE(pipe));
-		uint32_t psize = intel_gen9_r32(sc, PLANE_SIZE(pipe));
-		uint32_t poff  = intel_gen9_r32(sc, PLANE_OFFSET(pipe));
+		uint32_t pctl  = igen9_r32(sc, PLANE_CTL(pipe));
+		uint32_t psurf = igen9_r32(sc, PLANE_SURF(pipe));
+		uint32_t pstr  = igen9_r32(sc, PLANE_STRIDE(pipe));
+		uint32_t psize = igen9_r32(sc, PLANE_SIZE(pipe));
+		uint32_t poff  = igen9_r32(sc, PLANE_OFFSET(pipe));
 		uint32_t fmt   = (pctl & PLANE_CTL_FORMAT_MASK) >>
 		    PLANE_CTL_FORMAT_SHIFT;
 		uint32_t tile  = (pctl & PLANE_CTL_TILED_MASK) >>
@@ -2069,8 +2069,8 @@ intel_gen9_sysctl_current_mode(SYSCTL_HANDLER_ARGS)
 		device_printf(sc->dev,
 		    "  plane1: CTL=0x%08x  en=%d  fmt=%s  tile=%s\n",
 		    pctl, !!(pctl & PLANE_CTL_ENABLE),
-		    intel_gen9_plane_format_name(fmt),
-		    intel_gen9_plane_tiling_name(tile));
+		    igen9_plane_format_name(fmt),
+		    igen9_plane_tiling_name(tile));
 		device_printf(sc->dev,
 		    "          SURF=0x%08x  STRIDE=%u (raw=0x%x)"
 		    "  SIZE=%ux%u  OFFSET=0x%08x\n",
@@ -2102,7 +2102,7 @@ intel_gen9_sysctl_current_mode(SYSCTL_HANDLER_ARGS)
  *   17:   feature flags incl sync polarity bits [2:1] (h=2, v=1)
  */
 static void
-intel_gen9_edid_to_mode(const uint8_t *d, struct drm_display_mode *m)
+igen9_edid_to_mode(const uint8_t *d, struct drm_display_mode *m)
 {
 	uint32_t pixclk_10kHz = d[0] | ((uint32_t)d[1] << 8);
 	uint16_t hactive = d[2] | ((uint16_t)(d[4] >> 4) << 8);
@@ -2133,7 +2133,7 @@ intel_gen9_edid_to_mode(const uint8_t *d, struct drm_display_mode *m)
 }
 
 static int
-intel_gen9_attach_edid_modes(struct intel_gen9_softc *sc)
+igen9_attach_edid_modes(struct igen9_softc *sc)
 {
 	uint8_t edid[128];
 	int error = EIO;
@@ -2144,7 +2144,7 @@ intel_gen9_attach_edid_modes(struct intel_gen9_softc *sc)
 	 * 2nd attempt the bus is consistently warm.
 	 */
 	for (int try = 0; try < 4; try++) {
-		error = intel_gen9_gmbus_read_block(sc, GMBUS_PIN_DDI_B,
+		error = igen9_gmbus_read_block(sc, GMBUS_PIN_DDI_B,
 		    EDID_SLAVE, 0, edid, sizeof(edid));
 		if (error == 0)
 			break;
@@ -2170,7 +2170,7 @@ intel_gen9_attach_edid_modes(struct intel_gen9_softc *sc)
 		struct drm_display_mode *m = kms_mode_create();
 		if (m == NULL)
 			return (ENOMEM);
-		intel_gen9_edid_to_mode(&edid[i], m);
+		igen9_edid_to_mode(&edid[i], m);
 		kms_connector_add_mode(&sc->connector, m);
 		DPRINTF(sc, 0,
 		    "edid: added mode %s @%u kHz  %u Hz  flags=0x%x\n",
@@ -2198,9 +2198,9 @@ intel_gen9_attach_edid_modes(struct intel_gen9_softc *sc)
 #define	SDEISR			0x000c4000
 
 static int
-intel_gen9_sysctl_hpd_dump(SYSCTL_HANDLER_ARGS)
+igen9_sysctl_hpd_dump(SYSCTL_HANDLER_ARGS)
 {
-	struct intel_gen9_softc *sc = arg1;
+	struct igen9_softc *sc = arg1;
 	uint32_t sfuse, hot, sde;
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
@@ -2208,9 +2208,9 @@ intel_gen9_sysctl_hpd_dump(SYSCTL_HANDLER_ARGS)
 	if (error || req->newptr == NULL || trigger == 0)
 		return (error);
 
-	sfuse = intel_gen9_r32(sc, SFUSE_STRAP);
-	hot   = intel_gen9_r32(sc, SHOTPLUG_CTL_DDI);
-	sde   = intel_gen9_r32(sc, SDEISR);
+	sfuse = igen9_r32(sc, SFUSE_STRAP);
+	hot   = igen9_r32(sc, SHOTPLUG_CTL_DDI);
+	sde   = igen9_r32(sc, SDEISR);
 
 	device_printf(sc->dev,
 	    "hpd: SFUSE_STRAP=0x%08x  SHOTPLUG_CTL_DDI=0x%08x  SDEISR=0x%08x\n",
@@ -2266,9 +2266,9 @@ intel_gen9_sysctl_hpd_dump(SYSCTL_HANDLER_ARGS)
  * Conclusion: max 2 concurrent displays on this SKU (DDI_B + DDI_C).
  */
 static int
-intel_gen9_sysctl_cap_dump(SYSCTL_HANDLER_ARGS)
+igen9_sysctl_cap_dump(SYSCTL_HANDLER_ARGS)
 {
-	struct intel_gen9_softc *sc = arg1;
+	struct igen9_softc *sc = arg1;
 	uint32_t asls, sfuse, sde;
 	void *va;
 	uint8_t *blob;
@@ -2281,8 +2281,8 @@ intel_gen9_sysctl_cap_dump(SYSCTL_HANDLER_ARGS)
 	if (error || req->newptr == NULL || trigger == 0)
 		return (error);
 
-	sfuse = intel_gen9_r32(sc, SFUSE_STRAP);
-	sde   = intel_gen9_r32(sc, SDEISR);
+	sfuse = igen9_r32(sc, SFUSE_STRAP);
+	sde   = igen9_r32(sc, SDEISR);
 
 	/*
 	 * Walk the VBT to fill per_ddi_type[].  We map dvo_port back to a
@@ -2357,7 +2357,7 @@ intel_gen9_sysctl_cap_dump(SYSCTL_HANDLER_ARGS)
 		int silicon = 0;
 		int hpd = 0;
 		const char *vtype = per_ddi_type[ddi] ?
-		    intel_gen9_device_type_name(per_ddi_type[ddi]) : "(none)";
+		    igen9_device_type_name(per_ddi_type[ddi]) : "(none)";
 
 		switch (ddi) {
 		case 1: silicon = (sfuse >> 2) & 1; break;	/* DDI_B */
@@ -2398,7 +2398,7 @@ intel_gen9_sysctl_cap_dump(SYSCTL_HANDLER_ARGS)
 #define	CDCLK_CTL		0x00046000
 
 static const char *
-intel_gen9_cdclk_decode(uint32_t cdclk_ctl)
+igen9_cdclk_decode(uint32_t cdclk_ctl)
 {
 	/*
 	 * freq_decimal field encodes (2*MHz - 2) so:
@@ -2428,24 +2428,24 @@ intel_gen9_cdclk_decode(uint32_t cdclk_ctl)
 #define	LCPLL2_CTL		0x00046014
 
 static int
-intel_gen9_sysctl_clock_state(SYSCTL_HANDLER_ARGS)
+igen9_sysctl_clock_state(SYSCTL_HANDLER_ARGS)
 {
-	struct intel_gen9_softc *sc = arg1;
+	struct igen9_softc *sc = arg1;
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
 
 	if (error || req->newptr == NULL || trigger == 0)
 		return (error);
 
-	uint32_t cdclk = intel_gen9_r32(sc, CDCLK_CTL);
-	uint32_t lcpll1 = intel_gen9_r32(sc, LCPLL1_CTL);
-	uint32_t lcpll2 = intel_gen9_r32(sc, LCPLL2_CTL);
-	uint32_t dpll1 = intel_gen9_r32(sc, DPLL_CTRL1);
-	uint32_t dpll2 = intel_gen9_r32(sc, DPLL_CTRL2);
+	uint32_t cdclk = igen9_r32(sc, CDCLK_CTL);
+	uint32_t lcpll1 = igen9_r32(sc, LCPLL1_CTL);
+	uint32_t lcpll2 = igen9_r32(sc, LCPLL2_CTL);
+	uint32_t dpll1 = igen9_r32(sc, DPLL_CTRL1);
+	uint32_t dpll2 = igen9_r32(sc, DPLL_CTRL2);
 
 	device_printf(sc->dev,
 	    "clock: CDCLK_CTL=0x%08x  (%s, cd2x_div=%u, freq_dec=0x%03x)\n",
-	    cdclk, intel_gen9_cdclk_decode(cdclk),
+	    cdclk, igen9_cdclk_decode(cdclk),
 	    (cdclk >> 22) & 0x7, cdclk & 0x7ff);
 	device_printf(sc->dev,
 	    "clock: LCPLL1_CTL=0x%08x  LCPLL2_CTL=0x%08x\n",
@@ -2510,7 +2510,7 @@ static const uint8_t wrpll_even_dividers[] = {
 static const uint8_t wrpll_odd_dividers[] = { 3, 5, 7, 9, 15, 21, 35 };
 
 static bool
-intel_gen9_wrpll_decompose(uint32_t d, uint8_t *p0, uint8_t *p1, uint8_t *p2)
+igen9_wrpll_decompose(uint32_t d, uint8_t *p0, uint8_t *p1, uint8_t *p2)
 {
 	if ((d % 2) == 0) {
 		uint32_t half = d / 2;
@@ -2549,7 +2549,7 @@ intel_gen9_wrpll_decompose(uint32_t d, uint8_t *p0, uint8_t *p1, uint8_t *p2)
 }
 
 static bool
-intel_gen9_wrpll_solve(uint32_t pixel_khz, uint8_t *out_p0, uint8_t *out_p1,
+igen9_wrpll_solve(uint32_t pixel_khz, uint8_t *out_p0, uint8_t *out_p1,
     uint8_t *out_p2, uint16_t *out_dco_int, uint16_t *out_dco_frac,
     uint64_t *out_vco_khz)
 {
@@ -2569,7 +2569,7 @@ intel_gen9_wrpll_solve(uint32_t pixel_khz, uint8_t *out_p0, uint8_t *out_p1,
 
 		if (vco < WRPLL_VCO_MIN_KHZ || vco > WRPLL_VCO_MAX_KHZ)
 			continue;
-		if (!intel_gen9_wrpll_decompose(d, &a, &b, &c))
+		if (!igen9_wrpll_decompose(d, &a, &b, &c))
 			continue;
 		dev = vco > center ? vco - center : center - vco;
 		if (dev < best_dev) {
@@ -2589,7 +2589,7 @@ intel_gen9_wrpll_solve(uint32_t pixel_khz, uint8_t *out_p0, uint8_t *out_p1,
 
 		if (vco < WRPLL_VCO_MIN_KHZ || vco > WRPLL_VCO_MAX_KHZ)
 			continue;
-		if (!intel_gen9_wrpll_decompose(d, &a, &b, &c))
+		if (!igen9_wrpll_decompose(d, &a, &b, &c))
 			continue;
 		dev = vco > center ? vco - center : center - vco;
 		if (dev < best_dev) {
@@ -2615,9 +2615,9 @@ intel_gen9_wrpll_solve(uint32_t pixel_khz, uint8_t *out_p0, uint8_t *out_p1,
 }
 
 static int
-intel_gen9_sysctl_wrpll_calc(SYSCTL_HANDLER_ARGS)
+igen9_sysctl_wrpll_calc(SYSCTL_HANDLER_ARGS)
 {
-	struct intel_gen9_softc *sc = arg1;
+	struct igen9_softc *sc = arg1;
 	uint8_t p0, p1, p2;
 	uint16_t dco_int, dco_frac;
 	uint64_t vco;
@@ -2631,10 +2631,10 @@ intel_gen9_sysctl_wrpll_calc(SYSCTL_HANDLER_ARGS)
 	pixel_khz = sc->wrpll_target_khz;
 	if (pixel_khz == 0) {
 		device_printf(sc->dev,
-		    "wrpll: set dev.intel_gen9.0.re.wrpll_target_khz first\n");
+		    "wrpll: set dev.igen9.0.re.wrpll_target_khz first\n");
 		return (0);
 	}
-	if (!intel_gen9_wrpll_solve(pixel_khz, &p0, &p1, &p2,
+	if (!igen9_wrpll_solve(pixel_khz, &p0, &p1, &p2,
 	    &dco_int, &dco_frac, &vco)) {
 		device_printf(sc->dev,
 		    "wrpll: no solution for %u kHz (VCO out of range)\n",
@@ -2688,7 +2688,7 @@ intel_gen9_sysctl_wrpll_calc(SYSCTL_HANDLER_ARGS)
 #define	CFGCR2_PDIV_SHIFT	2
 
 static uint32_t
-intel_gen9_wrpll_encode_cfgcr1(uint16_t dco_int, uint16_t dco_frac)
+igen9_wrpll_encode_cfgcr1(uint16_t dco_int, uint16_t dco_frac)
 {
 	return (CFGCR1_FREQ_ENABLE |
 	    ((uint32_t)(dco_frac & 0x7fffu) << 9) |
@@ -2701,7 +2701,7 @@ intel_gen9_wrpll_encode_cfgcr1(uint16_t dco_int, uint16_t dco_frac)
  * uses 9.0 GHz for an 8910 MHz VCO, confirming this rule.
  */
 static uint32_t
-intel_gen9_wrpll_central_freq_bits(uint64_t vco_khz)
+igen9_wrpll_central_freq_bits(uint64_t vco_khz)
 {
 	uint64_t d96 = vco_khz > 9600000 ? vco_khz - 9600000 :
 	    9600000 - vco_khz;
@@ -2718,7 +2718,7 @@ intel_gen9_wrpll_central_freq_bits(uint64_t vco_khz)
 }
 
 static bool
-intel_gen9_wrpll_encode_cfgcr2(uint8_t p0, uint8_t p1, uint8_t p2,
+igen9_wrpll_encode_cfgcr2(uint8_t p0, uint8_t p1, uint8_t p2,
     uint64_t vco_khz, uint32_t *out)
 {
 	uint32_t v = 0;
@@ -2744,13 +2744,13 @@ intel_gen9_wrpll_encode_cfgcr2(uint8_t p0, uint8_t p1, uint8_t p2,
 		v |= CFGCR2_QDIV_MODE;
 	v |= (kdiv << CFGCR2_KDIV_SHIFT);
 	v |= (pdiv << CFGCR2_PDIV_SHIFT);
-	v |= intel_gen9_wrpll_central_freq_bits(vco_khz);
+	v |= igen9_wrpll_central_freq_bits(vco_khz);
 	*out = v;
 	return (true);
 }
 
 static void
-intel_gen9_wrpll_decode_cfgcr(uint32_t cfgcr1, uint32_t cfgcr2,
+igen9_wrpll_decode_cfgcr(uint32_t cfgcr1, uint32_t cfgcr2,
     device_t dev)
 {
 	static const uint8_t kdiv_to_p2[] = { 5, 2, 3, 1 };
@@ -2799,9 +2799,9 @@ intel_gen9_wrpll_decode_cfgcr(uint32_t cfgcr1, uint32_t cfgcr2,
 }
 
 static int
-intel_gen9_sysctl_wrpll_dump(SYSCTL_HANDLER_ARGS)
+igen9_sysctl_wrpll_dump(SYSCTL_HANDLER_ARGS)
 {
-	struct intel_gen9_softc *sc = arg1;
+	struct igen9_softc *sc = arg1;
 	uint32_t id, cfgcr1, cfgcr2;
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
@@ -2815,19 +2815,19 @@ intel_gen9_sysctl_wrpll_dump(SYSCTL_HANDLER_ARGS)
 		    "wrpll_dump: wrpll_dpll_id must be 2 or 3\n");
 		return (0);
 	}
-	cfgcr1 = intel_gen9_r32(sc, WRPLL_CFGCR1(id));
-	cfgcr2 = intel_gen9_r32(sc, WRPLL_CFGCR2(id));
+	cfgcr1 = igen9_r32(sc, WRPLL_CFGCR1(id));
+	cfgcr2 = igen9_r32(sc, WRPLL_CFGCR2(id));
 	device_printf(sc->dev,
 	    "wrpll DPLL%u: CFGCR1=0x%08x  CFGCR2=0x%08x\n",
 	    id, cfgcr1, cfgcr2);
-	intel_gen9_wrpll_decode_cfgcr(cfgcr1, cfgcr2, sc->dev);
+	igen9_wrpll_decode_cfgcr(cfgcr1, cfgcr2, sc->dev);
 	return (0);
 }
 
 static int
-intel_gen9_sysctl_wrpll_program(SYSCTL_HANDLER_ARGS)
+igen9_sysctl_wrpll_program(SYSCTL_HANDLER_ARGS)
 {
-	struct intel_gen9_softc *sc = arg1;
+	struct igen9_softc *sc = arg1;
 	uint8_t p0, p1, p2;
 	uint16_t dco_int, dco_frac;
 	uint64_t vco;
@@ -2850,7 +2850,7 @@ intel_gen9_sysctl_wrpll_program(SYSCTL_HANDLER_ARGS)
 	 * by which PLL.  If any DDI's DPLL_SEL == this PLL and the DDI
 	 * is clocked on, the PLL is live -- never reprogram a live PLL.
 	 */
-	uint32_t ctrl2 = intel_gen9_r32(sc, DPLL_CTRL2);
+	uint32_t ctrl2 = igen9_r32(sc, DPLL_CTRL2);
 	for (int port = 0; port < 5; port++) {
 		uint32_t off = (ctrl2 >> (15 + port)) & 1;
 		uint32_t sel = (ctrl2 >> (1 + port * 3)) & 0x3;
@@ -2869,22 +2869,22 @@ intel_gen9_sysctl_wrpll_program(SYSCTL_HANDLER_ARGS)
 		    "wrpll: set wrpll_target_khz first\n");
 		return (EINVAL);
 	}
-	if (!intel_gen9_wrpll_solve(pixel_khz, &p0, &p1, &p2,
+	if (!igen9_wrpll_solve(pixel_khz, &p0, &p1, &p2,
 	    &dco_int, &dco_frac, &vco)) {
 		device_printf(sc->dev,
 		    "wrpll: no solution for %u kHz\n", pixel_khz);
 		return (EINVAL);
 	}
 
-	cfgcr1 = intel_gen9_wrpll_encode_cfgcr1(dco_int, dco_frac);
-	if (!intel_gen9_wrpll_encode_cfgcr2(p0, p1, p2, vco, &cfgcr2)) {
+	cfgcr1 = igen9_wrpll_encode_cfgcr1(dco_int, dco_frac);
+	if (!igen9_wrpll_encode_cfgcr2(p0, p1, p2, vco, &cfgcr2)) {
 		device_printf(sc->dev,
 		    "wrpll: encode failed for P0=%u P1=%u P2=%u\n", p0, p1, p2);
 		return (EINVAL);
 	}
 
-	old1 = intel_gen9_r32(sc, WRPLL_CFGCR1(id));
-	old2 = intel_gen9_r32(sc, WRPLL_CFGCR2(id));
+	old1 = igen9_r32(sc, WRPLL_CFGCR1(id));
+	old2 = igen9_r32(sc, WRPLL_CFGCR2(id));
 	device_printf(sc->dev,
 	    "wrpll DPLL%u: pre  CFGCR1=0x%08x CFGCR2=0x%08x\n",
 	    id, old1, old2);
@@ -2893,15 +2893,15 @@ intel_gen9_sysctl_wrpll_program(SYSCTL_HANDLER_ARGS)
 	    " (target=%u kHz)\n",
 	    id, cfgcr1, cfgcr2, pixel_khz);
 
-	intel_gen9_w32(sc, WRPLL_CFGCR1(id), cfgcr1);
-	intel_gen9_w32(sc, WRPLL_CFGCR2(id), cfgcr2);
+	igen9_w32(sc, WRPLL_CFGCR1(id), cfgcr1);
+	igen9_w32(sc, WRPLL_CFGCR2(id), cfgcr2);
 
-	back1 = intel_gen9_r32(sc, WRPLL_CFGCR1(id));
-	back2 = intel_gen9_r32(sc, WRPLL_CFGCR2(id));
+	back1 = igen9_r32(sc, WRPLL_CFGCR1(id));
+	back2 = igen9_r32(sc, WRPLL_CFGCR2(id));
 	device_printf(sc->dev,
 	    "wrpll DPLL%u: post CFGCR1=0x%08x CFGCR2=0x%08x\n",
 	    id, back1, back2);
-	intel_gen9_wrpll_decode_cfgcr(back1, back2, sc->dev);
+	igen9_wrpll_decode_cfgcr(back1, back2, sc->dev);
 
 	if (back1 != cfgcr1 || back2 != cfgcr2)
 		device_printf(sc->dev,
@@ -2937,9 +2937,9 @@ intel_gen9_sysctl_wrpll_program(SYSCTL_HANDLER_ARGS)
 #define	CTRL2_DDI_OFF(p)		(1u << (15 + (p)))
 
 static int
-intel_gen9_sysctl_wrpll_enable(SYSCTL_HANDLER_ARGS)
+igen9_sysctl_wrpll_enable(SYSCTL_HANDLER_ARGS)
 {
-	struct intel_gen9_softc *sc = arg1;
+	struct igen9_softc *sc = arg1;
 	uint32_t id, cfgcr1, ctrl1, enreg, en, lock;
 	int i;
 	int trigger = 0;
@@ -2954,7 +2954,7 @@ intel_gen9_sysctl_wrpll_enable(SYSCTL_HANDLER_ARGS)
 		    "wrpll: wrpll_dpll_id must be 2 or 3\n");
 		return (EINVAL);
 	}
-	cfgcr1 = intel_gen9_r32(sc, WRPLL_CFGCR1(id));
+	cfgcr1 = igen9_r32(sc, WRPLL_CFGCR1(id));
 	if (!(cfgcr1 & CFGCR1_FREQ_ENABLE)) {
 		device_printf(sc->dev,
 		    "wrpll DPLL%u: CFGCR1 FREQ_ENABLE clear; program it"
@@ -2969,7 +2969,7 @@ intel_gen9_sysctl_wrpll_enable(SYSCTL_HANDLER_ARGS)
 	 * We refuse rather than risk wedging the box.
 	 */
 	/* PW1 STATE = bit (idx*2) in HSW_PWR_WELL_CTL2 @ 0x45404; idx=1. */
-	uint32_t pwr = intel_gen9_r32(sc, 0x45404);
+	uint32_t pwr = igen9_r32(sc, 0x45404);
 	if (!(pwr & (1u << 2))) {
 		device_printf(sc->dev,
 		    "wrpll DPLL%u: REFUSE: PW1 not up (CTL2=0x%08x);"
@@ -2982,7 +2982,7 @@ intel_gen9_sysctl_wrpll_enable(SYSCTL_HANDLER_ARGS)
 	 * 6-bit per-DPLL field first to wipe any stale link-rate / SSC bits
 	 * so the new write is authoritative.
 	 */
-	ctrl1 = intel_gen9_r32(sc, DPLL_CTRL1);
+	ctrl1 = igen9_r32(sc, DPLL_CTRL1);
 	uint32_t per_dpll_mask = 0x3fu << (id * 6);
 	uint32_t new_ctrl1 = (ctrl1 & ~per_dpll_mask) |
 	    CTRL1_OVERRIDE(id) | CTRL1_HDMI_MODE(id);
@@ -2991,7 +2991,7 @@ intel_gen9_sysctl_wrpll_enable(SYSCTL_HANDLER_ARGS)
 		device_printf(sc->dev,
 		    "wrpll DPLL%u: CTRL1 0x%08x -> 0x%08x\n",
 		    id, ctrl1, new_ctrl1);
-		intel_gen9_w32(sc, DPLL_CTRL1, new_ctrl1);
+		igen9_w32(sc, DPLL_CTRL1, new_ctrl1);
 	}
 
 	/*
@@ -3003,22 +3003,22 @@ intel_gen9_sysctl_wrpll_enable(SYSCTL_HANDLER_ARGS)
 	 * engine then sees a broken clock path and printf-storms.
 	 */
 	enreg = WRPLL_ENABLE_REG(id);
-	en = intel_gen9_r32(sc, enreg);
+	en = igen9_r32(sc, enreg);
 	device_printf(sc->dev,
 	    "wrpll DPLL%u: ENABLE_REG[0x%05x]=0x%08x (pre)\n", id, enreg, en);
 
 	if (!(en & WRPLL_POWER_ENABLE_BIT))
-		intel_gen9_w32(sc, enreg, en | WRPLL_POWER_ENABLE_BIT);
+		igen9_w32(sc, enreg, en | WRPLL_POWER_ENABLE_BIT);
 
 	for (i = 0; i < 50; i++) {
-		uint32_t v = intel_gen9_r32(sc, enreg);
+		uint32_t v = igen9_r32(sc, enreg);
 		if (v & WRPLL_POWER_STATE_BIT)
 			break;
 		DELAY(100);
 	}
-	uint32_t ps = intel_gen9_r32(sc, enreg);
+	uint32_t ps = igen9_r32(sc, enreg);
 	if (!(ps & WRPLL_POWER_STATE_BIT)) {
-		intel_gen9_w32(sc, enreg, ps & ~WRPLL_POWER_ENABLE_BIT);
+		igen9_w32(sc, enreg, ps & ~WRPLL_POWER_ENABLE_BIT);
 		device_printf(sc->dev,
 		    "wrpll DPLL%u: POWER_STATE never asserted (REG=0x%08x);"
 		    " POWER_ENABLE cleared\n", id, ps);
@@ -3028,13 +3028,13 @@ intel_gen9_sysctl_wrpll_enable(SYSCTL_HANDLER_ARGS)
 	    "wrpll DPLL%u: POWER_STATE up after %d us\n", id, i * 100);
 
 	/* Step 4: ENABLE. */
-	en = intel_gen9_r32(sc, enreg);
+	en = igen9_r32(sc, enreg);
 	if (!(en & WRPLL_ENABLE_BIT))
-		intel_gen9_w32(sc, enreg, en | WRPLL_ENABLE_BIT);
+		igen9_w32(sc, enreg, en | WRPLL_ENABLE_BIT);
 
 	/* Step 5: poll LOCK.  BSpec says <= 600 us; allow 5 ms. */
 	for (i = 0; i < 50; i++) {
-		lock = intel_gen9_r32(sc, enreg);
+		lock = igen9_r32(sc, enreg);
 		if (lock & WRPLL_LOCK_BIT)
 			break;
 		DELAY(100);
@@ -3049,11 +3049,11 @@ intel_gen9_sysctl_wrpll_enable(SYSCTL_HANDLER_ARGS)
 		 * doesn't sit in a half-on state.  Order matters: clear
 		 * ENABLE first, then POWER_ENABLE.
 		 */
-		uint32_t v = intel_gen9_r32(sc, enreg);
-		intel_gen9_w32(sc, enreg, v & ~WRPLL_ENABLE_BIT);
+		uint32_t v = igen9_r32(sc, enreg);
+		igen9_w32(sc, enreg, v & ~WRPLL_ENABLE_BIT);
 		DELAY(10);
-		v = intel_gen9_r32(sc, enreg);
-		intel_gen9_w32(sc, enreg, v & ~WRPLL_POWER_ENABLE_BIT);
+		v = igen9_r32(sc, enreg);
+		igen9_w32(sc, enreg, v & ~WRPLL_POWER_ENABLE_BIT);
 		device_printf(sc->dev,
 		    "wrpll DPLL%u: FAILED to lock; ENABLE+POWER_ENABLE"
 		    " cleared\n", id);
@@ -3063,9 +3063,9 @@ intel_gen9_sysctl_wrpll_enable(SYSCTL_HANDLER_ARGS)
 }
 
 static int
-intel_gen9_sysctl_wrpll_disable(SYSCTL_HANDLER_ARGS)
+igen9_sysctl_wrpll_disable(SYSCTL_HANDLER_ARGS)
 {
-	struct intel_gen9_softc *sc = arg1;
+	struct igen9_softc *sc = arg1;
 	uint32_t id, ctrl2, enreg, en;
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
@@ -3080,7 +3080,7 @@ intel_gen9_sysctl_wrpll_disable(SYSCTL_HANDLER_ARGS)
 		return (EINVAL);
 	}
 	/* Same liveness guard as wrpll_program. */
-	ctrl2 = intel_gen9_r32(sc, DPLL_CTRL2);
+	ctrl2 = igen9_r32(sc, DPLL_CTRL2);
 	for (int port = 0; port < 5; port++) {
 		uint32_t off = (ctrl2 >> (15 + port)) & 1;
 		uint32_t sel = (ctrl2 >> (1 + port * 3)) & 0x3;
@@ -3093,7 +3093,7 @@ intel_gen9_sysctl_wrpll_disable(SYSCTL_HANDLER_ARGS)
 		}
 	}
 	enreg = WRPLL_ENABLE_REG(id);
-	en = intel_gen9_r32(sc, enreg);
+	en = igen9_r32(sc, enreg);
 	/*
 	 * Clear ENABLE first, brief wait, then clear POWER_ENABLE.  BSpec
 	 * disable order is the reverse of enable.
@@ -3103,16 +3103,16 @@ intel_gen9_sysctl_wrpll_disable(SYSCTL_HANDLER_ARGS)
 	device_printf(sc->dev,
 	    "wrpll DPLL%u: disable, ENABLE_REG 0x%08x -> 0x%08x -> 0x%08x\n",
 	    id, en, after_en, after_pe);
-	intel_gen9_w32(sc, enreg, after_en);
+	igen9_w32(sc, enreg, after_en);
 	DELAY(10);
-	intel_gen9_w32(sc, enreg, after_pe);
+	igen9_w32(sc, enreg, after_pe);
 	return (0);
 }
 
 static int
-intel_gen9_sysctl_wrpll_route(SYSCTL_HANDLER_ARGS)
+igen9_sysctl_wrpll_route(SYSCTL_HANDLER_ARGS)
 {
-	struct intel_gen9_softc *sc = arg1;
+	struct igen9_softc *sc = arg1;
 	uint32_t id, port, ctrl2, new_ctrl2, enreg, en;
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
@@ -3135,7 +3135,7 @@ intel_gen9_sysctl_wrpll_route(SYSCTL_HANDLER_ARGS)
 
 	/* Refuse if the PLL isn't locked. */
 	enreg = WRPLL_ENABLE_REG(id);
-	en = intel_gen9_r32(sc, enreg);
+	en = igen9_r32(sc, enreg);
 	if (!(en & WRPLL_LOCK_BIT)) {
 		device_printf(sc->dev,
 		    "wrpll_route: DPLL%u not locked (ENABLE_REG=0x%08x);"
@@ -3143,7 +3143,7 @@ intel_gen9_sysctl_wrpll_route(SYSCTL_HANDLER_ARGS)
 		return (EAGAIN);
 	}
 
-	ctrl2 = intel_gen9_r32(sc, DPLL_CTRL2);
+	ctrl2 = igen9_r32(sc, DPLL_CTRL2);
 	new_ctrl2 = ctrl2;
 	new_ctrl2 &= ~CTRL2_DDI_SEL_MASK(port);
 	new_ctrl2 |= CTRL2_DDI_SEL(id, port);
@@ -3153,10 +3153,10 @@ intel_gen9_sysctl_wrpll_route(SYSCTL_HANDLER_ARGS)
 	device_printf(sc->dev,
 	    "wrpll_route: DDI_%c -> DPLL%u  CTRL2 0x%08x -> 0x%08x\n",
 	    'A' + port, id, ctrl2, new_ctrl2);
-	intel_gen9_w32(sc, DPLL_CTRL2, new_ctrl2);
+	igen9_w32(sc, DPLL_CTRL2, new_ctrl2);
 
 	/* Read-back. */
-	uint32_t back = intel_gen9_r32(sc, DPLL_CTRL2);
+	uint32_t back = igen9_r32(sc, DPLL_CTRL2);
 	uint32_t off  = (back >> (15 + port)) & 1;
 	uint32_t sel  = (back >> (1 + port * 3)) & 0x3;
 	uint32_t ovr  = (back >> (port * 3)) & 1;
@@ -3168,9 +3168,9 @@ intel_gen9_sysctl_wrpll_route(SYSCTL_HANDLER_ARGS)
 }
 
 static int
-intel_gen9_sysctl_wrpll_force_clear(SYSCTL_HANDLER_ARGS)
+igen9_sysctl_wrpll_force_clear(SYSCTL_HANDLER_ARGS)
 {
-	struct intel_gen9_softc *sc = arg1;
+	struct igen9_softc *sc = arg1;
 	uint32_t id, enreg, en;
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
@@ -3185,19 +3185,19 @@ intel_gen9_sysctl_wrpll_force_clear(SYSCTL_HANDLER_ARGS)
 		return (EINVAL);
 	}
 	enreg = WRPLL_ENABLE_REG(id);
-	en = intel_gen9_r32(sc, enreg);
+	en = igen9_r32(sc, enreg);
 	uint32_t cleared = en & ~(WRPLL_ENABLE_BIT | WRPLL_POWER_ENABLE_BIT);
 	device_printf(sc->dev,
 	    "wrpll_force_clear DPLL%u: ENABLE_REG 0x%08x -> 0x%08x"
 	    " (ENABLE+POWER_ENABLE cleared)\n", id, en, cleared);
-	intel_gen9_w32(sc, enreg, cleared);
+	igen9_w32(sc, enreg, cleared);
 	return (0);
 }
 
 static int
-intel_gen9_sysctl_wrpll_unroute(SYSCTL_HANDLER_ARGS)
+igen9_sysctl_wrpll_unroute(SYSCTL_HANDLER_ARGS)
 {
-	struct intel_gen9_softc *sc = arg1;
+	struct igen9_softc *sc = arg1;
 	uint32_t port, ctrl2, new_ctrl2;
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
@@ -3218,12 +3218,12 @@ intel_gen9_sysctl_wrpll_unroute(SYSCTL_HANDLER_ARGS)
 		    " firmware-driven mode\n");
 		return (EBUSY);
 	}
-	ctrl2 = intel_gen9_r32(sc, DPLL_CTRL2);
+	ctrl2 = igen9_r32(sc, DPLL_CTRL2);
 	new_ctrl2 = ctrl2 | CTRL2_DDI_OFF(port);
 	device_printf(sc->dev,
 	    "wrpll_unroute: DDI_%c  CTRL2 0x%08x -> 0x%08x\n",
 	    'A' + port, ctrl2, new_ctrl2);
-	intel_gen9_w32(sc, DPLL_CTRL2, new_ctrl2);
+	igen9_w32(sc, DPLL_CTRL2, new_ctrl2);
 	return (0);
 }
 
@@ -3299,9 +3299,9 @@ static const uint32_t skl_hdmi_ddi_trans[10][2] = {
 };
 
 static int
-intel_gen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS)
+igen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS)
 {
-	struct intel_gen9_softc *sc = arg1;
+	struct igen9_softc *sc = arg1;
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
 
@@ -3313,11 +3313,11 @@ intel_gen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS)
 	 *    these the pipe/DDI register writes hit a powered-off domain and
 	 *    silently get dropped on retain.
 	 */
-	uint32_t pwr = intel_gen9_r32(sc, HSW_PWR_WELL_CTL2);
+	uint32_t pwr = igen9_r32(sc, HSW_PWR_WELL_CTL2);
 	uint32_t want = PWR_WELL_REQ(PW_IDX_PW2) | PWR_WELL_REQ(PW_IDX_DDI_B);
-	intel_gen9_w32(sc, HSW_PWR_WELL_CTL2, pwr | want);
+	igen9_w32(sc, HSW_PWR_WELL_CTL2, pwr | want);
 	for (int spin = 0; spin < 100; spin++) {
-		uint32_t s = intel_gen9_r32(sc, HSW_PWR_WELL_CTL2);
+		uint32_t s = igen9_r32(sc, HSW_PWR_WELL_CTL2);
 		uint32_t need = PWR_WELL_STATE(PW_IDX_PW2) |
 		    PWR_WELL_STATE(PW_IDX_DDI_B);
 		if ((s & need) == need) {
@@ -3342,7 +3342,7 @@ intel_gen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS)
 	 *   5. Set ENABLE
 	 *   6. Poll LOCK (BSpec says <5 ms)
 	 */
-	uint32_t lcpll2 = intel_gen9_r32(sc, SKL_DPLL1_ENABLE);
+	uint32_t lcpll2 = igen9_r32(sc, SKL_DPLL1_ENABLE);
 	/*
 	 * Diagnostic: dump all 4 SKL DPLLs so we can see which one
 	 * firmware actually uses for the live HDMI scanout.  DPLL1
@@ -3357,14 +3357,14 @@ intel_gen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS)
 		uint32_t off = (id == 0) ? 0x46010 :
 		    (id == 1) ? 0x46014 :
 		    (id == 2) ? 0x46040 : 0x46060;
-		uint32_t v = intel_gen9_r32(sc, off);
+		uint32_t v = igen9_r32(sc, off);
 		device_printf(sc->dev,
 		    "resume: DPLL%d @0x%05x = 0x%08x  (ENABLE=%d LOCK=%d)\n",
 		    id, off, v,
 		    (v & DPLL_ENABLE_BIT) ? 1 : 0,
 		    (v & DPLL_LOCK_BIT) ? 1 : 0);
 	}
-	uint32_t ctrl2 = intel_gen9_r32(sc, DPLL_CTRL2);
+	uint32_t ctrl2 = igen9_r32(sc, DPLL_CTRL2);
 	for (int port = 0; port < 5; port++) {
 		uint32_t sel = (ctrl2 >> (port * 3 + 1)) & 0x3;
 		bool off_bit = (ctrl2 >> (port + 15)) & 0x1;
@@ -3372,8 +3372,8 @@ intel_gen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS)
 		    "resume: DDI_%c clk_sel=DPLL%u  clk_off=%d\n",
 		    'A' + port, sel, off_bit ? 1 : 0);
 	}
-	intel_gen9_w32(sc, SKL_DPLL1_ENABLE, lcpll2 & ~DPLL_ENABLE_BIT);
-	(void)intel_gen9_r32(sc, SKL_DPLL1_ENABLE);
+	igen9_w32(sc, SKL_DPLL1_ENABLE, lcpll2 & ~DPLL_ENABLE_BIT);
+	(void)igen9_r32(sc, SKL_DPLL1_ENABLE);
 
 	/*
 	 * DPLL_CTRL1 (0x6c058) is six bits per DPLL.  For DPLL_n the
@@ -3390,23 +3390,23 @@ intel_gen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS)
 	 */
 #define	SKL_DPLL_CTRL1_OVERRIDE(id)	(1u << ((id) * 6))
 #define	SKL_DPLL_CTRL1_HDMI_MODE(id)	(1u << ((id) * 6 + 1))
-	uint32_t ctrl1 = intel_gen9_r32(sc, DPLL_CTRL1);
-	intel_gen9_w32(sc, DPLL_CTRL1,
+	uint32_t ctrl1 = igen9_r32(sc, DPLL_CTRL1);
+	igen9_w32(sc, DPLL_CTRL1,
 	    ctrl1 | SKL_DPLL_CTRL1_OVERRIDE(1) | SKL_DPLL_CTRL1_HDMI_MODE(1));
 	device_printf(sc->dev,
 	    "resume: DPLL_CTRL1 0x%08x -> 0x%08x (DPLL1 HDMI_MODE + OVERRIDE)\n",
-	    ctrl1, intel_gen9_r32(sc, DPLL_CTRL1));
+	    ctrl1, igen9_r32(sc, DPLL_CTRL1));
 
 	/* CFGCR1/2 — firmware-tuned for 148.5 MHz HDMI. */
-	intel_gen9_w32(sc, 0x6c040, 0x80400173);
-	intel_gen9_w32(sc, 0x6c044, 0x000003a5);
-	(void)intel_gen9_r32(sc, 0x6c044);	/* posting */
+	igen9_w32(sc, 0x6c040, 0x80400173);
+	igen9_w32(sc, 0x6c044, 0x000003a5);
+	(void)igen9_r32(sc, 0x6c044);	/* posting */
 
-	intel_gen9_w32(sc, SKL_DPLL1_ENABLE,
-	    intel_gen9_r32(sc, SKL_DPLL1_ENABLE) | DPLL_ENABLE_BIT);
+	igen9_w32(sc, SKL_DPLL1_ENABLE,
+	    igen9_r32(sc, SKL_DPLL1_ENABLE) | DPLL_ENABLE_BIT);
 	bool locked = false;
 	for (int spin = 0; spin < 50; spin++) {
-		uint32_t v = intel_gen9_r32(sc, SKL_DPLL1_ENABLE);
+		uint32_t v = igen9_r32(sc, SKL_DPLL1_ENABLE);
 		if (v & DPLL_LOCK_BIT) {
 			device_printf(sc->dev,
 			    "resume: DPLL1 LOCK after %d * 100us (LCPLL2=0x%08x)\n",
@@ -3419,39 +3419,39 @@ intel_gen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS)
 	if (!locked)
 		device_printf(sc->dev,
 		    "resume: DPLL1 NOT LOCKED  (LCPLL2_CTL=0x%08x)\n",
-		    intel_gen9_r32(sc, SKL_DPLL1_ENABLE));
+		    igen9_r32(sc, SKL_DPLL1_ENABLE));
 
 	/* 1) Enable DDI_B port clock: clear CLOCK_OFF bit in DPLL_CTRL2. */
-	uint32_t dpll2 = intel_gen9_r32(sc, DPLL_CTRL2);
-	intel_gen9_w32(sc, DPLL_CTRL2, dpll2 & ~DPLL_CTRL2_DDI_B_OFF);
+	uint32_t dpll2 = igen9_r32(sc, DPLL_CTRL2);
+	igen9_w32(sc, DPLL_CTRL2, dpll2 & ~DPLL_CTRL2_DDI_B_OFF);
 	device_printf(sc->dev,
 	    "resume: DPLL_CTRL2 0x%08x -> 0x%08x (DDI_B clock on)\n",
 	    dpll2, dpll2 & ~DPLL_CTRL2_DDI_B_OFF);
 
 	/* 2) Transcoder A timing — BASELINE values for 1920x1080@60. */
-	intel_gen9_w32(sc, TRANS_HTOTAL(0), 0x0897077f);
-	intel_gen9_w32(sc, TRANS_HBLANK(0), 0x0897077f);
-	intel_gen9_w32(sc, TRANS_HSYNC(0),  0x080307d7);
-	intel_gen9_w32(sc, TRANS_VTOTAL(0), 0x04640437);
-	intel_gen9_w32(sc, TRANS_VBLANK(0), 0x04640437);
-	intel_gen9_w32(sc, TRANS_VSYNC(0),  0x043e0439);
-	intel_gen9_w32(sc, PIPE_SRCSZ(0),   ((uint32_t)1919 << 16) | 1079);
+	igen9_w32(sc, TRANS_HTOTAL(0), 0x0897077f);
+	igen9_w32(sc, TRANS_HBLANK(0), 0x0897077f);
+	igen9_w32(sc, TRANS_HSYNC(0),  0x080307d7);
+	igen9_w32(sc, TRANS_VTOTAL(0), 0x04640437);
+	igen9_w32(sc, TRANS_VBLANK(0), 0x04640437);
+	igen9_w32(sc, TRANS_VSYNC(0),  0x043e0439);
+	igen9_w32(sc, PIPE_SRCSZ(0),   ((uint32_t)1919 << 16) | 1079);
 
 	/* 3) Route transcoder A to DDI_B in HDMI mode (BASELINE value). */
-	intel_gen9_w32(sc, TRANS_DDI_FUNC_CTL(0), 0x90030000);
+	igen9_w32(sc, TRANS_DDI_FUNC_CTL(0), 0x90030000);
 
 	/* 4) Enable Pipe A. */
-	intel_gen9_w32(sc, PIPE_CONF(0), PIPE_CONF_ENABLE);
+	igen9_w32(sc, PIPE_CONF(0), PIPE_CONF_ENABLE);
 	DELAY(100);
-	uint32_t pconf = intel_gen9_r32(sc, PIPE_CONF(0));
+	uint32_t pconf = igen9_r32(sc, PIPE_CONF(0));
 	device_printf(sc->dev, "resume: PIPE_CONF=0x%08x\n", pconf);
 
 	/* 5) Primary plane: XRGB8888 linear, 1920x1080, stride 7680, surf=0. */
-	intel_gen9_w32(sc, PLANE_STRIDE(0), 7680 / 64);
-	intel_gen9_w32(sc, PLANE_SIZE(0),
+	igen9_w32(sc, PLANE_STRIDE(0), 7680 / 64);
+	igen9_w32(sc, PLANE_SIZE(0),
 	    ((uint32_t)1079 << 16) | 1919);
-	intel_gen9_w32(sc, PLANE_SURF(0), 0);
-	intel_gen9_w32(sc, PLANE_CTL(0),
+	igen9_w32(sc, PLANE_SURF(0), 0);
+	igen9_w32(sc, PLANE_CTL(0),
 	    PLANE_CTL_ENABLE | (0x4 << PLANE_CTL_FORMAT_SHIFT));
 
 	/*
@@ -3463,12 +3463,12 @@ intel_gen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS)
 	 *    "display present" gate.  ENABLE goes last.
 	 */
 	for (int i = 0; i < 10; i++) {
-		intel_gen9_w32(sc, DDI_BUF_TRANS_LO(1, i),
+		igen9_w32(sc, DDI_BUF_TRANS_LO(1, i),
 		    skl_hdmi_ddi_trans[i][0]);
-		intel_gen9_w32(sc, DDI_BUF_TRANS_HI(1, i),
+		igen9_w32(sc, DDI_BUF_TRANS_HI(1, i),
 		    skl_hdmi_ddi_trans[i][1]);
 	}
-	intel_gen9_w32(sc, DDI_BUF_CTL(1),
+	igen9_w32(sc, DDI_BUF_CTL(1),
 	    DDI_BUF_CTL_ENABLE_BIT |
 	    (8u << DDI_BUF_CTL_TRANS_SELECT_SHIFT) |
 	    DDI_BUF_CTL_PORT_WIDTH_X4 |
@@ -3476,7 +3476,7 @@ intel_gen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS)
 
 	/* Poll IDLE_STATUS to clear; BSpec says < 600 us. */
 	for (int spin = 0; spin < 200; spin++) {
-		uint32_t bc = intel_gen9_r32(sc, DDI_BUF_CTL(1));
+		uint32_t bc = igen9_r32(sc, DDI_BUF_CTL(1));
 		if ((bc & DDI_BUF_CTL_IDLE_STATUS) == 0) {
 			device_printf(sc->dev,
 			    "resume: DDI_B left IDLE after %d us\n",
@@ -3489,12 +3489,12 @@ intel_gen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS)
 	DELAY(20000);	/* ~20 ms for HW to stabilise */
 	device_printf(sc->dev,
 	    "resume: PIPE_CONF=0x%08x  PLANE_CTL=0x%08x  DDI_BUF_B=0x%08x\n",
-	    intel_gen9_r32(sc, PIPE_CONF(0)),
-	    intel_gen9_r32(sc, PLANE_CTL(0)),
-	    intel_gen9_r32(sc, DDI_BUF_CTL(1)));
-	uint32_t fc1 = intel_gen9_r32(sc, PIPE_FRMCOUNT(0));
+	    igen9_r32(sc, PIPE_CONF(0)),
+	    igen9_r32(sc, PLANE_CTL(0)),
+	    igen9_r32(sc, DDI_BUF_CTL(1)));
+	uint32_t fc1 = igen9_r32(sc, PIPE_FRMCOUNT(0));
 	pause("gen9rsm", hz / 4);
-	uint32_t fc2 = intel_gen9_r32(sc, PIPE_FRMCOUNT(0));
+	uint32_t fc2 = igen9_r32(sc, PIPE_FRMCOUNT(0));
 	device_printf(sc->dev,
 	    "resume: FRMCOUNT delta over 250 ms = %u (expect ~15 if 60 Hz)\n",
 	    fc2 - fc1);
@@ -3510,11 +3510,11 @@ intel_gen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS)
  * atomic_commit.
  */
 static void
-intel_gen9_wait_vblank(struct intel_gen9_softc *sc, int pipe)
+igen9_wait_vblank(struct igen9_softc *sc, int pipe)
 {
-	uint32_t start = intel_gen9_r32(sc, PIPE_FRMCOUNT(pipe));
+	uint32_t start = igen9_r32(sc, PIPE_FRMCOUNT(pipe));
 	for (int spin = 0; spin < 50; spin++) {
-		if (intel_gen9_r32(sc, PIPE_FRMCOUNT(pipe)) != start)
+		if (igen9_r32(sc, PIPE_FRMCOUNT(pipe)) != start)
 			return;
 		pause("gen9vbl", hz / 1000);
 	}
@@ -3557,44 +3557,44 @@ intel_gen9_wait_vblank(struct intel_gen9_softc *sc, int pipe)
 #define	GEN8_PIPE_VBLANK		(1u << 0)
 
 static void
-intel_gen9_irq_handler(void *arg)
+igen9_irq_handler(void *arg)
 {
-	struct intel_gen9_softc *sc = arg;
+	struct igen9_softc *sc = arg;
 	uint32_t master, master_w;
 
-	master = intel_gen9_r32(sc, GEN8_MASTER_IRQ);
+	master = igen9_r32(sc, GEN8_MASTER_IRQ);
 	if ((master & GEN8_MASTER_IRQ_CONTROL) == 0)
 		return;
 	/* Disable master while servicing; re-enable at end. */
 	master_w = master & ~GEN8_MASTER_IRQ_CONTROL;
-	intel_gen9_w32(sc, GEN8_MASTER_IRQ, master_w);
+	igen9_w32(sc, GEN8_MASTER_IRQ, master_w);
 
 	sc->irq_total_count++;
 	bool pipe_a_vblank = false;
 	if (master & GEN8_DE_PIPE_A_IRQ) {
-		uint32_t iir = intel_gen9_r32(sc, GEN8_DE_PIPE_IIR(0));
+		uint32_t iir = igen9_r32(sc, GEN8_DE_PIPE_IIR(0));
 		if (iir & GEN8_PIPE_VBLANK) {
 			sc->vblank_count_pipe_a++;
 			pipe_a_vblank = true;
 		}
-		intel_gen9_w32(sc, GEN8_DE_PIPE_IIR(0), iir);
+		igen9_w32(sc, GEN8_DE_PIPE_IIR(0), iir);
 	}
 	if (master & GEN8_DE_PIPE_B_IRQ) {
-		uint32_t iir = intel_gen9_r32(sc, GEN8_DE_PIPE_IIR(1));
+		uint32_t iir = igen9_r32(sc, GEN8_DE_PIPE_IIR(1));
 		if (iir & GEN8_PIPE_VBLANK)
 			sc->vblank_count_pipe_b++;
-		intel_gen9_w32(sc, GEN8_DE_PIPE_IIR(1), iir);
+		igen9_w32(sc, GEN8_DE_PIPE_IIR(1), iir);
 	}
 	if (master & GEN8_DE_PIPE_C_IRQ) {
-		uint32_t iir = intel_gen9_r32(sc, GEN8_DE_PIPE_IIR(2));
+		uint32_t iir = igen9_r32(sc, GEN8_DE_PIPE_IIR(2));
 		if (iir & GEN8_PIPE_VBLANK)
 			sc->vblank_count_pipe_c++;
-		intel_gen9_w32(sc, GEN8_DE_PIPE_IIR(2), iir);
+		igen9_w32(sc, GEN8_DE_PIPE_IIR(2), iir);
 	}
 
-	intel_gen9_w32(sc, GEN8_MASTER_IRQ,
+	igen9_w32(sc, GEN8_MASTER_IRQ,
 	    master_w | GEN8_MASTER_IRQ_CONTROL);
-	(void)intel_gen9_r32(sc, GEN8_MASTER_IRQ);	/* posting flush */
+	(void)igen9_r32(sc, GEN8_MASTER_IRQ);	/* posting flush */
 
 	/*
 	 * Deliver to framework AFTER re-enabling master: kms_vblank_handler
@@ -3607,7 +3607,7 @@ intel_gen9_irq_handler(void *arg)
 }
 
 static int
-intel_gen9_irq_setup(struct intel_gen9_softc *sc)
+igen9_irq_setup(struct igen9_softc *sc)
 {
 	int msi_count = 1;
 	int error;
@@ -3617,13 +3617,13 @@ intel_gen9_irq_setup(struct intel_gen9_softc *sc)
 	 * Pipes B/C stay fully off (no scanout there); Pipe A gets the
 	 * vblank source unmasked + enabled after MSI is hooked.
 	 */
-	intel_gen9_w32(sc, GEN8_MASTER_IRQ, 0);
+	igen9_w32(sc, GEN8_MASTER_IRQ, 0);
 	for (int p = 0; p < 3; p++) {
-		intel_gen9_w32(sc, GEN8_DE_PIPE_IMR(p), 0xffffffff);
-		intel_gen9_w32(sc, GEN8_DE_PIPE_IER(p), 0);
-		intel_gen9_w32(sc, GEN8_DE_PIPE_IIR(p), 0xffffffff);
+		igen9_w32(sc, GEN8_DE_PIPE_IMR(p), 0xffffffff);
+		igen9_w32(sc, GEN8_DE_PIPE_IER(p), 0);
+		igen9_w32(sc, GEN8_DE_PIPE_IIR(p), 0xffffffff);
 	}
-	(void)intel_gen9_r32(sc, GEN8_MASTER_IRQ);
+	(void)igen9_r32(sc, GEN8_MASTER_IRQ);
 
 	if (pci_alloc_msi(sc->dev, &msi_count) != 0 || msi_count < 1) {
 		device_printf(sc->dev, "MSI alloc failed; falling back to INTx\n");
@@ -3640,7 +3640,7 @@ intel_gen9_irq_setup(struct intel_gen9_softc *sc)
 		return (ENXIO);
 	}
 	error = bus_setup_intr(sc->dev, sc->irq_res,
-	    INTR_TYPE_MISC | INTR_MPSAFE, NULL, intel_gen9_irq_handler, sc,
+	    INTR_TYPE_MISC | INTR_MPSAFE, NULL, igen9_irq_handler, sc,
 	    &sc->irq_cookie);
 	if (error != 0) {
 		device_printf(sc->dev, "bus_setup_intr: %d\n", error);
@@ -3656,27 +3656,27 @@ intel_gen9_irq_setup(struct intel_gen9_softc *sc)
 	 * Arm Pipe A vblank only (the firmware-active pipe).  B/C remain
 	 * fully masked.  Master IRQ_CONTROL turns the whole tree on last.
 	 */
-	intel_gen9_w32(sc, GEN8_DE_PIPE_IIR(0), 0xffffffff);
-	intel_gen9_w32(sc, GEN8_DE_PIPE_IMR(0), ~GEN8_PIPE_VBLANK);
-	intel_gen9_w32(sc, GEN8_DE_PIPE_IER(0), GEN8_PIPE_VBLANK);
-	intel_gen9_w32(sc, GEN8_MASTER_IRQ,
+	igen9_w32(sc, GEN8_DE_PIPE_IIR(0), 0xffffffff);
+	igen9_w32(sc, GEN8_DE_PIPE_IMR(0), ~GEN8_PIPE_VBLANK);
+	igen9_w32(sc, GEN8_DE_PIPE_IER(0), GEN8_PIPE_VBLANK);
+	igen9_w32(sc, GEN8_MASTER_IRQ,
 	    GEN8_MASTER_IRQ_CONTROL | GEN8_DE_PIPE_A_IRQ);
-	(void)intel_gen9_r32(sc, GEN8_MASTER_IRQ);
+	(void)igen9_r32(sc, GEN8_MASTER_IRQ);
 	DPRINTF(sc, 0, "irq: MSI armed, Pipe A vblank enabled\n");
 	return (0);
 }
 
 static void
-intel_gen9_irq_teardown(struct intel_gen9_softc *sc)
+igen9_irq_teardown(struct igen9_softc *sc)
 {
 	if (sc->irq_res == NULL)
 		return;
 	/* Master off, per-pipe banks masked + cleared. */
-	intel_gen9_w32(sc, GEN8_MASTER_IRQ, 0);
+	igen9_w32(sc, GEN8_MASTER_IRQ, 0);
 	for (int p = 0; p < 3; p++) {
-		intel_gen9_w32(sc, GEN8_DE_PIPE_IMR(p), 0xffffffff);
-		intel_gen9_w32(sc, GEN8_DE_PIPE_IER(p), 0);
-		intel_gen9_w32(sc, GEN8_DE_PIPE_IIR(p), 0xffffffff);
+		igen9_w32(sc, GEN8_DE_PIPE_IMR(p), 0xffffffff);
+		igen9_w32(sc, GEN8_DE_PIPE_IER(p), 0);
+		igen9_w32(sc, GEN8_DE_PIPE_IIR(p), 0xffffffff);
 	}
 
 	bus_teardown_intr(sc->dev, sc->irq_res, sc->irq_cookie);
@@ -3688,8 +3688,8 @@ intel_gen9_irq_teardown(struct intel_gen9_softc *sc)
 
 /* ----------------------------- driver glue -------------------------------- */
 
-static const struct drm_driver intel_gen9_driver = {
-	.name		= "intel_gen9",
+static const struct drm_driver igen9_driver = {
+	.name		= "igen9",
 	.desc		= "Intel Gen9 iGPU (kms framework)",
 	.date		= "20260613",
 	.major		= 0,
@@ -3697,18 +3697,18 @@ static const struct drm_driver intel_gen9_driver = {
 	.patchlevel	= 0,
 };
 
-static const struct drm_crtc_funcs intel_gen9_crtc_funcs = { 0 };
-static const struct drm_plane_funcs intel_gen9_plane_funcs = { 0 };
-static const struct drm_encoder_funcs intel_gen9_encoder_funcs = { 0 };
-static const struct drm_connector_funcs intel_gen9_connector_funcs = { 0 };
+static const struct drm_crtc_funcs igen9_crtc_funcs = { 0 };
+static const struct drm_plane_funcs igen9_plane_funcs = { 0 };
+static const struct drm_encoder_funcs igen9_encoder_funcs = { 0 };
+static const struct drm_connector_funcs igen9_connector_funcs = { 0 };
 
-static void intel_gen9_owned_fb_destroy(struct drm_framebuffer *fb) { (void)fb; }
+static void igen9_owned_fb_destroy(struct drm_framebuffer *fb) { (void)fb; }
 
-static const struct drm_framebuffer_funcs intel_gen9_owned_fb_funcs = {
-	.destroy = intel_gen9_owned_fb_destroy,
+static const struct drm_framebuffer_funcs igen9_owned_fb_funcs = {
+	.destroy = igen9_owned_fb_destroy,
 };
 
-static const uint32_t intel_gen9_plane_formats[] = {
+static const uint32_t igen9_plane_formats[] = {
 	0x34325258,	/* 'XR24' = DRM_FORMAT_XRGB8888 */
 };
 
@@ -3718,7 +3718,7 @@ static const uint32_t intel_gen9_plane_formats[] = {
  * once the display engine bring-up code is written.
  */
 static int
-intel_gen9_atomic_check(struct drm_device *dev __unused,
+igen9_atomic_check(struct drm_device *dev __unused,
     struct drm_atomic_state *state __unused)
 {
 	return (0);
@@ -3733,10 +3733,10 @@ intel_gen9_atomic_check(struct drm_device *dev __unused,
  * and decline mismatches rather than half-program them.
  */
 static int
-intel_gen9_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
+igen9_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
     bool nonblock __unused)
 {
-	struct intel_gen9_softc *sc = dev->driver_priv;
+	struct igen9_softc *sc = dev->driver_priv;
 
 	for (uint32_t i = 0; i < state->num_crtc; i++) {
 		struct drm_crtc_state *cs = state->crtc_states[i];
@@ -3750,7 +3750,7 @@ intel_gen9_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 			    "atomic_commit: pipe %u off-request (no-op)\n", i);
 			continue;
 		}
-		intel_gen9_read_pipe_mode(sc, 0, &live);
+		igen9_read_pipe_mode(sc, 0, &live);
 		if (cs->mode.hdisplay != live.hdisplay ||
 		    cs->mode.vdisplay != live.vdisplay ||
 		    cs->mode.htotal != live.htotal ||
@@ -3783,15 +3783,15 @@ intel_gen9_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 		if (ps == NULL || ps->plane != &sc->primary)
 			continue;
 
-		if (ps->fb != NULL && ps->fb->funcs == &intel_gen9_owned_fb_funcs) {
-			struct intel_gen9_owned_fb *ofb = __containerof(
-			    ps->fb, struct intel_gen9_owned_fb, base);
+		if (ps->fb != NULL && ps->fb->funcs == &igen9_owned_fb_funcs) {
+			struct igen9_owned_fb *ofb = __containerof(
+			    ps->fb, struct igen9_owned_fb, base);
 			uint32_t new_surf = ofb->test_fb->gtt_first_idx *
 			    PAGE_SIZE;
 			if (!sc->scanout_held)
 				sc->scanout_prev_surf =
-				    intel_gen9_r32(sc, PLANE_SURF(0));
-			intel_gen9_w32(sc, PLANE_SURF(0), new_surf);
+				    igen9_r32(sc, PLANE_SURF(0));
+			igen9_w32(sc, PLANE_SURF(0), new_surf);
 			sc->scanout_held = true;
 			DPRINTF(sc, 1,
 			    "atomic_commit: plane FB_ID %u -> PLANE_SURF=0x%08x\n",
@@ -3806,7 +3806,7 @@ intel_gen9_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 			 * latches the new SURF -- eliminates partial-frame
 			 * tearing on the page-flip path.
 			 */
-			uint32_t new_surf = intel_gen9_gtt_bind_user_fb(sc,
+			uint32_t new_surf = igen9_gtt_bind_user_fb(sc,
 			    ps->fb);
 			if (new_surf == 0) {
 				device_printf(sc->dev,
@@ -3816,12 +3816,12 @@ intel_gen9_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 			}
 			if (!sc->scanout_held)
 				sc->scanout_prev_surf =
-				    intel_gen9_r32(sc, PLANE_SURF(0));
-			intel_gen9_wait_vblank(sc, 0);
-			intel_gen9_w32(sc, PLANE_SURF(0), new_surf);
+				    igen9_r32(sc, PLANE_SURF(0));
+			igen9_wait_vblank(sc, 0);
+			igen9_w32(sc, PLANE_SURF(0), new_surf);
 			sc->scanout_held = true;
 		} else if (ps->fb == NULL && sc->scanout_held) {
-			intel_gen9_w32(sc, PLANE_SURF(0), sc->scanout_prev_surf);
+			igen9_w32(sc, PLANE_SURF(0), sc->scanout_prev_surf);
 			sc->scanout_held = false;
 			DPRINTF(sc, 1,
 			    "atomic_commit: plane fb=NULL -> PLANE_SURF"
@@ -3831,13 +3831,13 @@ intel_gen9_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 	return (0);
 }
 
-static const struct drm_mode_config_funcs intel_gen9_mode_config_funcs = {
-	.atomic_check  = intel_gen9_atomic_check,
-	.atomic_commit = intel_gen9_atomic_commit,
+static const struct drm_mode_config_funcs igen9_mode_config_funcs = {
+	.atomic_check  = igen9_atomic_check,
+	.atomic_commit = igen9_atomic_commit,
 };
 
 static int
-intel_gen9_probe(device_t dev)
+igen9_probe(device_t dev)
 {
 	uint16_t vid = pci_get_vendor(dev);
 	uint16_t did = pci_get_device(dev);
@@ -3845,9 +3845,9 @@ intel_gen9_probe(device_t dev)
 
 	if (vid != INTEL_PCI_VENDOR)
 		return (ENXIO);
-	for (i = 0; i < nitems(intel_gen9_ids); i++) {
-		if (intel_gen9_ids[i].id == did) {
-			device_set_desc(dev, intel_gen9_ids[i].desc);
+	for (i = 0; i < nitems(igen9_ids); i++) {
+		if (igen9_ids[i].id == did) {
+			device_set_desc(dev, igen9_ids[i].desc);
 			return (BUS_PROBE_DEFAULT);
 		}
 	}
@@ -3855,9 +3855,9 @@ intel_gen9_probe(device_t dev)
 }
 
 static int
-intel_gen9_attach(device_t dev)
+igen9_attach(device_t dev)
 {
-	struct intel_gen9_softc *sc = device_get_softc(dev);
+	struct igen9_softc *sc = device_get_softc(dev);
 	int error;
 
 	sc->dev = dev;
@@ -3896,7 +3896,7 @@ intel_gen9_attach(device_t dev)
 	 * land can already do GET_VERSION / GET_UNIQUE / GET_CAP against
 	 * us — there's just nothing visible on the connectors yet.
 	 */
-	error = kms_dev_register(&intel_gen9_driver, sc, &sc->drm_dev);
+	error = kms_dev_register(&igen9_driver, sc, &sc->drm_dev);
 	if (error != 0) {
 		device_printf(dev, "kms_dev_register: %d\n", error);
 		bus_release_resource(dev, SYS_RES_MEMORY, sc->gmadr_rid,
@@ -3907,7 +3907,7 @@ intel_gen9_attach(device_t dev)
 	}
 
 	/* Install atomic hooks before any object becomes reachable. */
-	sc->drm_dev->mode_config.funcs = &intel_gen9_mode_config_funcs;
+	sc->drm_dev->mode_config.funcs = &igen9_mode_config_funcs;
 
 	/*
 	 * RE scaffold: live MMIO snapshot/diff/poke/bit-scan via sysctl.
@@ -3916,8 +3916,8 @@ intel_gen9_attach(device_t dev)
 	 * firmware / loader / previous driver left behind, then watch what
 	 * each write actually does.
 	 */
-	intel_gen9_re_sysctls_init(sc);
-	intel_gen9_snapshot_save(sc);
+	igen9_re_sysctls_init(sc);
+	igen9_snapshot_save(sc);
 
 	/*
 	 * Single stub of each KMS object so GETRESOURCES returns non-empty
@@ -3925,18 +3925,18 @@ intel_gen9_attach(device_t dev)
 	 * topology (one CRTC per pipe, encoders per DDI, connectors per
 	 * physical port) lands once the display engine is decoded.
 	 */
-	error = kms_crtc_init(sc->drm_dev, &sc->crtc, &intel_gen9_crtc_funcs);
+	error = kms_crtc_init(sc->drm_dev, &sc->crtc, &igen9_crtc_funcs);
 	if (error == 0)
 		error = kms_plane_init(sc->drm_dev, &sc->primary,
-		    &intel_gen9_plane_funcs, DRM_PLANE_TYPE_PRIMARY,
-		    1u, intel_gen9_plane_formats,
-		    nitems(intel_gen9_plane_formats));
+		    &igen9_plane_funcs, DRM_PLANE_TYPE_PRIMARY,
+		    1u, igen9_plane_formats,
+		    nitems(igen9_plane_formats));
 	if (error == 0)
 		error = kms_encoder_init(sc->drm_dev, &sc->encoder,
-		    &intel_gen9_encoder_funcs, DRM_MODE_ENCODER_DAC);
+		    &igen9_encoder_funcs, DRM_MODE_ENCODER_DAC);
 	if (error == 0)
 		error = kms_connector_init(sc->drm_dev, &sc->connector,
-		    &intel_gen9_connector_funcs,
+		    &igen9_connector_funcs,
 		    DRM_MODE_CONNECTOR_HDMIA);
 	if (error != 0)
 		device_printf(dev, "topology init: %d (will appear with"
@@ -3944,9 +3944,9 @@ intel_gen9_attach(device_t dev)
 
 	/*
 	 * IRQ — MSI + Pipe A vblank.  Non-fatal; falling back to polled
-	 * vblank still works (intel_gen9_wait_vblank reads PIPE_FRMCOUNT).
+	 * vblank still works (igen9_wait_vblank reads PIPE_FRMCOUNT).
 	 */
-	(void)intel_gen9_irq_setup(sc);
+	(void)igen9_irq_setup(sc);
 
 	/*
 	 * Best-effort EDID-on-attach: try to fetch the DDI_B EDID via GMBus
@@ -3954,7 +3954,7 @@ intel_gen9_attach(device_t dev)
 	 * connector in UNKNOWN with no modes — userspace GETCONNECTOR still
 	 * works, it just sees a connector with no detected sink.
 	 */
-	(void)intel_gen9_attach_edid_modes(sc);
+	(void)igen9_attach_edid_modes(sc);
 
 	device_printf(dev, "attached: PCI 8086:%04x as /dev/dri/card%d\n",
 	    sc->pci_id, sc->drm_dev->minor);
@@ -3962,34 +3962,34 @@ intel_gen9_attach(device_t dev)
 }
 
 static int
-intel_gen9_detach(device_t dev)
+igen9_detach(device_t dev)
 {
-	struct intel_gen9_softc *sc = device_get_softc(dev);
+	struct igen9_softc *sc = device_get_softc(dev);
 
 	if (sc->scanout_held && sc->scanout_fb != NULL) {
-		intel_gen9_anim_stop(sc);
-		intel_gen9_w32(sc, PLANE_SURF(0), sc->scanout_prev_surf);
+		igen9_anim_stop(sc);
+		igen9_w32(sc, PLANE_SURF(0), sc->scanout_prev_surf);
 		pause("gen9rst", hz / 20);
-		intel_gen9_test_fb_free(sc, sc->scanout_fb);
+		igen9_test_fb_free(sc, sc->scanout_fb);
 		free(sc->scanout_fb, M_KMS);
 		sc->scanout_fb = NULL;
 		sc->scanout_held = false;
 	}
-	if (intel_gen9_exposed_fb != NULL) {
+	if (igen9_exposed_fb != NULL) {
 		if (sc->scanout_held) {
-			intel_gen9_w32(sc, PLANE_SURF(0),
+			igen9_w32(sc, PLANE_SURF(0),
 			    sc->scanout_prev_surf);
 			sc->scanout_held = false;
 		}
-		kms_framebuffer_cleanup(&intel_gen9_exposed_fb->base);
-		intel_gen9_test_fb_free(sc, intel_gen9_exposed_fb->test_fb);
-		free(intel_gen9_exposed_fb->test_fb, M_KMS);
-		free(intel_gen9_exposed_fb, M_KMS);
-		intel_gen9_exposed_fb = NULL;
+		kms_framebuffer_cleanup(&igen9_exposed_fb->base);
+		igen9_test_fb_free(sc, igen9_exposed_fb->test_fb);
+		free(igen9_exposed_fb->test_fb, M_KMS);
+		free(igen9_exposed_fb, M_KMS);
+		igen9_exposed_fb = NULL;
 	}
 	if (sc->drm_dev != NULL) {
-		intel_gen9_irq_teardown(sc);
-		intel_gen9_re_sysctls_fini(sc);
+		igen9_irq_teardown(sc);
+		igen9_re_sysctls_fini(sc);
 		kms_connector_cleanup(&sc->connector);
 		kms_encoder_cleanup(&sc->encoder);
 		kms_plane_cleanup(&sc->primary);
@@ -4006,20 +4006,20 @@ intel_gen9_detach(device_t dev)
 	return (0);
 }
 
-static device_method_t intel_gen9_methods[] = {
-	DEVMETHOD(device_probe,		intel_gen9_probe),
-	DEVMETHOD(device_attach,	intel_gen9_attach),
-	DEVMETHOD(device_detach,	intel_gen9_detach),
+static device_method_t igen9_methods[] = {
+	DEVMETHOD(device_probe,		igen9_probe),
+	DEVMETHOD(device_attach,	igen9_attach),
+	DEVMETHOD(device_detach,	igen9_detach),
 	DEVMETHOD_END
 };
 
-static driver_t intel_gen9_driver_t = {
-	"intel_gen9",
-	intel_gen9_methods,
-	sizeof(struct intel_gen9_softc),
+static driver_t igen9_driver_t = {
+	"igen9",
+	igen9_methods,
+	sizeof(struct igen9_softc),
 };
 
-DRIVER_MODULE(intel_gen9, pci, intel_gen9_driver_t, 0, 0);
-MODULE_VERSION(intel_gen9, 1);
-MODULE_DEPEND(intel_gen9, kms, 1, 1, 1);
-MODULE_DEPEND(intel_gen9, pci, 1, 1, 1);
+DRIVER_MODULE(igen9, pci, igen9_driver_t, 0, 0);
+MODULE_VERSION(igen9, 1);
+MODULE_DEPEND(igen9, kms, 1, 1, 1);
+MODULE_DEPEND(igen9, pci, 1, 1, 1);
