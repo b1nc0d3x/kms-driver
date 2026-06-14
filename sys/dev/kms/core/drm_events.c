@@ -155,6 +155,10 @@ kms_vblank_handler(struct drm_crtc *crtc)
 		return;
 	mc = &crtc->dev->mode_config;
 
+	struct kms_pending_vblank_event *pe, *pe_next;
+	TAILQ_HEAD(, kms_pending_vblank_event) ready;
+	TAILQ_INIT(&ready);
+
 	sx_xlock(&mc->mutex);
 	crtc->sequence++;
 	if (crtc->pending_flip_file != NULL) {
@@ -163,7 +167,27 @@ kms_vblank_handler(struct drm_crtc *crtc)
 		crtc->pending_flip_file = NULL;
 		crtc->pending_flip_user_data = 0;
 	}
+	/*
+	 * Drain everything in pending_vblank_events whose target_seq has
+	 * been reached.  Detach to a local list so we can deliver outside
+	 * the mode_config lock (kms_send_event takes the per-file event_mtx).
+	 */
+	TAILQ_FOREACH_SAFE(pe, &crtc->pending_vblank_events, link, pe_next) {
+		if ((int32_t)(crtc->sequence - pe->target_seq) >= 0) {
+			TAILQ_REMOVE(&crtc->pending_vblank_events, pe, link);
+			TAILQ_INSERT_TAIL(&ready, pe, link);
+		}
+	}
 	sx_xunlock(&mc->mutex);
+
+	while ((pe = TAILQ_FIRST(&ready)) != NULL) {
+		struct drm_event_vblank ev;
+		TAILQ_REMOVE(&ready, pe, link);
+		drm_event_fill_vblank(&ev, DRM_EVENT_VBLANK, crtc->base.id,
+		    pe->target_seq, pe->user_data);
+		(void)kms_send_event(pe->file, &ev, sizeof(ev));
+		free(pe, M_KMS);
+	}
 
 	/*
 	 * Wake every WAIT_VBLANK sleeper on this CRTC.  The wait
@@ -225,6 +249,33 @@ kms_ioctl_wait_vblank(struct drm_file *file, union drm_wait_vblank *arg)
 
 	if (flags & _DRM_VBLANK_EVENT) {
 		struct drm_event_vblank ev;
+
+		/*
+		 * If the target sequence has already passed, dispatch
+		 * immediately (matches Linux DRM semantics).  Otherwise
+		 * queue and let kms_vblank_handler dispatch when the IRQ
+		 * fires for the target frame.
+		 */
+		sx_xlock(&mc->mutex);
+		bool already = ((int32_t)(crtc->sequence - target) >= 0);
+		if (!already) {
+			struct kms_pending_vblank_event *pe =
+			    malloc(sizeof(*pe), M_KMS, M_NOWAIT | M_ZERO);
+			if (pe == NULL) {
+				sx_xunlock(&mc->mutex);
+				return (ENOMEM);
+			}
+			pe->file = file;
+			pe->target_seq = target;
+			pe->user_data = arg->request.signal;
+			TAILQ_INSERT_TAIL(&crtc->pending_vblank_events,
+			    pe, link);
+			sx_xunlock(&mc->mutex);
+			arg->reply.type = type | _DRM_VBLANK_EVENT;
+			arg->reply.sequence = target;
+			return (0);
+		}
+		sx_xunlock(&mc->mutex);
 
 		drm_event_fill_vblank(&ev, DRM_EVENT_VBLANK, crtc->base.id,
 		    target, arg->request.signal);

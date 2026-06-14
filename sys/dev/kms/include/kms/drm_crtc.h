@@ -8,6 +8,7 @@
 #define _KMS_DRM_CRTC_H_
 
 #include <sys/types.h>
+#include <sys/queue.h>
 
 #include <kms/drm_mode_object.h>
 #include <kms/drm_modes.h>
@@ -84,6 +85,22 @@ struct drm_crtc {
 	uint32_t			 sequence;
 	struct drm_file			*pending_flip_file;
 	uint64_t			 pending_flip_user_data;
+	/*
+	 * WAIT_VBLANK + _DRM_VBLANK_EVENT outstanding requests.  Each
+	 * carries the target sequence; kms_vblank_handler dispatches +
+	 * frees the entry when sequence >= target.  Multiple outstanding
+	 * (queued renderer frames, multiple clients) so this is a list,
+	 * not a single slot.
+	 */
+	TAILQ_HEAD(kms_pending_vblank_event_head, kms_pending_vblank_event)
+					 pending_vblank_events;
+};
+
+struct kms_pending_vblank_event {
+	TAILQ_ENTRY(kms_pending_vblank_event)	 link;
+	struct drm_file				*file;
+	uint32_t				 target_seq;
+	uint64_t				 user_data;
 };
 
 int	kms_crtc_init(struct drm_device *dev, struct drm_crtc *crtc,

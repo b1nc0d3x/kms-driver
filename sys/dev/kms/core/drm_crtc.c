@@ -37,6 +37,8 @@ kms_crtc_init(struct drm_device *dev, struct drm_crtc *crtc,
 	 */
 	crtc->index = dev->mode_config.num_crtc;
 
+	TAILQ_INIT(&crtc->pending_vblank_events);
+
 	error = kms_mode_object_register(dev, &crtc->base,
 	    DRM_MODE_OBJECT_CRTC);
 	if (error != 0)
@@ -60,8 +62,14 @@ kms_crtc_init(struct drm_device *dev, struct drm_crtc *crtc,
 void
 kms_crtc_cleanup(struct drm_crtc *crtc)
 {
+	struct kms_pending_vblank_event *pe;
+
 	if (crtc == NULL || crtc->dev == NULL)
 		return;
+	while ((pe = TAILQ_FIRST(&crtc->pending_vblank_events)) != NULL) {
+		TAILQ_REMOVE(&crtc->pending_vblank_events, pe, link);
+		free(pe, M_KMS);
+	}
 	kms_mode_object_unregister(crtc->dev, &crtc->base);
 	if (crtc->funcs != NULL && crtc->funcs->destroy != NULL)
 		crtc->funcs->destroy(crtc);
