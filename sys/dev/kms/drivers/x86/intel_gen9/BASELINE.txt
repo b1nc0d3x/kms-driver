@@ -59,7 +59,21 @@ GMBus xfer status 2026-06-10:
   physical DDC line of whichever connector matters is either (1) on a
   port not in the canonical SKL+ pin map for this desktop motherboard,
   or (2) the monitor was unplugged after boot and the firmware-programmed
-  mode is scanning to nothing.  Next session should either VBT-parse
-  /dev/iopl mailbox 0x2 or sweep DDI_BUF_CTL_C/D/E for any other live
-  port + redo scan.  Validated GMBus protocol stack is correct on the
-  controller side.
+  mode is scanning to nothing.
+
+VBT parse 2026-06-10: rules out (1).
+  ASLS=0xbf96b018  OpRegion sig "IntelGra..."  $VBT v100 BDB v209
+  Child devices for this board's HD 630:
+    child[0]: eDP   on DP-A   ddc_pin=3  aux=0x40   (laptop panel slot)
+    child[1]: HDMI  on HDMI-B ddc_pin=5  aux=0x00   <- firmware mode target
+    child[2]: DP+HDMI on DP-C ddc_pin=4  aux=0x20   <- pin 4's NAK explained
+    child[3]: DP+HDMI on DP-D ddc_pin=6  aux=0x30
+    child[4]: DP    on DP-E   ddc_pin=0  aux=0x40
+  Canonical SKL+ pin map IS correct on this board.  Pin 5 (HDMI-B) being
+  dead confirms (2): no monitor on the HDMI port firmware programmed.
+  Pin 4 NAK-only state matches HDMI-C/DP-C dual being wired but unplugged.
+
+  Next: HPD live status read (PCH_PORT_HOTPLUG / DE_HPD_ISR around
+  0xc4030 / 0x44030) to find which connector actually has signal, then
+  read EDID over GMBus or AUX of THAT port — not the firmware-programmed
+  one.

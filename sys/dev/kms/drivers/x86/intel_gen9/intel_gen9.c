@@ -35,6 +35,9 @@
 #include <machine/bus.h>
 #include <machine/resource.h>
 
+#include <vm/vm.h>
+#include <vm/pmap.h>
+
 #include <dev/pci/pcireg.h>
 #include <dev/pci/pcivar.h>
 
@@ -51,7 +54,7 @@
 #include <kms/drm_modes.h>
 #include <kms/drm_plane.h>
 
-#define	INTEL_VENDOR_ID		0x8086
+#define	INTEL_PCI_VENDOR	0x8086
 
 /*
  * Gen9 PCI IDs.  Sourced from Intel's "graphics-pciids" header; this is a
@@ -385,6 +388,7 @@ intel_gen9_sysctl_bit_scan(SYSCTL_HANDLER_ARGS)
 }
 
 static int	intel_gen9_sysctl_edid_read_b(SYSCTL_HANDLER_ARGS);
+static int	intel_gen9_sysctl_vbt_dump(SYSCTL_HANDLER_ARGS);
 
 static void
 intel_gen9_re_sysctls_init(struct intel_gen9_softc *sc)
@@ -438,6 +442,11 @@ intel_gen9_re_sysctls_init(struct intel_gen9_softc *sc)
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
 	    sc, 0, intel_gen9_sysctl_edid_read_b, "I",
 	    "write 1 to GMBus-read 128 bytes of EDID block 0 from DDI_B");
+	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "vbt_dump",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, intel_gen9_sysctl_vbt_dump, "I",
+	    "write 1 to map OpRegion via ASLS and walk VBT child devices");
 }
 
 static void
@@ -758,6 +767,227 @@ intel_gen9_sysctl_edid_read_b(SYSCTL_HANDLER_ARGS)
 	return (0);
 }
 
+/* -------------------------------- VBT ------------------------------------- */
+
+/*
+ * The Intel firmware exposes a "graphics OpRegion" — a ~8 KiB blob in
+ * system RAM whose physical address is in PCI config register ASLS
+ * (offset 0xFC).  The OpRegion header starts with "IntelGraphicsMem"
+ * and contains four mailboxes.  Mailbox 4, at offset 0x400, holds the
+ * VBT (Video BIOS Table).  The VBT is the firmware-provided routing
+ * table — the canonical source for which physical port is wired to
+ * which DDI, and which GMBus pin its DDC line is on.  Linux's i915
+ * parses this; we have to too, otherwise the static SKL+ pin map is
+ * a guess.
+ */
+
+#define	ASLS_PCI_CFG		0xFC
+#define	OPREGION_SIZE		8192
+#define	OPREGION_VBT_OFFSET	0x400
+
+struct vbt_header {
+	uint8_t		signature[20];	/* "$VBT <platform>" */
+	uint16_t	version;
+	uint16_t	header_size;
+	uint16_t	vbt_size;
+	uint8_t		vbt_checksum;
+	uint8_t		reserved0;
+	uint32_t	bdb_offset;
+	uint32_t	aim_offset[4];
+} __packed;
+
+struct bdb_header {
+	uint8_t		signature[16];	/* "BIOS_DATA_BLOCK " */
+	uint16_t	version;
+	uint16_t	header_size;
+	uint16_t	bdb_size;
+} __packed;
+
+#define	BDB_GENERAL_DEFINITIONS	2
+
+struct bdb_general_definitions {
+	uint8_t		crt_ddc_gmbus_pin;
+	uint8_t		dpms_acpi:1;
+	uint8_t		skip_boot_crt_detect:1;
+	uint8_t		dpms_aim:1;
+	uint8_t		rsvd1:5;
+	uint8_t		boot_display[2];
+	uint8_t		child_dev_size;
+	uint8_t		devices[0];
+} __packed;
+
+/*
+ * SKL+ child_device_config — 38 bytes, modern layout.
+ * Only the fields needed for routing are spelled out; bytes between are
+ * intentionally opaque.
+ */
+struct child_device_config {
+	uint16_t	handle;		/* device handle */
+	uint16_t	device_type;	/* bitmask; HDMI=0x60D2 etc. */
+	uint8_t		device_id[10];
+	uint16_t	addin_offset;
+	uint8_t		dvo_port;	/* HDMIB=1, DPB=7, etc. */
+	uint8_t		i2c_pin;	/* GMBUS pin (not DDC) */
+	uint8_t		slave_addr;
+	uint8_t		ddc_pin;	/* GMBUS pin for DDC */
+	uint16_t	edid_ptr;
+	uint8_t		dvo_cfg;
+	uint8_t		flags2;
+	uint8_t		compat;
+	uint8_t		aux_channel;
+	uint8_t		dongle_detect;
+	uint8_t		pipe_cap:2;
+	uint8_t		sdvo_stall:1;
+	uint8_t		hpd_status:2;
+	uint8_t		integrated_encoder:1;
+	uint8_t		capabilities_rsvd:2;
+	uint8_t		dvo_wiring;
+	uint8_t		mipi_bridge_type;
+	uint16_t	device_class_ext;
+	uint8_t		dvo_function;
+} __packed;
+
+static const char *
+intel_gen9_dvo_port_name(uint8_t p)
+{
+	switch (p) {
+	case 0:  return "HDMI-A";
+	case 1:  return "HDMI-B";
+	case 2:  return "HDMI-C";
+	case 3:  return "HDMI-D";
+	case 4:  return "LVDS";
+	case 5:  return "TV";
+	case 6:  return "CRT";
+	case 7:  return "DP-B";
+	case 8:  return "DP-C";
+	case 9:  return "DP-D";
+	case 10: return "DP-A";
+	case 11: return "DP-E";
+	case 12: return "HDMI-E";
+	default: return "?";
+	}
+}
+
+static const char *
+intel_gen9_device_type_name(uint16_t t)
+{
+	switch (t) {
+	case 0x1806: return "eDP";
+	case 0x60D2: return "HDMI";
+	case 0x60D6: return "DP+HDMI(dual)";
+	case 0x68C6: return "DP";
+	case 0x1022: return "internal LFP";
+	case 0x1009: return "TV";
+	default:     return "?";
+	}
+}
+
+static int
+intel_gen9_sysctl_vbt_dump(SYSCTL_HANDLER_ARGS)
+{
+	struct intel_gen9_softc *sc = arg1;
+	uint32_t asls;
+	void *va;
+	uint8_t *blob;
+	struct vbt_header *vbt;
+	struct bdb_header *bdb;
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+
+	if (error || req->newptr == NULL || trigger == 0)
+		return (error);
+
+	asls = pci_read_config(sc->dev, ASLS_PCI_CFG, 4);
+	if (asls == 0 || asls == 0xffffffff) {
+		device_printf(sc->dev, "vbt: ASLS empty (0x%08x)\n", asls);
+		return (0);
+	}
+	device_printf(sc->dev, "vbt: ASLS=0x%08x  mapping %u bytes\n",
+	    asls, OPREGION_SIZE);
+
+	va = pmap_mapdev(asls, OPREGION_SIZE);
+	if (va == NULL) {
+		device_printf(sc->dev, "vbt: pmap_mapdev failed\n");
+		return (0);
+	}
+	blob = (uint8_t *)va;
+
+	/* OpRegion header signature check. */
+	device_printf(sc->dev, "vbt: OpRegion sig: %c%c%c%c%c%c%c%c\n",
+	    blob[0], blob[1], blob[2], blob[3],
+	    blob[4], blob[5], blob[6], blob[7]);
+
+	vbt = (struct vbt_header *)(blob + OPREGION_VBT_OFFSET);
+	if (memcmp(vbt->signature, "$VBT", 4) != 0) {
+		device_printf(sc->dev,
+		    "vbt: no $VBT at OpRegion+0x400 (sig: %c%c%c%c)\n",
+		    vbt->signature[0], vbt->signature[1],
+		    vbt->signature[2], vbt->signature[3]);
+		pmap_unmapdev(va, OPREGION_SIZE);
+		return (0);
+	}
+	device_printf(sc->dev,
+	    "vbt: $VBT found, version=%u vbt_size=%u bdb_offset=%u\n",
+	    vbt->version, vbt->vbt_size, vbt->bdb_offset);
+
+	bdb = (struct bdb_header *)((uint8_t *)vbt + vbt->bdb_offset);
+	if (memcmp(bdb->signature, "BIOS_DATA_BLOCK", 15) != 0) {
+		device_printf(sc->dev, "vbt: no BDB signature\n");
+		pmap_unmapdev(va, OPREGION_SIZE);
+		return (0);
+	}
+	device_printf(sc->dev,
+	    "vbt: BDB version=%u bdb_size=%u\n", bdb->version, bdb->bdb_size);
+
+	/* Walk BDB blocks looking for GENERAL_DEFINITIONS (id=2). */
+	uint8_t *p = (uint8_t *)bdb + bdb->header_size;
+	uint8_t *end = (uint8_t *)bdb + bdb->bdb_size;
+	while (p + 3 <= end) {
+		uint8_t id = p[0];
+		uint16_t size = p[1] | (p[2] << 8);
+		uint8_t *body = p + 3;
+
+		if (id == BDB_GENERAL_DEFINITIONS) {
+			struct bdb_general_definitions *gd =
+			    (struct bdb_general_definitions *)body;
+			device_printf(sc->dev,
+			    "vbt: BDB block 2 size=%u  CRT_DDC_pin=%u"
+			    "  child_dev_size=%u\n",
+			    size, gd->crt_ddc_gmbus_pin, gd->child_dev_size);
+
+			uint8_t *dev = gd->devices;
+			uint8_t *dev_end = body + size;
+			int n = 0;
+			while (dev + gd->child_dev_size <= dev_end) {
+				struct child_device_config *cd =
+				    (struct child_device_config *)dev;
+				if (cd->device_type != 0) {
+					device_printf(sc->dev,
+					    "  child[%d]: handle=0x%04x"
+					    "  type=0x%04x (%s)"
+					    "  dvo_port=%u (%s)"
+					    "  ddc_pin=%u  aux_ch=0x%02x"
+					    "\n",
+					    n, cd->handle, cd->device_type,
+					    intel_gen9_device_type_name(
+						cd->device_type),
+					    cd->dvo_port,
+					    intel_gen9_dvo_port_name(
+						cd->dvo_port),
+					    cd->ddc_pin, cd->aux_channel);
+				}
+				dev += gd->child_dev_size;
+				n++;
+			}
+			break;
+		}
+		p = body + size;
+	}
+
+	pmap_unmapdev(va, OPREGION_SIZE);
+	return (0);
+}
+
 /* ----------------------------- driver glue -------------------------------- */
 
 static const struct drm_driver intel_gen9_driver = {
@@ -804,7 +1034,7 @@ intel_gen9_probe(device_t dev)
 	uint16_t did = pci_get_device(dev);
 	size_t i;
 
-	if (vid != INTEL_VENDOR_ID)
+	if (vid != INTEL_PCI_VENDOR)
 		return (ENXIO);
 	for (i = 0; i < nitems(intel_gen9_ids); i++) {
 		if (intel_gen9_ids[i].id == did) {
