@@ -257,6 +257,7 @@ struct intel_gen9_softc {
 	uint32_t		 bit_scan_addr;
 	uint32_t		 bit_scan_skip; /* per-cycle skip count */
 	uint32_t		 wrpll_target_khz;
+	uint32_t		 wrpll_dpll_id;	/* 2 = DPLL2, 3 = DPLL3 */
 	struct sysctl_ctx_list	 re_sysctl_ctx;
 	struct sysctl_oid	*re_sysctl_tree;
 };
@@ -481,6 +482,8 @@ static int	intel_gen9_sysctl_vbt_dump(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_hpd_dump(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_cap_dump(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_wrpll_calc(SYSCTL_HANDLER_ARGS);
+static int	intel_gen9_sysctl_wrpll_program(SYSCTL_HANDLER_ARGS);
+static int	intel_gen9_sysctl_wrpll_dump(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_current_mode(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_clock_state(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS);
@@ -582,6 +585,21 @@ intel_gen9_re_sysctls_init(struct intel_gen9_softc *sc)
 	    sc, 0, intel_gen9_sysctl_wrpll_calc, "I",
 	    "write 1 to solve WRPLL (DCO_INT/DCO_FRAC/P0/P1/P2) for"
 	    " wrpll_target_khz");
+	sc->wrpll_dpll_id = 2;
+	SYSCTL_ADD_UINT(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "wrpll_dpll_id", CTLFLAG_RW, &sc->wrpll_dpll_id, 0,
+	    "WRPLL to program / dump: 2 = DPLL2, 3 = DPLL3");
+	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "wrpll_dump",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, intel_gen9_sysctl_wrpll_dump, "I",
+	    "write 1 to print CFGCR1/CFGCR2 of wrpll_dpll_id (decoded)");
+	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "wrpll_program",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, intel_gen9_sysctl_wrpll_program, "I",
+	    "write 1 to solve wrpll_target_khz and program CFGCR1/CFGCR2"
+	    " of wrpll_dpll_id (does NOT enable PLL or re-mux DDIs)");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "current_mode",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
@@ -2587,6 +2605,262 @@ intel_gen9_sysctl_wrpll_calc(SYSCTL_HANDLER_ARGS)
 	device_printf(sc->dev,
 	    "wrpll: verify pixel = VCO / 5 / div = %llu kHz\n",
 	    (unsigned long long)(vco / 5 / (p0 * p1 * p2)));
+	return (0);
+}
+
+/* --------------------------- WRPLL programming ---------------------------- */
+
+/*
+ * SKL+ WRPLL programming.  BSpec layout:
+ *
+ *   DPLL2_CFGCR1 = 0x6C040    DPLL2_CFGCR2 = 0x6C044    (WRPLL1)
+ *   DPLL3_CFGCR1 = 0x6C048    DPLL3_CFGCR2 = 0x6C04C    (WRPLL2)
+ *
+ *   CFGCR1:
+ *     bit 31         FREQ_ENABLE        must be set when valid
+ *     bits 23:9      DCO_FRACTION       15-bit fractional part
+ *     bits 8:0       DCO_INTEGER        9-bit integer part
+ *
+ *   CFGCR2:
+ *     bits 15:8      QDIV_RATIO         P1 (Q) value, raw 1..255
+ *     bit 7          QDIV_MODE          1 = Q divider engaged (P1>1)
+ *     bits 6:5       KDIV               P2 encoded:
+ *                                         0=K5, 1=K2, 2=K3, 3=K1
+ *     bits 4:2       PDIV               P0 encoded:
+ *                                         0=P1, 1=P2, 2=P3, 4=P7
+ *     bits 1:0       CENTRAL_FREQ       00=9.6 GHz, 01=9.0 GHz, 11=8.4 GHz
+ *
+ * For HDMI WRPLL we always select 8.4 GHz central (CF=3): the VCO range
+ * [8.4, 9.0] GHz brackets it and the solver targets the centre.
+ */
+#define	WRPLL_CFGCR1(id)	(0x6c040u + ((id) - 2u) * 8u)
+#define	WRPLL_CFGCR2(id)	(0x6c044u + ((id) - 2u) * 8u)
+
+#define	CFGCR1_FREQ_ENABLE	(1u << 31)
+#define	CFGCR2_QDIV_RATIO_SHIFT	8
+#define	CFGCR2_QDIV_MODE	(1u << 7)
+#define	CFGCR2_KDIV_SHIFT	5
+#define	CFGCR2_PDIV_SHIFT	2
+
+static uint32_t
+intel_gen9_wrpll_encode_cfgcr1(uint16_t dco_int, uint16_t dco_frac)
+{
+	return (CFGCR1_FREQ_ENABLE |
+	    ((uint32_t)(dco_frac & 0x7fffu) << 9) |
+	    (uint32_t)(dco_int & 0x1ffu));
+}
+
+/*
+ * Central frequency hint: tells the analog which of 9.6 / 9.0 / 8.4 GHz
+ * to bias the VCO around.  Pick the nearest.  Firmware on KBL-S 8086:5912
+ * uses 9.0 GHz for an 8910 MHz VCO, confirming this rule.
+ */
+static uint32_t
+intel_gen9_wrpll_central_freq_bits(uint64_t vco_khz)
+{
+	uint64_t d96 = vco_khz > 9600000 ? vco_khz - 9600000 :
+	    9600000 - vco_khz;
+	uint64_t d90 = vco_khz > 9000000 ? vco_khz - 9000000 :
+	    9000000 - vco_khz;
+	uint64_t d84 = vco_khz > 8400000 ? vco_khz - 8400000 :
+	    8400000 - vco_khz;
+
+	if (d84 <= d90 && d84 <= d96)
+		return (3);	/* 8.4 GHz */
+	if (d90 <= d96)
+		return (1);	/* 9.0 GHz */
+	return (0);		/* 9.6 GHz */
+}
+
+static bool
+intel_gen9_wrpll_encode_cfgcr2(uint8_t p0, uint8_t p1, uint8_t p2,
+    uint64_t vco_khz, uint32_t *out)
+{
+	uint32_t v = 0;
+	uint32_t pdiv;
+	uint32_t kdiv;
+
+	switch (p0) {
+	case 1: pdiv = 0; break;
+	case 2: pdiv = 1; break;
+	case 3: pdiv = 2; break;
+	case 7: pdiv = 4; break;
+	default: return (false);
+	}
+	switch (p2) {
+	case 5: kdiv = 0; break;
+	case 2: kdiv = 1; break;
+	case 3: kdiv = 2; break;
+	case 1: kdiv = 3; break;
+	default: return (false);
+	}
+	v |= ((uint32_t)p1 << CFGCR2_QDIV_RATIO_SHIFT);
+	if (p1 > 1)
+		v |= CFGCR2_QDIV_MODE;
+	v |= (kdiv << CFGCR2_KDIV_SHIFT);
+	v |= (pdiv << CFGCR2_PDIV_SHIFT);
+	v |= intel_gen9_wrpll_central_freq_bits(vco_khz);
+	*out = v;
+	return (true);
+}
+
+static void
+intel_gen9_wrpll_decode_cfgcr(uint32_t cfgcr1, uint32_t cfgcr2,
+    device_t dev)
+{
+	static const uint8_t kdiv_to_p2[] = { 5, 2, 3, 1 };
+	static const uint8_t pdiv_to_p0[] = { 1, 2, 3, 0, 7, 0, 0, 0 };
+	uint32_t dco_int  = cfgcr1 & 0x1ffu;
+	uint32_t dco_frac = (cfgcr1 >> 9) & 0x7fffu;
+	uint32_t p1 = (cfgcr2 >> CFGCR2_QDIV_RATIO_SHIFT) & 0xffu;
+	uint32_t kdiv = (cfgcr2 >> CFGCR2_KDIV_SHIFT) & 0x3u;
+	uint32_t pdiv = (cfgcr2 >> CFGCR2_PDIV_SHIFT) & 0x7u;
+	uint8_t p0 = pdiv_to_p0[pdiv];
+	uint8_t p2 = kdiv_to_p2[kdiv];
+	const char *cf_str;
+
+	switch (cfgcr2 & 3) {
+	case 0: cf_str = "9.6 GHz"; break;
+	case 1: cf_str = "9.0 GHz"; break;
+	case 3: cf_str = "8.4 GHz"; break;
+	default: cf_str = "RSVD";
+	}
+
+	if (!(cfgcr1 & CFGCR1_FREQ_ENABLE)) {
+		device_printf(dev, "  CFGCR1 FREQ_ENABLE=0 (PLL not"
+		    " programmed)\n");
+		return;
+	}
+	if (p0 == 0 || p2 == 0) {
+		device_printf(dev,
+		    "  CFGCR2 pdiv=%u kdiv=%u invalid (raw 0x%08x)\n",
+		    pdiv, kdiv, cfgcr2);
+		return;
+	}
+	uint64_t vco = (uint64_t)dco_int * WRPLL_REF_KHZ +
+	    ((uint64_t)dco_frac * WRPLL_REF_KHZ) / 32768ull;
+	uint32_t divider = (uint32_t)p0 * p1 * p2;
+	uint64_t pixel = divider ? vco / 5 / divider : 0;
+
+	device_printf(dev,
+	    "  DCO_INT=%u (0x%03x)  DCO_FRAC=%u (0x%04x)  CENTRAL=%s\n",
+	    dco_int, dco_int, dco_frac, dco_frac, cf_str);
+	device_printf(dev,
+	    "  P0=%u  P1=%u (qdiv_mode=%d)  P2=%u  div=%u\n",
+	    p0, p1, (cfgcr2 & CFGCR2_QDIV_MODE) ? 1 : 0, p2, divider);
+	device_printf(dev,
+	    "  VCO=%llu kHz  pixel=%llu kHz\n",
+	    (unsigned long long)vco, (unsigned long long)pixel);
+}
+
+static int
+intel_gen9_sysctl_wrpll_dump(SYSCTL_HANDLER_ARGS)
+{
+	struct intel_gen9_softc *sc = arg1;
+	uint32_t id, cfgcr1, cfgcr2;
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+
+	if (error || req->newptr == NULL || trigger == 0)
+		return (error);
+
+	id = sc->wrpll_dpll_id;
+	if (id != 2 && id != 3) {
+		device_printf(sc->dev,
+		    "wrpll_dump: wrpll_dpll_id must be 2 or 3\n");
+		return (0);
+	}
+	cfgcr1 = intel_gen9_r32(sc, WRPLL_CFGCR1(id));
+	cfgcr2 = intel_gen9_r32(sc, WRPLL_CFGCR2(id));
+	device_printf(sc->dev,
+	    "wrpll DPLL%u: CFGCR1=0x%08x  CFGCR2=0x%08x\n",
+	    id, cfgcr1, cfgcr2);
+	intel_gen9_wrpll_decode_cfgcr(cfgcr1, cfgcr2, sc->dev);
+	return (0);
+}
+
+static int
+intel_gen9_sysctl_wrpll_program(SYSCTL_HANDLER_ARGS)
+{
+	struct intel_gen9_softc *sc = arg1;
+	uint8_t p0, p1, p2;
+	uint16_t dco_int, dco_frac;
+	uint64_t vco;
+	uint32_t id, pixel_khz, cfgcr1, cfgcr2;
+	uint32_t old1, old2, back1, back2;
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+
+	if (error || req->newptr == NULL || trigger == 0)
+		return (error);
+
+	id = sc->wrpll_dpll_id;
+	if (id != 2 && id != 3) {
+		device_printf(sc->dev,
+		    "wrpll: wrpll_dpll_id must be 2 or 3 (got %u)\n", id);
+		return (EINVAL);
+	}
+	/*
+	 * Guard rail: DPLL_CTRL2 routing tells us which DDIs are driven
+	 * by which PLL.  If any DDI's DPLL_SEL == this PLL and the DDI
+	 * is clocked on, the PLL is live -- never reprogram a live PLL.
+	 */
+	uint32_t ctrl2 = intel_gen9_r32(sc, DPLL_CTRL2);
+	for (int port = 0; port < 5; port++) {
+		uint32_t off = (ctrl2 >> (3 + port)) & 1;
+		uint32_t sel = (ctrl2 >> (1 + port * 3)) & 0x3;
+		if (!off && sel == id) {
+			device_printf(sc->dev,
+			    "wrpll: REFUSE: DDI_%c is using DPLL%u live"
+			    " (DPLL_CTRL2=0x%08x)\n",
+			    'A' + port, id, ctrl2);
+			return (EBUSY);
+		}
+	}
+
+	pixel_khz = sc->wrpll_target_khz;
+	if (pixel_khz == 0) {
+		device_printf(sc->dev,
+		    "wrpll: set wrpll_target_khz first\n");
+		return (EINVAL);
+	}
+	if (!intel_gen9_wrpll_solve(pixel_khz, &p0, &p1, &p2,
+	    &dco_int, &dco_frac, &vco)) {
+		device_printf(sc->dev,
+		    "wrpll: no solution for %u kHz\n", pixel_khz);
+		return (EINVAL);
+	}
+
+	cfgcr1 = intel_gen9_wrpll_encode_cfgcr1(dco_int, dco_frac);
+	if (!intel_gen9_wrpll_encode_cfgcr2(p0, p1, p2, vco, &cfgcr2)) {
+		device_printf(sc->dev,
+		    "wrpll: encode failed for P0=%u P1=%u P2=%u\n", p0, p1, p2);
+		return (EINVAL);
+	}
+
+	old1 = intel_gen9_r32(sc, WRPLL_CFGCR1(id));
+	old2 = intel_gen9_r32(sc, WRPLL_CFGCR2(id));
+	device_printf(sc->dev,
+	    "wrpll DPLL%u: pre  CFGCR1=0x%08x CFGCR2=0x%08x\n",
+	    id, old1, old2);
+	device_printf(sc->dev,
+	    "wrpll DPLL%u: prog CFGCR1=0x%08x CFGCR2=0x%08x"
+	    " (target=%u kHz)\n",
+	    id, cfgcr1, cfgcr2, pixel_khz);
+
+	intel_gen9_w32(sc, WRPLL_CFGCR1(id), cfgcr1);
+	intel_gen9_w32(sc, WRPLL_CFGCR2(id), cfgcr2);
+
+	back1 = intel_gen9_r32(sc, WRPLL_CFGCR1(id));
+	back2 = intel_gen9_r32(sc, WRPLL_CFGCR2(id));
+	device_printf(sc->dev,
+	    "wrpll DPLL%u: post CFGCR1=0x%08x CFGCR2=0x%08x\n",
+	    id, back1, back2);
+	intel_gen9_wrpll_decode_cfgcr(back1, back2, sc->dev);
+
+	if (back1 != cfgcr1 || back2 != cfgcr2)
+		device_printf(sc->dev,
+		    "wrpll DPLL%u: WARNING readback mismatch\n", id);
 	return (0);
 }
 
