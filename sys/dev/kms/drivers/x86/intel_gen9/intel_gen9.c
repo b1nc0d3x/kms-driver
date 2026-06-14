@@ -107,6 +107,8 @@ static const struct {
 
 MALLOC_DECLARE(M_KMS);
 
+struct intel_gen9_test_fb;	/* defined further down */
+
 /*
  * MMIO ranges we care about on gen9 display.  Bracket the regions, not
  * the full 16 MiB BAR — saves snapshot/diff memory and keeps the diff
@@ -157,6 +159,16 @@ struct intel_gen9_softc {
 	struct drm_crtc		 crtc;
 	struct drm_encoder	 encoder;
 	struct drm_connector	 connector;
+
+	/*
+	 * Optional driver-owned scanout buffer.  Allocated lazily when the
+	 * scanout_hold sysctl is asserted; persists across atomic_commit
+	 * calls so PLANE_SURF can stay pointed at it until the user releases.
+	 * Cleaned up on detach.
+	 */
+	struct intel_gen9_test_fb *scanout_fb;
+	uint32_t		 scanout_prev_surf;
+	bool			 scanout_held;
 
 	/* MMIO RE scaffold (snapshot/diff/poke/bit-scan). */
 	struct sx		 re_lock;
@@ -395,6 +407,7 @@ static int	intel_gen9_sysctl_gtt_dump(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_gtt_alloc_test(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_test_fb_make(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_test_fb_flip(SYSCTL_HANDLER_ARGS);
+static int	intel_gen9_sysctl_scanout_hold(SYSCTL_HANDLER_ARGS);
 static void	intel_gen9_edid_to_mode(const uint8_t *dtd,
 		    struct drm_display_mode *m);
 static int	intel_gen9_attach_edid_modes(struct intel_gen9_softc *sc);
@@ -487,6 +500,12 @@ intel_gen9_re_sysctls_init(struct intel_gen9_softc *sc)
 	    sc, 0, intel_gen9_sysctl_test_fb_flip, "I",
 	    "write N (seconds 1..10) to flip PLANE_SURF to our checker FB"
 	    " then restore");
+	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "scanout_hold",
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, intel_gen9_sysctl_scanout_hold, "I",
+	    "1 = alloc + GTT-map + flip PLANE_SURF to checker FB and HOLD;"
+	    " 0 = restore + free");
 }
 
 static void
@@ -1192,6 +1211,58 @@ intel_gen9_test_fb_fill_checker(struct intel_gen9_test_fb *fb,
 			px[y * row_stride_px + x] = tile ? color_a : color_b;
 		}
 	}
+}
+
+/*
+ * scanout_hold: persistent flip.  Write 1 to allocate + flip; write 0
+ * to restore + free.  Lets userspace observe arbitrary work happening
+ * over the static checker buffer.  Idempotent in both directions.
+ */
+static int
+intel_gen9_sysctl_scanout_hold(SYSCTL_HANDLER_ARGS)
+{
+	struct intel_gen9_softc *sc = arg1;
+	int hold = sc->scanout_held ? 1 : 0;
+	int error = sysctl_handle_int(oidp, &hold, 0, req);
+
+	if (error || req->newptr == NULL)
+		return (error);
+
+	if (hold && !sc->scanout_held) {
+		sc->scanout_fb = malloc(sizeof(*sc->scanout_fb),
+		    M_KMS, M_WAITOK | M_ZERO);
+		error = intel_gen9_test_fb_alloc(sc, sc->scanout_fb,
+		    1920, 1080);
+		if (error != 0) {
+			device_printf(sc->dev,
+			    "scanout_hold: alloc failed: %d\n", error);
+			free(sc->scanout_fb, M_KMS);
+			sc->scanout_fb = NULL;
+			return (0);
+		}
+		intel_gen9_test_fb_fill_checker(sc->scanout_fb,
+		    0x00ff0000, 0x000000ff);
+
+		sc->scanout_prev_surf = intel_gen9_r32(sc, PLANE_SURF(0));
+		uint32_t new_surf = sc->scanout_fb->gtt_first_idx * PAGE_SIZE;
+		intel_gen9_w32(sc, PLANE_SURF(0), new_surf);
+		sc->scanout_held = true;
+
+		device_printf(sc->dev,
+		    "scanout_hold: ON  PLANE_SURF 0x%08x -> 0x%08x\n",
+		    sc->scanout_prev_surf, new_surf);
+	} else if (!hold && sc->scanout_held) {
+		intel_gen9_w32(sc, PLANE_SURF(0), sc->scanout_prev_surf);
+		pause("gen9rst", hz / 20);
+		intel_gen9_test_fb_free(sc, sc->scanout_fb);
+		free(sc->scanout_fb, M_KMS);
+		sc->scanout_fb = NULL;
+		sc->scanout_held = false;
+		device_printf(sc->dev,
+		    "scanout_hold: OFF  PLANE_SURF restored to 0x%08x\n",
+		    sc->scanout_prev_surf);
+	}
+	return (0);
 }
 
 static int
@@ -1923,6 +1994,14 @@ intel_gen9_detach(device_t dev)
 {
 	struct intel_gen9_softc *sc = device_get_softc(dev);
 
+	if (sc->scanout_held && sc->scanout_fb != NULL) {
+		intel_gen9_w32(sc, PLANE_SURF(0), sc->scanout_prev_surf);
+		pause("gen9rst", hz / 20);
+		intel_gen9_test_fb_free(sc, sc->scanout_fb);
+		free(sc->scanout_fb, M_KMS);
+		sc->scanout_fb = NULL;
+		sc->scanout_held = false;
+	}
 	if (sc->drm_dev != NULL) {
 		intel_gen9_re_sysctls_fini(sc);
 		kms_connector_cleanup(&sc->connector);
