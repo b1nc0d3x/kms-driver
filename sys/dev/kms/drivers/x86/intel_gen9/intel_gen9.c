@@ -392,6 +392,7 @@ static int	intel_gen9_sysctl_vbt_dump(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_hpd_dump(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_current_mode(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_gtt_dump(SYSCTL_HANDLER_ARGS);
+static int	intel_gen9_sysctl_gtt_alloc_test(SYSCTL_HANDLER_ARGS);
 static void	intel_gen9_edid_to_mode(const uint8_t *dtd,
 		    struct drm_display_mode *m);
 static int	intel_gen9_attach_edid_modes(struct intel_gen9_softc *sc);
@@ -468,6 +469,11 @@ intel_gen9_re_sysctls_init(struct intel_gen9_softc *sc)
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
 	    sc, 0, intel_gen9_sysctl_gtt_dump, "I",
 	    "write 1 to scan first 2048 GTT PTEs and print first 8");
+	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "gtt_alloc_test",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, intel_gen9_sysctl_gtt_alloc_test, "I",
+	    "write 1 to alloc 1 page, map at GTT[2048], read back, free");
 }
 
 static void
@@ -1075,6 +1081,70 @@ intel_gen9_gtt_read(struct intel_gen9_softc *sc, uint32_t entry_idx)
 	uint32_t lo = intel_gen9_r32(sc, off);
 	uint32_t hi = intel_gen9_r32(sc, off + 4);
 	return ((uint64_t)hi << 32) | lo;
+}
+
+static void
+intel_gen9_gtt_write(struct intel_gen9_softc *sc, uint32_t entry_idx,
+    uint64_t pte)
+{
+	uint32_t off = GTT_BASE + entry_idx * GTT_PTE_SIZE;
+	intel_gen9_w32(sc, off, (uint32_t)pte);
+	intel_gen9_w32(sc, off + 4, (uint32_t)(pte >> 32));
+}
+
+/*
+ * Allocate one wired kernel page, map it via GTT entry `idx`, read the
+ * PTE back to prove the GTT is writable, then free the page (clearing
+ * the PTE first).  This is the smoke-test that the GTT write path
+ * works before we build the page-flip logic on top.
+ */
+static int
+intel_gen9_sysctl_gtt_alloc_test(SYSCTL_HANDLER_ARGS)
+{
+	struct intel_gen9_softc *sc = arg1;
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+
+	if (error || req->newptr == NULL || trigger == 0)
+		return (error);
+
+	/*
+	 * Pick an index well past anything firmware might be using.  The
+	 * full GTT covers 4 GiB / 4 KiB = 1Mi entries; index 0x80000 is at
+	 * 2 GiB into the GTT-mapped address space, way beyond any plausible
+	 * scanout / engine context reservation.
+	 */
+	const uint32_t test_idx = 0x80000;
+	void *va = contigmalloc(PAGE_SIZE, M_KMS, M_WAITOK | M_ZERO,
+	    0, ~(vm_paddr_t)0, PAGE_SIZE, 0);
+	if (va == NULL) {
+		device_printf(sc->dev, "gtt_alloc_test: contigmalloc failed\n");
+		return (0);
+	}
+	vm_paddr_t pa = pmap_kextract((vm_offset_t)va);
+	uint64_t pte = (pa & ~0xfffULL) | GTT_PTE_VALID | GTT_PTE_WRITEABLE;
+
+	uint64_t before = intel_gen9_gtt_read(sc, test_idx);
+	intel_gen9_gtt_write(sc, test_idx, pte);
+	uint64_t after = intel_gen9_gtt_read(sc, test_idx);
+
+	device_printf(sc->dev,
+	    "gtt_alloc_test: va=%p  pa=0x%llx  wrote PTE=0x%llx\n",
+	    va, (unsigned long long)pa, (unsigned long long)pte);
+	device_printf(sc->dev,
+	    "  GTT[%u] before=0x%016llx  after=0x%016llx  %s\n",
+	    test_idx,
+	    (unsigned long long)before, (unsigned long long)after,
+	    (after == pte) ? "RW OK" : "MISMATCH");
+
+	/*
+	 * Restore the original PTE before freeing the page so HW can't
+	 * dangling-ref it AND any firmware mapping that happened to live
+	 * here stays intact.
+	 */
+	intel_gen9_gtt_write(sc, test_idx, before);
+	contigfree(va, PAGE_SIZE, M_KMS);
+	return (0);
 }
 
 static int
