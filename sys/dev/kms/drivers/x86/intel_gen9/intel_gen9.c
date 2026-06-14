@@ -2329,22 +2329,50 @@ intel_gen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS)
 	}
 
 	/*
-	 * 0b) Enable DPLL1 (LCPLL2) + poll LOCK.  CFGCR1/CFGCR2 are
-	 *     firmware-tuned for the 148.5 MHz HDMI pixel clock; we just
-	 *     need to flip ENABLE and let HW lock.  BSpec says <5 ms.
+	 * 0b) Enable DPLL1 (LCPLL2) + poll LOCK.
+	 *
+	 * Sequence per i915 skl_ddi_pll_enable:
+	 *   1. Disable ENABLE (in case of a stuck half-state)
+	 *   2. Write DPLL_CTRL1 with HDMI_MODE + OVERRIDE_EN for DPLL1
+	 *   3. Write CFGCR1 + CFGCR2 with the tuned DCO / divider values
+	 *      (these are the firmware-captured BASELINE values for the
+	 *      148.5 MHz HDMI pixel clock target)
+	 *   4. Posting read of CFGCR2
+	 *   5. Set ENABLE
+	 *   6. Poll LOCK (BSpec says <5 ms)
 	 */
 	uint32_t lcpll2 = intel_gen9_r32(sc, SKL_DPLL1_ENABLE);
-	intel_gen9_w32(sc, SKL_DPLL1_ENABLE, lcpll2 | DPLL_ENABLE_BIT);
+	intel_gen9_w32(sc, SKL_DPLL1_ENABLE, lcpll2 & ~DPLL_ENABLE_BIT);
+	(void)intel_gen9_r32(sc, SKL_DPLL1_ENABLE);
+
+	/* DPLL_CTRL1: DPLL1 HDMI_MODE (bit 6) + OVERRIDE_EN (bit 11). */
+	uint32_t ctrl1 = intel_gen9_r32(sc, DPLL_CTRL1);
+	intel_gen9_w32(sc, DPLL_CTRL1,
+	    ctrl1 | (1u << 6) | (1u << 11));
+
+	/* CFGCR1/2 — firmware-tuned for 148.5 MHz HDMI. */
+	intel_gen9_w32(sc, 0x6c040, 0x80400173);
+	intel_gen9_w32(sc, 0x6c044, 0x000003a5);
+	(void)intel_gen9_r32(sc, 0x6c044);	/* posting */
+
+	intel_gen9_w32(sc, SKL_DPLL1_ENABLE,
+	    intel_gen9_r32(sc, SKL_DPLL1_ENABLE) | DPLL_ENABLE_BIT);
+	bool locked = false;
 	for (int spin = 0; spin < 50; spin++) {
 		uint32_t v = intel_gen9_r32(sc, SKL_DPLL1_ENABLE);
 		if (v & DPLL_LOCK_BIT) {
 			device_printf(sc->dev,
-			    "resume: DPLL1 LOCK after %d ms (LCPLL2_CTL=0x%08x)\n",
+			    "resume: DPLL1 LOCK after %d * 100us (LCPLL2=0x%08x)\n",
 			    spin, v);
+			locked = true;
 			break;
 		}
 		DELAY(100);
 	}
+	if (!locked)
+		device_printf(sc->dev,
+		    "resume: DPLL1 NOT LOCKED  (LCPLL2_CTL=0x%08x)\n",
+		    intel_gen9_r32(sc, SKL_DPLL1_ENABLE));
 
 	/* 1) Enable DDI_B port clock: clear CLOCK_OFF bit in DPLL_CTRL2. */
 	uint32_t dpll2 = intel_gen9_r32(sc, DPLL_CTRL2);
