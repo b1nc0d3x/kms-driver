@@ -77,3 +77,22 @@ VBT parse 2026-06-10: rules out (1).
   0xc4030 / 0x44030) to find which connector actually has signal, then
   read EDID over GMBus or AUX of THAT port — not the firmware-programmed
   one.
+
+HPD register dump 2026-06-10:
+  SFUSE_STRAP      = 0x00000006   bits[2:0] = 110: DDI_B + DDI_C present,
+                                   DDI_D NOT populated on the package.
+  SHOTPLUG_CTL_DDI = 0x00101010   per-port nibble: bit0=short, bit1=long,
+                                   bit3=enable.  Status bits set on DDI_B
+                                   short, DDI_D short (latched from prior
+                                   state).  NO enable bits set on any
+                                   port — firmware never armed HPD.
+  SDEISR           = 0x00200000   bit 21 set; likely DDI_A or other.
+
+  Net: firmware programmed Pipe A -> HDMI-B but never enabled HPD on
+  DDI_B, and SFUSE confirms HDMI-B is wired on the package.  GMBus pin
+  5 wire is genuinely dead.  Most consistent conclusion: NO MONITOR is
+  plugged into fbsdx86's HDMI-B right now; firmware set a default
+  hot-pluggable mode and the pipe is scanning to nothing.
+
+  Real next step needs physical access: plug a monitor into HDMI-B
+  (or HDMI-C/DP-C, which is pin 4) and retry edid_read_b=1.
