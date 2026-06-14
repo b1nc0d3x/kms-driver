@@ -258,6 +258,7 @@ struct intel_gen9_softc {
 	uint32_t		 bit_scan_skip; /* per-cycle skip count */
 	uint32_t		 wrpll_target_khz;
 	uint32_t		 wrpll_dpll_id;	/* 2 = DPLL2, 3 = DPLL3 */
+	uint32_t		 wrpll_route_port; /* 0=A..4=E */
 	struct sysctl_ctx_list	 re_sysctl_ctx;
 	struct sysctl_oid	*re_sysctl_tree;
 };
@@ -484,6 +485,11 @@ static int	intel_gen9_sysctl_cap_dump(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_wrpll_calc(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_wrpll_program(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_wrpll_dump(SYSCTL_HANDLER_ARGS);
+static int	intel_gen9_sysctl_wrpll_enable(SYSCTL_HANDLER_ARGS);
+static int	intel_gen9_sysctl_wrpll_disable(SYSCTL_HANDLER_ARGS);
+static int	intel_gen9_sysctl_wrpll_route(SYSCTL_HANDLER_ARGS);
+static int	intel_gen9_sysctl_wrpll_unroute(SYSCTL_HANDLER_ARGS);
+static int	intel_gen9_sysctl_wrpll_force_clear(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_current_mode(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_clock_state(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS);
@@ -600,6 +606,38 @@ intel_gen9_re_sysctls_init(struct intel_gen9_softc *sc)
 	    sc, 0, intel_gen9_sysctl_wrpll_program, "I",
 	    "write 1 to solve wrpll_target_khz and program CFGCR1/CFGCR2"
 	    " of wrpll_dpll_id (does NOT enable PLL or re-mux DDIs)");
+	sc->wrpll_route_port = 2;	/* DDI_C */
+	SYSCTL_ADD_UINT(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "wrpll_route_port", CTLFLAG_RW, &sc->wrpll_route_port, 0,
+	    "DDI to re-mux to wrpll_dpll_id: 0=A 1=B 2=C 3=D 4=E");
+	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "wrpll_enable",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, intel_gen9_sysctl_wrpll_enable, "I",
+	    "write 1 to enable wrpll_dpll_id (CTRL1 HDMI_MODE + ENABLE +"
+	    " poll LOCK)");
+	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "wrpll_disable",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, intel_gen9_sysctl_wrpll_disable, "I",
+	    "write 1 to disable wrpll_dpll_id");
+	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "wrpll_route",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, intel_gen9_sysctl_wrpll_route, "I",
+	    "write 1 to route DDI[wrpll_route_port] clock to wrpll_dpll_id"
+	    " (CTRL2 OFF=0 SEL=id OVERRIDE=1)");
+	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "wrpll_unroute",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, intel_gen9_sysctl_wrpll_unroute, "I",
+	    "write 1 to gate DDI[wrpll_route_port] clock off (CTRL2 OFF=1)");
+	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "wrpll_force_clear",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, intel_gen9_sysctl_wrpll_force_clear, "I",
+	    "emergency: write 1 to unconditionally clear ENABLE of"
+	    " wrpll_dpll_id (no liveness check)");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "current_mode",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
@@ -2416,16 +2454,23 @@ intel_gen9_sysctl_clock_state(SYSCTL_HANDLER_ARGS)
 	    "clock: DPLL_CTRL1=0x%08x  DPLL_CTRL2=0x%08x\n", dpll1, dpll2);
 
 	/*
-	 * DPLL_CTRL2 layout: bits[3] DDI_A_CLOCK_OFF, [4] DDI_B_OFF, [5] C_OFF,
-	 * [6] D_OFF, [7] E_OFF.  bits[15:13] DDI_E_CLOCK_SELECT (2 bits each).
-	 * 0 means clock-on; 1 means off.
+	 * DPLL_CTRL2 layout (SKL+, per i915 reg defs):
+	 *   per DDI port idx 0..4 (A..E):
+	 *     bit (port*3)     = SEL_OVERRIDE (1 = SELECT bits are authoritative)
+	 *     bits (port*3+1)+ = CLOCK_SELECT (2 bits: 0=DPLL0..3=DPLL3)
+	 *     bit (15+port)    = CLOCK_OFF (1 = gated)
+	 *
+	 * Earlier code used `3+port` for OFF -- that overlapped OVERRIDE/SELECT
+	 * fields and silently misreported live state.
 	 */
 	for (int port = 0; port < 5; port++) {
-		uint32_t off = (dpll2 >> (3 + port)) & 1;
+		uint32_t off = (dpll2 >> (15 + port)) & 1;
 		uint32_t sel = (dpll2 >> (1 + port * 3)) & 0x3;
+		uint32_t ovr = (dpll2 >> (port * 3)) & 1;
 		device_printf(sc->dev,
-		    "  DDI_%c: %s  DPLL_SEL=%u\n",
-		    'A' + port, off ? "CLOCK_OFF" : "clock-on", sel);
+		    "  DDI_%c: %s  DPLL_SEL=%u (DPLL%u)%s\n",
+		    'A' + port, off ? "CLOCK_OFF" : "clock-on", sel, sel,
+		    ovr ? "  OVERRIDE" : "");
 	}
 	return (0);
 }
@@ -2807,7 +2852,7 @@ intel_gen9_sysctl_wrpll_program(SYSCTL_HANDLER_ARGS)
 	 */
 	uint32_t ctrl2 = intel_gen9_r32(sc, DPLL_CTRL2);
 	for (int port = 0; port < 5; port++) {
-		uint32_t off = (ctrl2 >> (3 + port)) & 1;
+		uint32_t off = (ctrl2 >> (15 + port)) & 1;
 		uint32_t sel = (ctrl2 >> (1 + port * 3)) & 0x3;
 		if (!off && sel == id) {
 			device_printf(sc->dev,
@@ -2861,6 +2906,324 @@ intel_gen9_sysctl_wrpll_program(SYSCTL_HANDLER_ARGS)
 	if (back1 != cfgcr1 || back2 != cfgcr2)
 		device_printf(sc->dev,
 		    "wrpll DPLL%u: WARNING readback mismatch\n", id);
+	return (0);
+}
+
+/* --------------------------- WRPLL enable / route ------------------------- */
+
+/*
+ * Per-DPLL ENABLE register offsets.  DPLL0/1 are LCPLLs (own ctl); DPLL2/3
+ * are WRPLLs.  Bit 31 = PLL_ENABLE (RW), bit 30 = PLL_LOCK (RO).
+ *
+ * From the BSpec PLL enable sequence (SKL+ HDMI path):
+ *   1. Program CFGCR1/CFGCR2  (already done)
+ *   2. Set DPLL_CTRL1[(id*6)+OVERRIDE] and DPLL_CTRL1[(id*6)+HDMI_MODE]
+ *   3. Set ENABLE bit in DPLLx_ENABLE
+ *   4. Poll LOCK bit (HW asserts within ~600 us)
+ *   5. Re-mux DDI clock via DPLL_CTRL2 (DDI_x SEL=id, OVERRIDE=1, OFF=0)
+ *
+ * Disable is the reverse: gate the DDI clock first, then clear ENABLE.
+ */
+#define	WRPLL_ENABLE_REG(id)		((id) == 2 ? 0x46040u : 0x46060u)
+#define	WRPLL_ENABLE_BIT		(1u << 31)	/* PLL_ENABLE */
+#define	WRPLL_LOCK_BIT			(1u << 30)	/* PLL_LOCK */
+#define	WRPLL_POWER_ENABLE_BIT		(1u << 27)	/* PLL_POWER_ENABLE */
+#define	WRPLL_POWER_STATE_BIT		(1u << 26)	/* PLL_POWER_STATE */
+#define	CTRL1_OVERRIDE(id)		(1u << ((id) * 6))
+#define	CTRL1_HDMI_MODE(id)		(1u << ((id) * 6 + 1))
+#define	CTRL2_DDI_OVERRIDE(p)		(1u << ((p) * 3))
+#define	CTRL2_DDI_SEL_MASK(p)		(3u << ((p) * 3 + 1))
+#define	CTRL2_DDI_SEL(id, p)		((uint32_t)(id) << ((p) * 3 + 1))
+#define	CTRL2_DDI_OFF(p)		(1u << (15 + (p)))
+
+static int
+intel_gen9_sysctl_wrpll_enable(SYSCTL_HANDLER_ARGS)
+{
+	struct intel_gen9_softc *sc = arg1;
+	uint32_t id, cfgcr1, ctrl1, enreg, en, lock;
+	int i;
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+
+	if (error || req->newptr == NULL || trigger == 0)
+		return (error);
+
+	id = sc->wrpll_dpll_id;
+	if (id != 2 && id != 3) {
+		device_printf(sc->dev,
+		    "wrpll: wrpll_dpll_id must be 2 or 3\n");
+		return (EINVAL);
+	}
+	cfgcr1 = intel_gen9_r32(sc, WRPLL_CFGCR1(id));
+	if (!(cfgcr1 & CFGCR1_FREQ_ENABLE)) {
+		device_printf(sc->dev,
+		    "wrpll DPLL%u: CFGCR1 FREQ_ENABLE clear; program it"
+		    " first\n", id);
+		return (EINVAL);
+	}
+
+	/*
+	 * Step 1.5: PW1 (display PLL power well) must be up.  PW1 is index 1
+	 * in HSW_PWR_WELL_CTL2; without it DPLL2/3 can't lock and ENABLE
+	 * leaves the silicon in a stuck "enabled-but-not-locked" state.
+	 * We refuse rather than risk wedging the box.
+	 */
+	/* PW1 STATE = bit (idx*2) in HSW_PWR_WELL_CTL2 @ 0x45404; idx=1. */
+	uint32_t pwr = intel_gen9_r32(sc, 0x45404);
+	if (!(pwr & (1u << 2))) {
+		device_printf(sc->dev,
+		    "wrpll DPLL%u: REFUSE: PW1 not up (CTL2=0x%08x);"
+		    " enable PW1 first\n", id, pwr);
+		return (ENXIO);
+	}
+
+	/*
+	 * Step 2: CTRL1 OVERRIDE + HDMI_MODE for this DPLL.  Clear the
+	 * 6-bit per-DPLL field first to wipe any stale link-rate / SSC bits
+	 * so the new write is authoritative.
+	 */
+	ctrl1 = intel_gen9_r32(sc, DPLL_CTRL1);
+	uint32_t per_dpll_mask = 0x3fu << (id * 6);
+	uint32_t new_ctrl1 = (ctrl1 & ~per_dpll_mask) |
+	    CTRL1_OVERRIDE(id) | CTRL1_HDMI_MODE(id);
+
+	if (new_ctrl1 != ctrl1) {
+		device_printf(sc->dev,
+		    "wrpll DPLL%u: CTRL1 0x%08x -> 0x%08x\n",
+		    id, ctrl1, new_ctrl1);
+		intel_gen9_w32(sc, DPLL_CTRL1, new_ctrl1);
+	}
+
+	/*
+	 * Step 3: POWER_ENABLE handshake.  SKL+ requires the PLL be powered
+	 * up (POWER_ENABLE request -> POWER_STATE ack from HW) before ENABLE
+	 * can take effect.  Skipping this is what wedged the box on the
+	 * 2026-06-14 first attempt: ENABLE set but POWER_STATE=0 leaves the
+	 * PLL drawing current but unable to lock; the rest of the display
+	 * engine then sees a broken clock path and printf-storms.
+	 */
+	enreg = WRPLL_ENABLE_REG(id);
+	en = intel_gen9_r32(sc, enreg);
+	device_printf(sc->dev,
+	    "wrpll DPLL%u: ENABLE_REG[0x%05x]=0x%08x (pre)\n", id, enreg, en);
+
+	if (!(en & WRPLL_POWER_ENABLE_BIT))
+		intel_gen9_w32(sc, enreg, en | WRPLL_POWER_ENABLE_BIT);
+
+	for (i = 0; i < 50; i++) {
+		uint32_t v = intel_gen9_r32(sc, enreg);
+		if (v & WRPLL_POWER_STATE_BIT)
+			break;
+		DELAY(100);
+	}
+	uint32_t ps = intel_gen9_r32(sc, enreg);
+	if (!(ps & WRPLL_POWER_STATE_BIT)) {
+		intel_gen9_w32(sc, enreg, ps & ~WRPLL_POWER_ENABLE_BIT);
+		device_printf(sc->dev,
+		    "wrpll DPLL%u: POWER_STATE never asserted (REG=0x%08x);"
+		    " POWER_ENABLE cleared\n", id, ps);
+		return (EIO);
+	}
+	device_printf(sc->dev,
+	    "wrpll DPLL%u: POWER_STATE up after %d us\n", id, i * 100);
+
+	/* Step 4: ENABLE. */
+	en = intel_gen9_r32(sc, enreg);
+	if (!(en & WRPLL_ENABLE_BIT))
+		intel_gen9_w32(sc, enreg, en | WRPLL_ENABLE_BIT);
+
+	/* Step 5: poll LOCK.  BSpec says <= 600 us; allow 5 ms. */
+	for (i = 0; i < 50; i++) {
+		lock = intel_gen9_r32(sc, enreg);
+		if (lock & WRPLL_LOCK_BIT)
+			break;
+		DELAY(100);
+	}
+	device_printf(sc->dev,
+	    "wrpll DPLL%u: ENABLE_REG=0x%08x  LOCK=%d  after %d us\n",
+	    id, lock, !!(lock & WRPLL_LOCK_BIT), i * 100);
+
+	if (!(lock & WRPLL_LOCK_BIT)) {
+		/*
+		 * Critical: undo both ENABLE and POWER_ENABLE so the silicon
+		 * doesn't sit in a half-on state.  Order matters: clear
+		 * ENABLE first, then POWER_ENABLE.
+		 */
+		uint32_t v = intel_gen9_r32(sc, enreg);
+		intel_gen9_w32(sc, enreg, v & ~WRPLL_ENABLE_BIT);
+		DELAY(10);
+		v = intel_gen9_r32(sc, enreg);
+		intel_gen9_w32(sc, enreg, v & ~WRPLL_POWER_ENABLE_BIT);
+		device_printf(sc->dev,
+		    "wrpll DPLL%u: FAILED to lock; ENABLE+POWER_ENABLE"
+		    " cleared\n", id);
+		return (EIO);
+	}
+	return (0);
+}
+
+static int
+intel_gen9_sysctl_wrpll_disable(SYSCTL_HANDLER_ARGS)
+{
+	struct intel_gen9_softc *sc = arg1;
+	uint32_t id, ctrl2, enreg, en;
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+
+	if (error || req->newptr == NULL || trigger == 0)
+		return (error);
+
+	id = sc->wrpll_dpll_id;
+	if (id != 2 && id != 3) {
+		device_printf(sc->dev,
+		    "wrpll: wrpll_dpll_id must be 2 or 3\n");
+		return (EINVAL);
+	}
+	/* Same liveness guard as wrpll_program. */
+	ctrl2 = intel_gen9_r32(sc, DPLL_CTRL2);
+	for (int port = 0; port < 5; port++) {
+		uint32_t off = (ctrl2 >> (15 + port)) & 1;
+		uint32_t sel = (ctrl2 >> (1 + port * 3)) & 0x3;
+		if (!off && sel == id) {
+			device_printf(sc->dev,
+			    "wrpll DPLL%u: REFUSE disable: DDI_%c still routed"
+			    " (CTRL2=0x%08x); unroute first\n",
+			    id, 'A' + port, ctrl2);
+			return (EBUSY);
+		}
+	}
+	enreg = WRPLL_ENABLE_REG(id);
+	en = intel_gen9_r32(sc, enreg);
+	/*
+	 * Clear ENABLE first, brief wait, then clear POWER_ENABLE.  BSpec
+	 * disable order is the reverse of enable.
+	 */
+	uint32_t after_en = en & ~WRPLL_ENABLE_BIT;
+	uint32_t after_pe = after_en & ~WRPLL_POWER_ENABLE_BIT;
+	device_printf(sc->dev,
+	    "wrpll DPLL%u: disable, ENABLE_REG 0x%08x -> 0x%08x -> 0x%08x\n",
+	    id, en, after_en, after_pe);
+	intel_gen9_w32(sc, enreg, after_en);
+	DELAY(10);
+	intel_gen9_w32(sc, enreg, after_pe);
+	return (0);
+}
+
+static int
+intel_gen9_sysctl_wrpll_route(SYSCTL_HANDLER_ARGS)
+{
+	struct intel_gen9_softc *sc = arg1;
+	uint32_t id, port, ctrl2, new_ctrl2, enreg, en;
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+
+	if (error || req->newptr == NULL || trigger == 0)
+		return (error);
+
+	id = sc->wrpll_dpll_id;
+	port = sc->wrpll_route_port;
+	if (id != 2 && id != 3) {
+		device_printf(sc->dev,
+		    "wrpll_route: wrpll_dpll_id must be 2 or 3\n");
+		return (EINVAL);
+	}
+	if (port > 4) {
+		device_printf(sc->dev,
+		    "wrpll_route: wrpll_route_port must be 0..4\n");
+		return (EINVAL);
+	}
+
+	/* Refuse if the PLL isn't locked. */
+	enreg = WRPLL_ENABLE_REG(id);
+	en = intel_gen9_r32(sc, enreg);
+	if (!(en & WRPLL_LOCK_BIT)) {
+		device_printf(sc->dev,
+		    "wrpll_route: DPLL%u not locked (ENABLE_REG=0x%08x);"
+		    " run wrpll_enable first\n", id, en);
+		return (EAGAIN);
+	}
+
+	ctrl2 = intel_gen9_r32(sc, DPLL_CTRL2);
+	new_ctrl2 = ctrl2;
+	new_ctrl2 &= ~CTRL2_DDI_SEL_MASK(port);
+	new_ctrl2 |= CTRL2_DDI_SEL(id, port);
+	new_ctrl2 |= CTRL2_DDI_OVERRIDE(port);
+	new_ctrl2 &= ~CTRL2_DDI_OFF(port);
+
+	device_printf(sc->dev,
+	    "wrpll_route: DDI_%c -> DPLL%u  CTRL2 0x%08x -> 0x%08x\n",
+	    'A' + port, id, ctrl2, new_ctrl2);
+	intel_gen9_w32(sc, DPLL_CTRL2, new_ctrl2);
+
+	/* Read-back. */
+	uint32_t back = intel_gen9_r32(sc, DPLL_CTRL2);
+	uint32_t off  = (back >> (15 + port)) & 1;
+	uint32_t sel  = (back >> (1 + port * 3)) & 0x3;
+	uint32_t ovr  = (back >> (port * 3)) & 1;
+	device_printf(sc->dev,
+	    "wrpll_route: post CTRL2=0x%08x  DDI_%c: %s SEL=%u OVERRIDE=%u\n",
+	    back, 'A' + port,
+	    off ? "CLOCK_OFF" : "clock-on", sel, ovr);
+	return (0);
+}
+
+static int
+intel_gen9_sysctl_wrpll_force_clear(SYSCTL_HANDLER_ARGS)
+{
+	struct intel_gen9_softc *sc = arg1;
+	uint32_t id, enreg, en;
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+
+	if (error || req->newptr == NULL || trigger == 0)
+		return (error);
+
+	id = sc->wrpll_dpll_id;
+	if (id != 2 && id != 3) {
+		device_printf(sc->dev,
+		    "wrpll_force_clear: wrpll_dpll_id must be 2 or 3\n");
+		return (EINVAL);
+	}
+	enreg = WRPLL_ENABLE_REG(id);
+	en = intel_gen9_r32(sc, enreg);
+	uint32_t cleared = en & ~(WRPLL_ENABLE_BIT | WRPLL_POWER_ENABLE_BIT);
+	device_printf(sc->dev,
+	    "wrpll_force_clear DPLL%u: ENABLE_REG 0x%08x -> 0x%08x"
+	    " (ENABLE+POWER_ENABLE cleared)\n", id, en, cleared);
+	intel_gen9_w32(sc, enreg, cleared);
+	return (0);
+}
+
+static int
+intel_gen9_sysctl_wrpll_unroute(SYSCTL_HANDLER_ARGS)
+{
+	struct intel_gen9_softc *sc = arg1;
+	uint32_t port, ctrl2, new_ctrl2;
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+
+	if (error || req->newptr == NULL || trigger == 0)
+		return (error);
+
+	port = sc->wrpll_route_port;
+	if (port > 4) {
+		device_printf(sc->dev,
+		    "wrpll_unroute: wrpll_route_port must be 0..4\n");
+		return (EINVAL);
+	}
+	/* Hard refuse DDI_B -- that's the live firmware-driven panel. */
+	if (port == 1) {
+		device_printf(sc->dev,
+		    "wrpll_unroute: REFUSE: DDI_B carries the live"
+		    " firmware-driven mode\n");
+		return (EBUSY);
+	}
+	ctrl2 = intel_gen9_r32(sc, DPLL_CTRL2);
+	new_ctrl2 = ctrl2 | CTRL2_DDI_OFF(port);
+	device_printf(sc->dev,
+	    "wrpll_unroute: DDI_%c  CTRL2 0x%08x -> 0x%08x\n",
+	    'A' + port, ctrl2, new_ctrl2);
+	intel_gen9_w32(sc, DPLL_CTRL2, new_ctrl2);
 	return (0);
 }
 
