@@ -461,6 +461,7 @@ static int	intel_gen9_sysctl_vbt_dump(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_hpd_dump(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_current_mode(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_clock_state(SYSCTL_HANDLER_ARGS);
+static int	intel_gen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_gtt_dump(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_gtt_alloc_test(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_test_fb_make(SYSCTL_HANDLER_ARGS);
@@ -543,6 +544,12 @@ intel_gen9_re_sysctls_init(struct intel_gen9_softc *sc)
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
 	    sc, 0, intel_gen9_sysctl_clock_state, "I",
 	    "write 1 to dump CDCLK / LCPLL / DPLL / DDI clock-on-off state");
+	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "try_pipe_resume",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, intel_gen9_sysctl_try_pipe_resume, "I",
+	    "write 1 to write BASELINE timing/format and enable Pipe A ->"
+	    " DDI_B (HDMI 1920x1080@60); upstream clocks must be alive");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "gtt_dump",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
@@ -2216,6 +2223,85 @@ intel_gen9_sysctl_clock_state(SYSCTL_HANDLER_ARGS)
 		    "  DDI_%c: %s  DPLL_SEL=%u\n",
 		    'A' + port, off ? "CLOCK_OFF" : "clock-on", sel);
 	}
+	return (0);
+}
+
+/* --------------------------- pipe resume ---------------------------------- */
+
+/*
+ * Minimal "resume the firmware mode" sequence using BASELINE values
+ * captured 2026-06-10 on this board.  Assumes the upstream clocks
+ * (CDCLK, LCPLL1, DPLL0/1) are still alive -- the clock_state readback
+ * confirms they are.  Writes the BASELINE timing into transcoder A,
+ * routes it to DDI_B, points the primary plane at GTT[0], then enables
+ * pipe -> plane -> DDI buffer in that order.
+ *
+ * Doesn't handle from-cold start (would need full CDCLK/DPLL bring-up).
+ */
+
+#define	PIPE_SRCSZ(p)		(0x7001c + (p) * 0x1000)
+#define	DDI_BUF_CTL(d)		(0x64000 + (d) * 0x100)
+#define	  DDI_BUF_CTL_ENABLE_BIT (1u << 31)
+#define	DPLL_CTRL2_DDI_B_OFF	(1u << 4)
+
+static int
+intel_gen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS)
+{
+	struct intel_gen9_softc *sc = arg1;
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+
+	if (error || req->newptr == NULL || trigger == 0)
+		return (error);
+
+	/* 1) Enable DDI_B port clock: clear CLOCK_OFF bit in DPLL_CTRL2. */
+	uint32_t dpll2 = intel_gen9_r32(sc, DPLL_CTRL2);
+	intel_gen9_w32(sc, DPLL_CTRL2, dpll2 & ~DPLL_CTRL2_DDI_B_OFF);
+	device_printf(sc->dev,
+	    "resume: DPLL_CTRL2 0x%08x -> 0x%08x (DDI_B clock on)\n",
+	    dpll2, dpll2 & ~DPLL_CTRL2_DDI_B_OFF);
+
+	/* 2) Transcoder A timing — BASELINE values for 1920x1080@60. */
+	intel_gen9_w32(sc, TRANS_HTOTAL(0), 0x0897077f);
+	intel_gen9_w32(sc, TRANS_HBLANK(0), 0x0897077f);
+	intel_gen9_w32(sc, TRANS_HSYNC(0),  0x080307d7);
+	intel_gen9_w32(sc, TRANS_VTOTAL(0), 0x04640437);
+	intel_gen9_w32(sc, TRANS_VBLANK(0), 0x04640437);
+	intel_gen9_w32(sc, TRANS_VSYNC(0),  0x043e0439);
+	intel_gen9_w32(sc, PIPE_SRCSZ(0),   ((uint32_t)1919 << 16) | 1079);
+
+	/* 3) Route transcoder A to DDI_B in HDMI mode (BASELINE value). */
+	intel_gen9_w32(sc, TRANS_DDI_FUNC_CTL(0), 0x90030000);
+
+	/* 4) Enable Pipe A. */
+	intel_gen9_w32(sc, PIPE_CONF(0), PIPE_CONF_ENABLE);
+	DELAY(100);
+	uint32_t pconf = intel_gen9_r32(sc, PIPE_CONF(0));
+	device_printf(sc->dev, "resume: PIPE_CONF=0x%08x\n", pconf);
+
+	/* 5) Primary plane: XRGB8888 linear, 1920x1080, stride 7680, surf=0. */
+	intel_gen9_w32(sc, PLANE_STRIDE(0), 7680 / 64);
+	intel_gen9_w32(sc, PLANE_SIZE(0),
+	    ((uint32_t)1079 << 16) | 1919);
+	intel_gen9_w32(sc, PLANE_SURF(0), 0);
+	intel_gen9_w32(sc, PLANE_CTL(0),
+	    PLANE_CTL_ENABLE | (0x4 << PLANE_CTL_FORMAT_SHIFT));
+
+	/* 6) Enable DDI_B output driver. */
+	intel_gen9_w32(sc, DDI_BUF_CTL(1), DDI_BUF_CTL_ENABLE_BIT);
+
+	DELAY(20000);	/* ~20 ms for HW to stabilise */
+	device_printf(sc->dev,
+	    "resume: PIPE_CONF=0x%08x  PLANE_CTL=0x%08x  DDI_BUF_B=0x%08x\n",
+	    intel_gen9_r32(sc, PIPE_CONF(0)),
+	    intel_gen9_r32(sc, PLANE_CTL(0)),
+	    intel_gen9_r32(sc, DDI_BUF_CTL(1)));
+	uint32_t fc1 = intel_gen9_r32(sc, PIPE_FRMCOUNT(0));
+	pause("gen9rsm", hz / 4);
+	uint32_t fc2 = intel_gen9_r32(sc, PIPE_FRMCOUNT(0));
+	device_printf(sc->dev,
+	    "resume: FRMCOUNT delta over 250 ms = %u (expect ~15 if 60 Hz)\n",
+	    fc2 - fc1);
 	return (0);
 }
 
