@@ -2255,6 +2255,17 @@ intel_gen9_sysctl_clock_state(SYSCTL_HANDLER_ARGS)
 #define	PWR_WELL_STATE(idx)	(1u << ((idx) * 2))
 #define	PW_IDX_PW2		2
 #define	PW_IDX_DDI_B		4
+
+/*
+ * SKL DPLL enable / lock registers.
+ *   DPLL0 = LCPLL1 (0x46010), DPLL1 = LCPLL2 (0x46014),
+ *   DPLL2 = WRPLL1 (0x46040), DPLL3 = WRPLL2 (0x46060).
+ * Each: bit 30 = ENABLE (RW), bit 31 = LOCK (RO).
+ */
+#define	SKL_DPLL0_ENABLE	0x46010
+#define	SKL_DPLL1_ENABLE	0x46014
+#define	DPLL_ENABLE_BIT		(1u << 31)	/* LCPLL_PLL_ENABLE */
+#define	DPLL_LOCK_BIT		(1u << 30)	/* LCPLL_PLL_LOCK */
 #define	  DDI_BUF_CTL_ENABLE_BIT		(1u << 31)
 #define	  DDI_BUF_CTL_TRANS_SELECT_SHIFT	24
 #define	  DDI_BUF_CTL_PORT_WIDTH_X4		(3u << 1)
@@ -2315,6 +2326,24 @@ intel_gen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS)
 			break;
 		}
 		DELAY(1000);
+	}
+
+	/*
+	 * 0b) Enable DPLL1 (LCPLL2) + poll LOCK.  CFGCR1/CFGCR2 are
+	 *     firmware-tuned for the 148.5 MHz HDMI pixel clock; we just
+	 *     need to flip ENABLE and let HW lock.  BSpec says <5 ms.
+	 */
+	uint32_t lcpll2 = intel_gen9_r32(sc, SKL_DPLL1_ENABLE);
+	intel_gen9_w32(sc, SKL_DPLL1_ENABLE, lcpll2 | DPLL_ENABLE_BIT);
+	for (int spin = 0; spin < 50; spin++) {
+		uint32_t v = intel_gen9_r32(sc, SKL_DPLL1_ENABLE);
+		if (v & DPLL_LOCK_BIT) {
+			device_printf(sc->dev,
+			    "resume: DPLL1 LOCK after %d ms (LCPLL2_CTL=0x%08x)\n",
+			    spin, v);
+			break;
+		}
+		DELAY(100);
 	}
 
 	/* 1) Enable DDI_B port clock: clear CLOCK_OFF bit in DPLL_CTRL2. */
