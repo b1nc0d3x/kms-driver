@@ -184,6 +184,15 @@ struct intel_gen9_softc {
 	int			 gmadr_rid;
 	struct resource		*gmadr_res;
 
+	/* IRQ — single MSI vector covers all display interrupts. */
+	int			 irq_rid;
+	struct resource		*irq_res;
+	void			*irq_cookie;
+	uint64_t		 vblank_count_pipe_a;
+	uint64_t		 vblank_count_pipe_b;
+	uint64_t		 vblank_count_pipe_c;
+	uint64_t		 irq_total_count;
+
 	/* Minimal KMS topology — one of each, all stubs. */
 	struct drm_crtc		 crtc;
 	struct drm_plane	 primary;
@@ -560,6 +569,12 @@ intel_gen9_re_sysctls_init(struct intel_gen9_softc *sc)
 	    sc, 0, intel_gen9_sysctl_expose_scanout_fb, "I",
 	    "write 1 to allocate + register a driver-owned drm_framebuffer"
 	    " for userspace MODE_ATOMIC; prints FB_ID, CRTC_ID, PLANE_ID");
+	SYSCTL_ADD_U64(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "vblank_a_count", CTLFLAG_RD, &sc->vblank_count_pipe_a, 0,
+	    "Pipe A vblanks observed via IRQ");
+	SYSCTL_ADD_U64(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "irq_total_count", CTLFLAG_RD, &sc->irq_total_count, 0,
+	    "total display-engine IRQs serviced");
 }
 
 static void
@@ -2128,6 +2143,160 @@ intel_gen9_wait_vblank(struct intel_gen9_softc *sc, int pipe)
 	}
 }
 
+/* ------------------------------ IRQ + vblank ------------------------------ */
+
+/*
+ * Display Engine interrupts on gen8+ are a two-level hierarchy:
+ *   GEN8_MASTER_IRQ at 0x44200 — top-level enable + DE_PIPE_n_IRQ bits
+ *     that say which pipe has a pending event
+ *   GEN8_DE_PIPE_<IIR|IMR|IER|ISR>(pipe) — per-pipe banks at
+ *     0x44400 + pipe*0x10000.  Bit 0 of these is vblank.
+ *
+ * Programming sequence (matches i915 gen8_irq_postinstall):
+ *   1) GEN8_MASTER_IRQ = 0                 (disable while configuring)
+ *   2) IIR = ~0                            (clear stale)
+ *   3) IMR = ~GEN8_PIPE_VBLANK             (unmask vblank only)
+ *   4) IER = GEN8_PIPE_VBLANK              (enable vblank only)
+ *   5) GEN8_MASTER_IRQ = MASTER_CTL | DE_PIPE_A_IRQ
+ *
+ * Service order (in the handler):
+ *   1) master = read GEN8_MASTER_IRQ; if (master & MASTER_CTL) == 0 ret
+ *   2) for each PIPE_n_IRQ bit set in master:
+ *        iir = read GEN8_DE_PIPE_IIR(n)
+ *        if vblank, count
+ *        write iir back to W1C
+ *   3) GEN8_MASTER_IRQ readback acts as posting flush
+ */
+#define	GEN8_MASTER_IRQ			0x00044200
+#define	  GEN8_MASTER_IRQ_CONTROL	(1u << 31)
+#define	  GEN8_DE_PIPE_A_IRQ		(1u << 16)
+#define	  GEN8_DE_PIPE_B_IRQ		(1u << 17)
+#define	  GEN8_DE_PIPE_C_IRQ		(1u << 18)
+
+#define	GEN8_DE_PIPE_ISR(p)		(0x00044400 + (p) * 0x10000)
+#define	GEN8_DE_PIPE_IMR(p)		(0x00044404 + (p) * 0x10000)
+#define	GEN8_DE_PIPE_IIR(p)		(0x00044408 + (p) * 0x10000)
+#define	GEN8_DE_PIPE_IER(p)		(0x0004440c + (p) * 0x10000)
+#define	GEN8_PIPE_VBLANK		(1u << 0)
+
+static void
+intel_gen9_irq_handler(void *arg)
+{
+	struct intel_gen9_softc *sc = arg;
+	uint32_t master, master_w;
+
+	master = intel_gen9_r32(sc, GEN8_MASTER_IRQ);
+	if ((master & GEN8_MASTER_IRQ_CONTROL) == 0)
+		return;
+	/* Disable master while servicing; re-enable at end. */
+	master_w = master & ~GEN8_MASTER_IRQ_CONTROL;
+	intel_gen9_w32(sc, GEN8_MASTER_IRQ, master_w);
+
+	sc->irq_total_count++;
+	if (master & GEN8_DE_PIPE_A_IRQ) {
+		uint32_t iir = intel_gen9_r32(sc, GEN8_DE_PIPE_IIR(0));
+		if (iir & GEN8_PIPE_VBLANK)
+			sc->vblank_count_pipe_a++;
+		intel_gen9_w32(sc, GEN8_DE_PIPE_IIR(0), iir);
+	}
+	if (master & GEN8_DE_PIPE_B_IRQ) {
+		uint32_t iir = intel_gen9_r32(sc, GEN8_DE_PIPE_IIR(1));
+		if (iir & GEN8_PIPE_VBLANK)
+			sc->vblank_count_pipe_b++;
+		intel_gen9_w32(sc, GEN8_DE_PIPE_IIR(1), iir);
+	}
+	if (master & GEN8_DE_PIPE_C_IRQ) {
+		uint32_t iir = intel_gen9_r32(sc, GEN8_DE_PIPE_IIR(2));
+		if (iir & GEN8_PIPE_VBLANK)
+			sc->vblank_count_pipe_c++;
+		intel_gen9_w32(sc, GEN8_DE_PIPE_IIR(2), iir);
+	}
+
+	intel_gen9_w32(sc, GEN8_MASTER_IRQ,
+	    master_w | GEN8_MASTER_IRQ_CONTROL);
+	(void)intel_gen9_r32(sc, GEN8_MASTER_IRQ);	/* posting flush */
+}
+
+static int
+intel_gen9_irq_setup(struct intel_gen9_softc *sc)
+{
+	int msi_count = 1;
+	int error;
+
+	/*
+	 * Quiesce: master off, per-pipe banks all masked / IIRs cleared.
+	 * Pipes B/C stay fully off (no scanout there); Pipe A gets the
+	 * vblank source unmasked + enabled after MSI is hooked.
+	 */
+	intel_gen9_w32(sc, GEN8_MASTER_IRQ, 0);
+	for (int p = 0; p < 3; p++) {
+		intel_gen9_w32(sc, GEN8_DE_PIPE_IMR(p), 0xffffffff);
+		intel_gen9_w32(sc, GEN8_DE_PIPE_IER(p), 0);
+		intel_gen9_w32(sc, GEN8_DE_PIPE_IIR(p), 0xffffffff);
+	}
+	(void)intel_gen9_r32(sc, GEN8_MASTER_IRQ);
+
+	if (pci_alloc_msi(sc->dev, &msi_count) != 0 || msi_count < 1) {
+		device_printf(sc->dev, "MSI alloc failed; falling back to INTx\n");
+		sc->irq_rid = 0;
+	} else {
+		sc->irq_rid = 1;
+	}
+	sc->irq_res = bus_alloc_resource_any(sc->dev, SYS_RES_IRQ,
+	    &sc->irq_rid, RF_ACTIVE | RF_SHAREABLE);
+	if (sc->irq_res == NULL) {
+		device_printf(sc->dev, "IRQ alloc failed\n");
+		if (sc->irq_rid == 1)
+			pci_release_msi(sc->dev);
+		return (ENXIO);
+	}
+	error = bus_setup_intr(sc->dev, sc->irq_res,
+	    INTR_TYPE_MISC | INTR_MPSAFE, NULL, intel_gen9_irq_handler, sc,
+	    &sc->irq_cookie);
+	if (error != 0) {
+		device_printf(sc->dev, "bus_setup_intr: %d\n", error);
+		bus_release_resource(sc->dev, SYS_RES_IRQ, sc->irq_rid,
+		    sc->irq_res);
+		sc->irq_res = NULL;
+		if (sc->irq_rid == 1)
+			pci_release_msi(sc->dev);
+		return (error);
+	}
+
+	/*
+	 * Arm Pipe A vblank only (the firmware-active pipe).  B/C remain
+	 * fully masked.  Master IRQ_CONTROL turns the whole tree on last.
+	 */
+	intel_gen9_w32(sc, GEN8_DE_PIPE_IIR(0), 0xffffffff);
+	intel_gen9_w32(sc, GEN8_DE_PIPE_IMR(0), ~GEN8_PIPE_VBLANK);
+	intel_gen9_w32(sc, GEN8_DE_PIPE_IER(0), GEN8_PIPE_VBLANK);
+	intel_gen9_w32(sc, GEN8_MASTER_IRQ,
+	    GEN8_MASTER_IRQ_CONTROL | GEN8_DE_PIPE_A_IRQ);
+	(void)intel_gen9_r32(sc, GEN8_MASTER_IRQ);
+	device_printf(sc->dev, "irq: MSI armed, Pipe A vblank enabled\n");
+	return (0);
+}
+
+static void
+intel_gen9_irq_teardown(struct intel_gen9_softc *sc)
+{
+	if (sc->irq_res == NULL)
+		return;
+	/* Master off, per-pipe banks masked + cleared. */
+	intel_gen9_w32(sc, GEN8_MASTER_IRQ, 0);
+	for (int p = 0; p < 3; p++) {
+		intel_gen9_w32(sc, GEN8_DE_PIPE_IMR(p), 0xffffffff);
+		intel_gen9_w32(sc, GEN8_DE_PIPE_IER(p), 0);
+		intel_gen9_w32(sc, GEN8_DE_PIPE_IIR(p), 0xffffffff);
+	}
+
+	bus_teardown_intr(sc->dev, sc->irq_res, sc->irq_cookie);
+	bus_release_resource(sc->dev, SYS_RES_IRQ, sc->irq_rid, sc->irq_res);
+	if (sc->irq_rid == 1)
+		pci_release_msi(sc->dev);
+	sc->irq_res = NULL;
+}
+
 /* ----------------------------- driver glue -------------------------------- */
 
 static const struct drm_driver intel_gen9_driver = {
@@ -2385,6 +2554,12 @@ intel_gen9_attach(device_t dev)
 		    " empty/partial resources)\n", error);
 
 	/*
+	 * IRQ — MSI + Pipe A vblank.  Non-fatal; falling back to polled
+	 * vblank still works (intel_gen9_wait_vblank reads PIPE_FRMCOUNT).
+	 */
+	(void)intel_gen9_irq_setup(sc);
+
+	/*
 	 * Best-effort EDID-on-attach: try to fetch the DDI_B EDID via GMBus
 	 * and populate the connector's mode list.  Failure leaves the
 	 * connector in UNKNOWN with no modes — userspace GETCONNECTOR still
@@ -2424,6 +2599,7 @@ intel_gen9_detach(device_t dev)
 		intel_gen9_exposed_fb = NULL;
 	}
 	if (sc->drm_dev != NULL) {
+		intel_gen9_irq_teardown(sc);
 		intel_gen9_re_sysctls_fini(sc);
 		kms_connector_cleanup(&sc->connector);
 		kms_encoder_cleanup(&sc->encoder);
