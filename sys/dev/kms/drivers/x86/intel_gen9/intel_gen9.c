@@ -2241,6 +2241,20 @@ intel_gen9_sysctl_clock_state(SYSCTL_HANDLER_ARGS)
 
 #define	PIPE_SRCSZ(p)		(0x7001c + (p) * 0x1000)
 #define	DDI_BUF_CTL(d)		(0x64000 + (d) * 0x100)
+
+/*
+ * Power-well control.  Per BSpec / i915 HSW_PWR_WELL_CTL_REQ pattern:
+ *   bit (idx*2)   = STATE (RO; HW asserts when the well is up)
+ *   bit (idx*2+1) = REQ   (RW; software asserts to request power up)
+ * PW1=idx1, PW2=idx2, DDI_A_E=idx3, DDI_B=idx4, DDI_C=idx5, DDI_D=idx6.
+ * SKL needs PW2 + per-DDI wells up before pipe/DDI register writes
+ * have any effect on the analog side.
+ */
+#define	HSW_PWR_WELL_CTL2	0x00045404
+#define	PWR_WELL_REQ(idx)	(1u << ((idx) * 2 + 1))
+#define	PWR_WELL_STATE(idx)	(1u << ((idx) * 2))
+#define	PW_IDX_PW2		2
+#define	PW_IDX_DDI_B		4
 #define	  DDI_BUF_CTL_ENABLE_BIT		(1u << 31)
 #define	  DDI_BUF_CTL_TRANS_SELECT_SHIFT	24
 #define	  DDI_BUF_CTL_PORT_WIDTH_X4		(3u << 1)
@@ -2281,6 +2295,27 @@ intel_gen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS)
 
 	if (error || req->newptr == NULL || trigger == 0)
 		return (error);
+
+	/*
+	 * 0) Power wells: request PW2 + DDI_B and poll for STATE up.  Without
+	 *    these the pipe/DDI register writes hit a powered-off domain and
+	 *    silently get dropped on retain.
+	 */
+	uint32_t pwr = intel_gen9_r32(sc, HSW_PWR_WELL_CTL2);
+	uint32_t want = PWR_WELL_REQ(PW_IDX_PW2) | PWR_WELL_REQ(PW_IDX_DDI_B);
+	intel_gen9_w32(sc, HSW_PWR_WELL_CTL2, pwr | want);
+	for (int spin = 0; spin < 100; spin++) {
+		uint32_t s = intel_gen9_r32(sc, HSW_PWR_WELL_CTL2);
+		uint32_t need = PWR_WELL_STATE(PW_IDX_PW2) |
+		    PWR_WELL_STATE(PW_IDX_DDI_B);
+		if ((s & need) == need) {
+			device_printf(sc->dev,
+			    "resume: PW2 + DDI_B up after %d ms (CTL2=0x%08x)\n",
+			    spin, s);
+			break;
+		}
+		DELAY(1000);
+	}
 
 	/* 1) Enable DDI_B port clock: clear CLOCK_OFF bit in DPLL_CTRL2. */
 	uint32_t dpll2 = intel_gen9_r32(sc, DPLL_CTRL2);
