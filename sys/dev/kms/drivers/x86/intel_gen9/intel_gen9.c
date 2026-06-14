@@ -390,6 +390,9 @@ intel_gen9_sysctl_bit_scan(SYSCTL_HANDLER_ARGS)
 static int	intel_gen9_sysctl_edid_read_b(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_vbt_dump(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_hpd_dump(SYSCTL_HANDLER_ARGS);
+static void	intel_gen9_edid_to_mode(const uint8_t *dtd,
+		    struct drm_display_mode *m);
+static int	intel_gen9_attach_edid_modes(struct intel_gen9_softc *sc);
 
 static void
 intel_gen9_re_sysctls_init(struct intel_gen9_softc *sc)
@@ -1035,6 +1038,107 @@ intel_gen9_sysctl_vbt_dump(SYSCTL_HANDLER_ARGS)
 	return (0);
 }
 
+/* -------------------------- EDID -> connector mode ------------------------ */
+
+/*
+ * Decode an EDID 18-byte detailed timing descriptor (block starts at byte
+ * offset 54, 72, 90, or 108 of the 128-byte EDID) into a drm_display_mode.
+ * Layout per VESA E-EDID:
+ *   0-1:  pixel clock in 10 kHz units (LE)
+ *   2:    horizontal active low 8 bits
+ *   3:    horizontal blanking low 8 bits
+ *   4:    horizontal active high 4 bits [7:4] | blanking high 4 bits [3:0]
+ *   5:    vertical active low 8 bits
+ *   6:    vertical blanking low 8 bits
+ *   7:    vertical active high 4 bits [7:4] | blanking high 4 bits [3:0]
+ *   8:    h sync offset low 8 bits
+ *   9:    h sync pulse low 8 bits
+ *   10:   v sync offset low 4 [7:4] | v sync pulse low 4 [3:0]
+ *   11:   h offset high 2 bits [7:6] | h pulse high 2 [5:4] |
+ *         v offset high 2 [3:2] | v pulse high 2 [1:0]
+ *   12-13: image width / height mm
+ *   14:   h border / v border (ignored)
+ *   17:   feature flags incl sync polarity bits [2:1] (h=2, v=1)
+ */
+static void
+intel_gen9_edid_to_mode(const uint8_t *d, struct drm_display_mode *m)
+{
+	uint32_t pixclk_10kHz = d[0] | ((uint32_t)d[1] << 8);
+	uint16_t hactive = d[2] | ((uint16_t)(d[4] >> 4) << 8);
+	uint16_t hblank  = d[3] | ((uint16_t)(d[4] & 0xf) << 8);
+	uint16_t vactive = d[5] | ((uint16_t)(d[7] >> 4) << 8);
+	uint16_t vblank  = d[6] | ((uint16_t)(d[7] & 0xf) << 8);
+	uint16_t hoff = d[8]  | ((uint16_t)((d[11] >> 6) & 0x3) << 8);
+	uint16_t hpw  = d[9]  | ((uint16_t)((d[11] >> 4) & 0x3) << 8);
+	uint16_t voff = (d[10] >> 4) | ((uint16_t)((d[11] >> 2) & 0x3) << 4);
+	uint16_t vpw  = (d[10] & 0xf) | ((uint16_t)((d[11] >> 0) & 0x3) << 4);
+
+	m->clock = pixclk_10kHz * 10;	/* kHz */
+	m->hdisplay = hactive;
+	m->hsync_start = hactive + hoff;
+	m->hsync_end = hactive + hoff + hpw;
+	m->htotal = hactive + hblank;
+	m->vdisplay = vactive;
+	m->vsync_start = vactive + voff;
+	m->vsync_end = vactive + voff + vpw;
+	m->vtotal = vactive + vblank;
+	m->flags = (d[17] & 0x02) ? KMS_MODE_FLAG_PHSYNC : KMS_MODE_FLAG_NHSYNC;
+	m->flags |= (d[17] & 0x04) ? KMS_MODE_FLAG_PVSYNC : KMS_MODE_FLAG_NVSYNC;
+	m->type = KMS_MODE_TYPE_DRIVER | KMS_MODE_TYPE_PREFERRED;
+	m->width_mm = d[12] | ((uint32_t)(d[14] >> 4) << 8);
+	m->height_mm = d[13] | ((uint32_t)(d[14] & 0xf) << 8);
+	m->vrefresh = kms_mode_vrefresh(m);
+	kms_mode_set_name(m);
+}
+
+static int
+intel_gen9_attach_edid_modes(struct intel_gen9_softc *sc)
+{
+	uint8_t edid[128];
+	int error = EIO;
+
+	/*
+	 * Cold-boot state of GMBus often leaves INUSE/SW_CLR_INT stale
+	 * enough that the first xfer NAKs.  Retry up to 4 times — by the
+	 * 2nd attempt the bus is consistently warm.
+	 */
+	for (int try = 0; try < 4; try++) {
+		error = intel_gen9_gmbus_read_block(sc, GMBUS_PIN_DDI_B,
+		    EDID_SLAVE, 0, edid, sizeof(edid));
+		if (error == 0)
+			break;
+		device_printf(sc->dev,
+		    "edid: GMBus read attempt %d failed (%d), retrying\n",
+		    try + 1, error);
+		DELAY(5000);
+	}
+	if (error != 0) {
+		device_printf(sc->dev,
+		    "edid: GMBus read gave up — connector stays UNKNOWN\n");
+		return (error);
+	}
+	if (edid[0] != 0x00 || edid[1] != 0xff || edid[7] != 0x00) {
+		device_printf(sc->dev, "edid: header invalid\n");
+		return (EIO);
+	}
+
+	for (int i = 54; i <= 108; i += 18) {
+		/* Skip non-DTD descriptors (pixclk == 0). */
+		if (edid[i] == 0 && edid[i + 1] == 0)
+			continue;
+		struct drm_display_mode *m = kms_mode_create();
+		if (m == NULL)
+			return (ENOMEM);
+		intel_gen9_edid_to_mode(&edid[i], m);
+		kms_connector_add_mode(&sc->connector, m);
+		device_printf(sc->dev,
+		    "edid: added mode %s @%u kHz  %u Hz  flags=0x%x\n",
+		    m->name, m->clock, m->vrefresh, m->flags);
+	}
+	sc->connector.status = connector_status_connected;
+	return (0);
+}
+
 /* ------------------------------- HPD -------------------------------------- */
 
 /*
@@ -1230,10 +1334,19 @@ intel_gen9_attach(device_t dev)
 		    &intel_gen9_encoder_funcs, DRM_MODE_ENCODER_DAC);
 	if (error == 0)
 		error = kms_connector_init(sc->drm_dev, &sc->connector,
-		    &intel_gen9_connector_funcs, DRM_MODE_CONNECTOR_VGA);
+		    &intel_gen9_connector_funcs,
+		    DRM_MODE_CONNECTOR_HDMIA);
 	if (error != 0)
 		device_printf(dev, "topology init: %d (will appear with"
 		    " empty/partial resources)\n", error);
+
+	/*
+	 * Best-effort EDID-on-attach: try to fetch the DDI_B EDID via GMBus
+	 * and populate the connector's mode list.  Failure leaves the
+	 * connector in UNKNOWN with no modes — userspace GETCONNECTOR still
+	 * works, it just sees a connector with no detected sink.
+	 */
+	(void)intel_gen9_attach_edid_modes(sc);
 
 	device_printf(dev, "attached: PCI 8086:%04x as /dev/dri/card%d\n",
 	    sc->pci_id, sc->drm_dev->minor);
