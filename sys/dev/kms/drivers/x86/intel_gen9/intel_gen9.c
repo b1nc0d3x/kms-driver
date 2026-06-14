@@ -2375,10 +2375,27 @@ intel_gen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS)
 	intel_gen9_w32(sc, SKL_DPLL1_ENABLE, lcpll2 & ~DPLL_ENABLE_BIT);
 	(void)intel_gen9_r32(sc, SKL_DPLL1_ENABLE);
 
-	/* DPLL_CTRL1: DPLL1 HDMI_MODE (bit 6) + OVERRIDE_EN (bit 11). */
+	/*
+	 * DPLL_CTRL1 (0x6c058) is six bits per DPLL.  For DPLL_n the
+	 * slot starts at bit (n*6) with the layout:
+	 *   +0  OVERRIDE
+	 *   +1  HDMI_MODE
+	 *   +2  SSC
+	 *   +3..+5  LINK_RATE
+	 * So DPLL1 OVERRIDE = bit 6, HDMI_MODE = bit 7.  Previously we
+	 * wrote bit 6 + bit 11 calling them "HDMI_MODE + OVERRIDE_EN"
+	 * — bit 11 is LINK_RATE[2], not OVERRIDE; and HDMI_MODE was
+	 * never set, so the PLL stayed in link-rate mode and CFGCR1/2
+	 * were ignored, which is exactly why LOCK never asserted.
+	 */
+#define	SKL_DPLL_CTRL1_OVERRIDE(id)	(1u << ((id) * 6))
+#define	SKL_DPLL_CTRL1_HDMI_MODE(id)	(1u << ((id) * 6 + 1))
 	uint32_t ctrl1 = intel_gen9_r32(sc, DPLL_CTRL1);
 	intel_gen9_w32(sc, DPLL_CTRL1,
-	    ctrl1 | (1u << 6) | (1u << 11));
+	    ctrl1 | SKL_DPLL_CTRL1_OVERRIDE(1) | SKL_DPLL_CTRL1_HDMI_MODE(1));
+	device_printf(sc->dev,
+	    "resume: DPLL_CTRL1 0x%08x -> 0x%08x (DPLL1 HDMI_MODE + OVERRIDE)\n",
+	    ctrl1, intel_gen9_r32(sc, DPLL_CTRL1));
 
 	/* CFGCR1/2 — firmware-tuned for 148.5 MHz HDMI. */
 	intel_gen9_w32(sc, 0x6c040, 0x80400173);
