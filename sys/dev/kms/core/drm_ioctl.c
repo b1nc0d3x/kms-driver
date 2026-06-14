@@ -120,14 +120,28 @@ drm_ioctl_get_cap(struct drm_file *file __unused, struct drm_get_cap *c)
 	case DRM_CAP_TIMESTAMP_MONOTONIC:
 		c->value = 1;
 		return (0);
-	case DRM_CAP_VBLANK_HIGH_CRTC:
 	case DRM_CAP_PRIME:
+		/*
+		 * drm_prime.c implements both HANDLE_TO_FD (export) and
+		 * FD_TO_HANDLE (import).  Bits per Linux uapi:
+		 *   DRM_PRIME_CAP_EXPORT = 1, DRM_PRIME_CAP_IMPORT = 2.
+		 */
+		c->value = 1 | 2;
+		return (0);
+	case DRM_CAP_CRTC_IN_VBLANK_EVENT:
+		/*
+		 * kms_send_vblank_event sets drm_event_vblank.crtc_id so
+		 * userspace can route the event by CRTC -- this is what the
+		 * cap advertises.
+		 */
+		c->value = 1;
+		return (0);
+	case DRM_CAP_VBLANK_HIGH_CRTC:
 	case DRM_CAP_ASYNC_PAGE_FLIP:
 	case DRM_CAP_CURSOR_WIDTH:
 	case DRM_CAP_CURSOR_HEIGHT:
 	case DRM_CAP_ADDFB2_MODIFIERS:
 	case DRM_CAP_PAGE_FLIP_TARGET:
-	case DRM_CAP_CRTC_IN_VBLANK_EVENT:
 	case DRM_CAP_SYNCOBJ:
 	case DRM_CAP_SYNCOBJ_TIMELINE:
 	case DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP:
