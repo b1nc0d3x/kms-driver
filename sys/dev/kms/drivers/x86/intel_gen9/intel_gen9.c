@@ -25,10 +25,12 @@
 #include <sys/systm.h>
 #include <sys/bus.h>
 #include <sys/kernel.h>
+#include <sys/lock.h>
 #include <sys/malloc.h>
 #include <sys/module.h>
 #include <sys/rman.h>
 #include <sys/sx.h>
+#include <sys/sysctl.h>
 
 #include <machine/bus.h>
 #include <machine/resource.h>
@@ -102,6 +104,41 @@ static const struct {
 
 MALLOC_DECLARE(M_KMS);
 
+/*
+ * MMIO ranges we care about on gen9 display.  Bracket the regions, not
+ * the full 16 MiB BAR — saves snapshot/diff memory and keeps the diff
+ * signal-to-noise high.  Add ranges here as bring-up uncovers new state.
+ *
+ * Stride is 4 bytes (32-bit registers) for every range; gen9 doesn't have
+ * any 8/16-bit-only MMIO that matters for display.
+ */
+struct intel_gen9_range {
+	uint32_t	start;
+	uint32_t	end;	/* inclusive */
+	const char	*name;
+};
+
+static const struct intel_gen9_range intel_gen9_ranges[] = {
+	{ 0x00044000, 0x00044100, "INT/HOTPLUG" },
+	{ 0x00045000, 0x000455ff, "PWR/DC_STATE" },
+	{ 0x00046000, 0x000460ff, "CDCLK/DPLL_CTRL" },
+	{ 0x0006c000, 0x0006c0ff, "AUDIO_PIN" },
+	{ 0x00060000, 0x000613ff, "TRANS_A/B/C/EDP" },
+	{ 0x00064000, 0x000643ff, "DDI_BUF_A/B/C/D/E" },
+	{ 0x00068000, 0x000683ff, "TRANS_DDI_FUNC_CTL" },
+	{ 0x00070000, 0x000703ff, "PIPE_A" },
+	{ 0x00071000, 0x000713ff, "PIPE_B" },
+	{ 0x00072000, 0x000723ff, "PIPE_C" },
+	{ 0x00070080, 0x000700ff, "PIPEA_GMCH/DSL" },
+	{ 0x00130000, 0x0013005f, "NORTH_GMBUS" },
+	{ 0x00162000, 0x001623ff, "DDI_AUX_A" },
+	{ 0x00164000, 0x001643ff, "DDI_AUX_B" },
+	{ 0x00164100, 0x001641ff, "DDI_AUX_C" },
+	{ 0x00164200, 0x001642ff, "DDI_AUX_D" },
+	{ 0x000c4000, 0x000c43ff, "PCH_FDI/SDE" },
+	{ 0x000c6000, 0x000c61ff, "PCH_GMBUS" },
+};
+
 struct intel_gen9_softc {
 	device_t		 dev;
 	struct drm_device	*drm_dev;
@@ -117,7 +154,298 @@ struct intel_gen9_softc {
 	struct drm_crtc		 crtc;
 	struct drm_encoder	 encoder;
 	struct drm_connector	 connector;
+
+	/* MMIO RE scaffold (snapshot/diff/poke/bit-scan). */
+	struct sx		 re_lock;
+	uint32_t		*snapshot;	/* compact, one entry per
+						 * 4-byte word in ranges[] */
+	size_t			 snapshot_words;
+	bool			 snapshot_valid;
+	uint32_t		 poke_addr;	/* set via sysctl; consumed
+						 * by poke_value sysctl */
+	uint32_t		 bit_scan_addr;
+	uint32_t		 bit_scan_skip; /* per-cycle skip count */
+	struct sysctl_ctx_list	 re_sysctl_ctx;
+	struct sysctl_oid	*re_sysctl_tree;
 };
+
+/* ----------------------------- MMIO RE helpers ---------------------------- */
+
+static inline uint32_t
+intel_gen9_r32(struct intel_gen9_softc *sc, uint32_t off)
+{
+	return (bus_read_4(sc->mmio_res, off));
+}
+
+static inline void
+intel_gen9_w32(struct intel_gen9_softc *sc, uint32_t off, uint32_t val)
+{
+	bus_write_4(sc->mmio_res, off, val);
+}
+
+/*
+ * Compute how many 32-bit words a full snapshot of intel_gen9_ranges[]
+ * occupies.  Caller-relative offset of register `addr` within the
+ * snapshot is the prefix-sum walk in intel_gen9_snapshot_index().
+ */
+static size_t
+intel_gen9_snapshot_total_words(void)
+{
+	size_t words = 0;
+
+	for (size_t i = 0; i < nitems(intel_gen9_ranges); i++) {
+		words += (intel_gen9_ranges[i].end -
+		    intel_gen9_ranges[i].start) / 4 + 1;
+	}
+	return (words);
+}
+
+/*
+ * Return the index into sc->snapshot[] corresponding to MMIO offset
+ * `addr`, or -1 if `addr` isn't in any tracked range.  O(N) over the
+ * range table — N is ~20 so this is fine in sysctl/debug paths.
+ */
+static ssize_t
+intel_gen9_snapshot_index(uint32_t addr)
+{
+	size_t base = 0;
+
+	for (size_t i = 0; i < nitems(intel_gen9_ranges); i++) {
+		const struct intel_gen9_range *r = &intel_gen9_ranges[i];
+		size_t words = (r->end - r->start) / 4 + 1;
+
+		if (addr >= r->start && addr <= r->end)
+			return ((ssize_t)(base + (addr - r->start) / 4));
+		base += words;
+	}
+	return (-1);
+}
+
+static void
+intel_gen9_snapshot_save(struct intel_gen9_softc *sc)
+{
+	sx_xlock(&sc->re_lock);
+	if (sc->snapshot == NULL) {
+		sc->snapshot_words = intel_gen9_snapshot_total_words();
+		sc->snapshot = malloc(sc->snapshot_words * sizeof(uint32_t),
+		    M_KMS, M_WAITOK | M_ZERO);
+	}
+	size_t idx = 0;
+	for (size_t i = 0; i < nitems(intel_gen9_ranges); i++) {
+		const struct intel_gen9_range *r = &intel_gen9_ranges[i];
+		for (uint32_t a = r->start; a <= r->end; a += 4)
+			sc->snapshot[idx++] = intel_gen9_r32(sc, a);
+	}
+	sc->snapshot_valid = true;
+	sx_xunlock(&sc->re_lock);
+	device_printf(sc->dev, "snapshot saved (%zu words / %zu bytes)\n",
+	    sc->snapshot_words, sc->snapshot_words * sizeof(uint32_t));
+}
+
+static void
+intel_gen9_snapshot_diff(struct intel_gen9_softc *sc)
+{
+	uint32_t changes = 0;
+
+	sx_slock(&sc->re_lock);
+	if (!sc->snapshot_valid) {
+		sx_sunlock(&sc->re_lock);
+		device_printf(sc->dev,
+		    "no snapshot saved — write 1 to mmio_snapshot_save first\n");
+		return;
+	}
+	size_t idx = 0;
+	for (size_t i = 0; i < nitems(intel_gen9_ranges); i++) {
+		const struct intel_gen9_range *r = &intel_gen9_ranges[i];
+		for (uint32_t a = r->start; a <= r->end; a += 4, idx++) {
+			uint32_t cur = intel_gen9_r32(sc, a);
+
+			if (cur != sc->snapshot[idx]) {
+				device_printf(sc->dev,
+				    "  %s 0x%08x: 0x%08x -> 0x%08x\n",
+				    r->name, a, sc->snapshot[idx], cur);
+				changes++;
+			}
+		}
+	}
+	sx_sunlock(&sc->re_lock);
+	device_printf(sc->dev, "snapshot diff: %u registers changed\n", changes);
+}
+
+/*
+ * Toggle each bit of (sc->bit_scan_addr) individually, observe whether
+ * any other tracked register changed as a side effect, then restore.
+ * Use sparingly: this is a strong probe for whether a write is even
+ * landing, plus side-effect discovery for poorly documented bits.
+ */
+static void
+intel_gen9_bit_scan(struct intel_gen9_softc *sc)
+{
+	uint32_t addr = sc->bit_scan_addr;
+	uint32_t orig, observed, bit_mask;
+
+	if (intel_gen9_snapshot_index(addr) < 0) {
+		device_printf(sc->dev,
+		    "bit_scan: 0x%08x not in any tracked range\n", addr);
+		return;
+	}
+	intel_gen9_snapshot_save(sc);
+	sx_xlock(&sc->re_lock);
+	orig = intel_gen9_r32(sc, addr);
+	device_printf(sc->dev,
+	    "bit_scan @0x%08x: orig=0x%08x (will toggle 32 bits)\n",
+	    addr, orig);
+	for (int bit = 0; bit < 32; bit++) {
+		if (sc->bit_scan_skip & (1u << bit))
+			continue;
+		bit_mask = 1u << bit;
+		intel_gen9_w32(sc, addr, orig ^ bit_mask);
+		observed = intel_gen9_r32(sc, addr);
+		device_printf(sc->dev,
+		    "  bit %2d: wrote 0x%08x, readback 0x%08x %s\n",
+		    bit, orig ^ bit_mask, observed,
+		    ((observed ^ orig) & bit_mask) ? "RW" : "RO/clamped");
+		intel_gen9_w32(sc, addr, orig);
+	}
+	sx_xunlock(&sc->re_lock);
+	device_printf(sc->dev, "bit_scan done; running side-effect diff:\n");
+	intel_gen9_snapshot_diff(sc);
+}
+
+static int
+intel_gen9_sysctl_snapshot_save(SYSCTL_HANDLER_ARGS)
+{
+	struct intel_gen9_softc *sc = arg1;
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+
+	if (error || req->newptr == NULL)
+		return (error);
+	if (trigger != 0)
+		intel_gen9_snapshot_save(sc);
+	return (0);
+}
+
+static int
+intel_gen9_sysctl_snapshot_diff(SYSCTL_HANDLER_ARGS)
+{
+	struct intel_gen9_softc *sc = arg1;
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+
+	if (error || req->newptr == NULL)
+		return (error);
+	if (trigger != 0)
+		intel_gen9_snapshot_diff(sc);
+	return (0);
+}
+
+static int
+intel_gen9_sysctl_mmio_read(SYSCTL_HANDLER_ARGS)
+{
+	struct intel_gen9_softc *sc = arg1;
+	uint32_t addr = sc->poke_addr;
+	uint32_t val;
+	int error;
+
+	val = intel_gen9_r32(sc, addr);
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (req->newptr != NULL)
+		return (EPERM);
+	return (error);
+}
+
+static int
+intel_gen9_sysctl_mmio_write(SYSCTL_HANDLER_ARGS)
+{
+	struct intel_gen9_softc *sc = arg1;
+	uint32_t val = 0;
+	int error = sysctl_handle_int(oidp, &val, 0, req);
+
+	if (error || req->newptr == NULL)
+		return (error);
+	device_printf(sc->dev, "mmio_write: 0x%08x <- 0x%08x\n",
+	    sc->poke_addr, val);
+	intel_gen9_w32(sc, sc->poke_addr, val);
+	return (0);
+}
+
+static int
+intel_gen9_sysctl_bit_scan(SYSCTL_HANDLER_ARGS)
+{
+	struct intel_gen9_softc *sc = arg1;
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+
+	if (error || req->newptr == NULL)
+		return (error);
+	if (trigger != 0)
+		intel_gen9_bit_scan(sc);
+	return (0);
+}
+
+static void
+intel_gen9_re_sysctls_init(struct intel_gen9_softc *sc)
+{
+	struct sysctl_oid_list *children;
+
+	sx_init(&sc->re_lock, "intel_gen9_re");
+	sysctl_ctx_init(&sc->re_sysctl_ctx);
+	sc->re_sysctl_tree = SYSCTL_ADD_NODE(&sc->re_sysctl_ctx,
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(sc->dev)),
+	    OID_AUTO, "re", CTLFLAG_RD | CTLFLAG_MPSAFE, NULL,
+	    "MMIO reverse-engineering scaffold");
+	children = SYSCTL_CHILDREN(sc->re_sysctl_tree);
+
+	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "mmio_snapshot_save",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, intel_gen9_sysctl_snapshot_save, "I",
+	    "write 1 to snapshot all tracked MMIO ranges");
+	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "mmio_snapshot_diff",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, intel_gen9_sysctl_snapshot_diff, "I",
+	    "write 1 to log changes since last snapshot");
+	SYSCTL_ADD_UINT(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "mmio_addr", CTLFLAG_RW, &sc->poke_addr, 0,
+	    "MMIO byte-offset for mmio_read / mmio_write");
+	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "mmio_read",
+	    CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, intel_gen9_sysctl_mmio_read, "IU",
+	    "read [mmio_addr] (32-bit)");
+	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "mmio_write",
+	    CTLTYPE_UINT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, intel_gen9_sysctl_mmio_write, "IU",
+	    "write value to [mmio_addr] (32-bit)");
+	SYSCTL_ADD_UINT(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "bit_scan_addr", CTLFLAG_RW, &sc->bit_scan_addr, 0,
+	    "MMIO byte-offset for bit_scan");
+	SYSCTL_ADD_UINT(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "bit_scan_skip", CTLFLAG_RW, &sc->bit_scan_skip, 0,
+	    "bitmask of bits bit_scan should leave alone");
+	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "bit_scan",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, intel_gen9_sysctl_bit_scan, "I",
+	    "write 1 to scan bit_scan_addr and diff side-effects");
+}
+
+static void
+intel_gen9_re_sysctls_fini(struct intel_gen9_softc *sc)
+{
+	sysctl_ctx_free(&sc->re_sysctl_ctx);
+	if (sc->snapshot != NULL) {
+		free(sc->snapshot, M_KMS);
+		sc->snapshot = NULL;
+		sc->snapshot_valid = false;
+	}
+	sx_destroy(&sc->re_lock);
+}
+
+/* ----------------------------- driver glue -------------------------------- */
 
 static const struct drm_driver intel_gen9_driver = {
 	.name		= "intel_gen9",
@@ -230,6 +558,16 @@ intel_gen9_attach(device_t dev)
 	sc->drm_dev->mode_config.funcs = &intel_gen9_mode_config_funcs;
 
 	/*
+	 * RE scaffold: live MMIO snapshot/diff/poke/bit-scan via sysctl.
+	 * Required before any display engine bring-up since the only honest
+	 * way to characterise gen9 modeset state is to capture what the
+	 * firmware / loader / previous driver left behind, then watch what
+	 * each write actually does.
+	 */
+	intel_gen9_re_sysctls_init(sc);
+	intel_gen9_snapshot_save(sc);
+
+	/*
 	 * Single stub of each KMS object so GETRESOURCES returns non-empty
 	 * and atomic-aware userspace can enumerate something.  Real
 	 * topology (one CRTC per pipe, encoders per DDI, connectors per
@@ -257,6 +595,7 @@ intel_gen9_detach(device_t dev)
 	struct intel_gen9_softc *sc = device_get_softc(dev);
 
 	if (sc->drm_dev != NULL) {
+		intel_gen9_re_sysctls_fini(sc);
 		kms_connector_cleanup(&sc->connector);
 		kms_encoder_cleanup(&sc->encoder);
 		kms_crtc_cleanup(&sc->crtc);

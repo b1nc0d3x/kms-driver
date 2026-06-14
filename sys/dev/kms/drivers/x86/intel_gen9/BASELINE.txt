@@ -1,0 +1,14 @@
+fbsdx86 (Intel HD 630, Kabylake-S GT2, PCI 8086:5912)
+Initial post-boot live MMIO state captured 2026-06-10 via dev.intel_gen9.0.re scaffold.
+Firmware/loader has Pipe A scanning out; DDI_A is the active port; DDI_B parked; C/D/E cold.
+
+CDCLK_CTL      0x46000  = 0x0c000544   CD2X div=3, freq_decimal=0x144 (low-power tier)
+PIPE_A CONF    0x70008  = 0xc0000000   bit31 ENABLE + bit30 STATE -> Pipe A active
+PIPE_B CONF    0x71008  = 0x00000000   disabled
+PIPE_C CONF    0x72008  = 0x00000000   disabled
+DDI_BUF_CTL_A  0x64000  = 0x00000081   enabled + init complete -> live port
+DDI_BUF_CTL_B  0x64100  = 0x80000000   IDLE_STATUS, parked
+DDI_BUF_CTL_C  0x64200  = 0x00000000   cold
+DDI_BUF_CTL_D  0x64300  = 0x00000000   cold
+DDI_BUF_CTL_E  0x64400  = 0x00000000   cold
+NORTH_GMBUS    0xc6014  = 0x2a480000   prescaler region
