@@ -393,6 +393,7 @@ static int	intel_gen9_sysctl_hpd_dump(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_current_mode(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_gtt_dump(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_gtt_alloc_test(SYSCTL_HANDLER_ARGS);
+static int	intel_gen9_sysctl_test_fb_make(SYSCTL_HANDLER_ARGS);
 static void	intel_gen9_edid_to_mode(const uint8_t *dtd,
 		    struct drm_display_mode *m);
 static int	intel_gen9_attach_edid_modes(struct intel_gen9_softc *sc);
@@ -474,6 +475,11 @@ intel_gen9_re_sysctls_init(struct intel_gen9_softc *sc)
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
 	    sc, 0, intel_gen9_sysctl_gtt_alloc_test, "I",
 	    "write 1 to alloc 1 page, map at GTT[2048], read back, free");
+	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "test_fb_make",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, intel_gen9_sysctl_test_fb_make, "I",
+	    "write 1 to alloc + GTT-map + checker-fill an 8 MiB 1920x1080 FB");
 }
 
 static void
@@ -1090,6 +1096,126 @@ intel_gen9_gtt_write(struct intel_gen9_softc *sc, uint32_t entry_idx,
 	uint32_t off = GTT_BASE + entry_idx * GTT_PTE_SIZE;
 	intel_gen9_w32(sc, off, (uint32_t)pte);
 	intel_gen9_w32(sc, off + 4, (uint32_t)(pte >> 32));
+}
+
+/*
+ * Owned framebuffer: contiguous kernel buffer + GTT mapping at a chosen
+ * offset.  Lives on the softc so a follow-up page-flip sysctl can swap
+ * PLANE_SURF to test_fb.gtt_offset and back to 0.
+ */
+struct intel_gen9_test_fb {
+	void		*va;
+	vm_paddr_t	 pa;
+	size_t		 size;
+	uint32_t	 gtt_first_idx;
+	uint32_t	 gtt_count;
+	uint32_t	 width;
+	uint32_t	 height;
+	uint32_t	 stride;	/* bytes */
+	bool		 mapped;
+};
+
+/* Test-FB lives at GTT[0x80000..] — same safe-past-firmware zone. */
+#define	TEST_FB_GTT_FIRST	0x80000
+
+static int
+intel_gen9_test_fb_alloc(struct intel_gen9_softc *sc,
+    struct intel_gen9_test_fb *fb, uint32_t w, uint32_t h)
+{
+	fb->width = w;
+	fb->height = h;
+	fb->stride = w * 4;
+	fb->size = (size_t)fb->stride * h;
+	fb->size = (fb->size + PAGE_SIZE - 1) & ~(size_t)(PAGE_SIZE - 1);
+	fb->gtt_count = fb->size / PAGE_SIZE;
+	fb->gtt_first_idx = TEST_FB_GTT_FIRST;
+
+	fb->va = contigmalloc(fb->size, M_KMS, M_WAITOK | M_ZERO,
+	    0, ~(vm_paddr_t)0, PAGE_SIZE, 0);
+	if (fb->va == NULL)
+		return (ENOMEM);
+	fb->pa = pmap_kextract((vm_offset_t)fb->va);
+
+	for (uint32_t i = 0; i < fb->gtt_count; i++) {
+		uint64_t pte = ((fb->pa + (uint64_t)i * PAGE_SIZE) & ~0xfffULL)
+		    | GTT_PTE_VALID | GTT_PTE_WRITEABLE;
+		intel_gen9_gtt_write(sc, fb->gtt_first_idx + i, pte);
+	}
+	fb->mapped = true;
+	return (0);
+}
+
+static void
+intel_gen9_test_fb_free(struct intel_gen9_softc *sc,
+    struct intel_gen9_test_fb *fb)
+{
+	if (fb->mapped) {
+		for (uint32_t i = 0; i < fb->gtt_count; i++)
+			intel_gen9_gtt_write(sc, fb->gtt_first_idx + i, 0);
+		fb->mapped = false;
+	}
+	if (fb->va != NULL) {
+		contigfree(fb->va, fb->size, M_KMS);
+		fb->va = NULL;
+	}
+}
+
+/* 64×64 checkerboard, two-color, in XRGB8888. */
+static void
+intel_gen9_test_fb_fill_checker(struct intel_gen9_test_fb *fb,
+    uint32_t color_a, uint32_t color_b)
+{
+	uint32_t *px = (uint32_t *)fb->va;
+	uint32_t row_stride_px = fb->stride / 4;
+
+	for (uint32_t y = 0; y < fb->height; y++) {
+		for (uint32_t x = 0; x < fb->width; x++) {
+			bool tile = ((x / 64) + (y / 64)) & 1;
+			px[y * row_stride_px + x] = tile ? color_a : color_b;
+		}
+	}
+}
+
+static int
+intel_gen9_sysctl_test_fb_make(SYSCTL_HANDLER_ARGS)
+{
+	struct intel_gen9_softc *sc = arg1;
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+
+	if (error || req->newptr == NULL || trigger == 0)
+		return (error);
+
+	struct intel_gen9_test_fb fb = { 0 };
+	error = intel_gen9_test_fb_alloc(sc, &fb, 1920, 1080);
+	if (error != 0) {
+		device_printf(sc->dev,
+		    "test_fb: alloc failed (%d) — need %u KiB contig\n",
+		    error, 1920 * 1080 * 4 / 1024);
+		return (0);
+	}
+	intel_gen9_test_fb_fill_checker(&fb, 0x00ff0000, 0x000000ff);
+
+	uint32_t *first = (uint32_t *)fb.va;
+	device_printf(sc->dev,
+	    "test_fb: %ux%u stride=%u size=%zu KiB  va=%p  pa=0x%llx\n",
+	    fb.width, fb.height, fb.stride, fb.size / 1024,
+	    fb.va, (unsigned long long)fb.pa);
+	device_printf(sc->dev,
+	    "  GTT mapped at [%u..%u]  GTT byte offset=0x%llx\n",
+	    fb.gtt_first_idx, fb.gtt_first_idx + fb.gtt_count - 1,
+	    (unsigned long long)fb.gtt_first_idx * PAGE_SIZE);
+	device_printf(sc->dev,
+	    "  first 4 px: 0x%08x 0x%08x 0x%08x 0x%08x\n",
+	    first[0], first[1], first[2], first[3]);
+	device_printf(sc->dev,
+	    "  GTT[%u] readback = 0x%016llx (expect VALID+WRITEABLE + pa)\n",
+	    fb.gtt_first_idx,
+	    (unsigned long long)intel_gen9_gtt_read(sc, fb.gtt_first_idx));
+
+	intel_gen9_test_fb_free(sc, &fb);
+	device_printf(sc->dev, "test_fb: freed cleanly\n");
+	return (0);
 }
 
 /*
