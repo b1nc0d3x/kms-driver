@@ -57,6 +57,7 @@
 #include <kms/drm_framebuffer.h>
 #include <kms/drm_gem.h>
 #include <kms/drm_plane.h>
+#include <kms/drm_vblank.h>
 
 #include <vm/vm_page.h>
 
@@ -459,6 +460,7 @@ static int	intel_gen9_sysctl_edid_read_b(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_vbt_dump(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_hpd_dump(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_current_mode(SYSCTL_HANDLER_ARGS);
+static int	intel_gen9_sysctl_clock_state(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_gtt_dump(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_gtt_alloc_test(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_test_fb_make(SYSCTL_HANDLER_ARGS);
@@ -536,6 +538,11 @@ intel_gen9_re_sysctls_init(struct intel_gen9_softc *sc)
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
 	    sc, 0, intel_gen9_sysctl_current_mode, "I",
 	    "write 1 to read back live pipe/transcoder timing as a mode");
+	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "clock_state",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, intel_gen9_sysctl_clock_state, "I",
+	    "write 1 to dump CDCLK / LCPLL / DPLL / DDI clock-on-off state");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "gtt_dump",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
@@ -2124,6 +2131,94 @@ intel_gen9_sysctl_hpd_dump(SYSCTL_HANDLER_ARGS)
 	return (0);
 }
 
+/* --------------------------- CDCLK / DPLL readback ------------------------ */
+
+/*
+ * SKL+ Central Display Clock.  Per BSpec:
+ *   CDCLK_CTL bits[26:24] = CD2X_DIVIDER_SELECT
+ *     000 = div1, 001 = div1.5, 010 = div2, 011 = div4
+ *   CDCLK_CTL bits[10:0]  = CD_FREQ_DECIMAL
+ *     a one-less-than-twice-frequency encoding; e.g. 337.5 MHz = 0x0a8
+ *
+ * SKL CDCLK_FREQ tier table (per BSpec):
+ *   337.5 MHz   freq_dec = 0x344  cd2x = div1
+ *   450 MHz     freq_dec = 0x468  cd2x = div1
+ *   540 MHz     freq_dec = 0x540  cd2x = div1
+ *   675 MHz     freq_dec = 0x650  cd2x = div1
+ */
+#define	CDCLK_CTL		0x00046000
+
+static const char *
+intel_gen9_cdclk_decode(uint32_t cdclk_ctl)
+{
+	/*
+	 * freq_decimal field encodes (2*MHz - 2) so:
+	 *   337.5 MHz -> 0x2A1, 450 MHz -> 0x382, 540 MHz -> 0x434,
+	 *   617.143 MHz -> 0x4D2, 675 MHz -> 0x544.
+	 * The 0x000a8 / 0x000a4 pre-SKL tier values were i915-internal
+	 * constants for a separate encoding; SKL+ uses these.
+	 */
+	uint32_t freq_dec = cdclk_ctl & 0x7ff;
+	switch (freq_dec) {
+	case 0x2a1: return "337.5 MHz";
+	case 0x382: return "450 MHz";
+	case 0x434: return "540 MHz";
+	case 0x4d2: return "617.143 MHz";
+	case 0x544: return "675 MHz";
+	default:  return "unknown";
+	}
+}
+
+/*
+ * DPLL routing on SKL+: each port reads its clock from a DPLL via the
+ * DPLL_CTRL2 SELECT bits.  DPLL_CTRL1 carries the link rate per DPLL.
+ */
+#define	DPLL_CTRL1		0x00006c058
+#define	DPLL_CTRL2		0x00006c05c
+#define	LCPLL1_CTL		0x00046010
+#define	LCPLL2_CTL		0x00046014
+
+static int
+intel_gen9_sysctl_clock_state(SYSCTL_HANDLER_ARGS)
+{
+	struct intel_gen9_softc *sc = arg1;
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+
+	if (error || req->newptr == NULL || trigger == 0)
+		return (error);
+
+	uint32_t cdclk = intel_gen9_r32(sc, CDCLK_CTL);
+	uint32_t lcpll1 = intel_gen9_r32(sc, LCPLL1_CTL);
+	uint32_t lcpll2 = intel_gen9_r32(sc, LCPLL2_CTL);
+	uint32_t dpll1 = intel_gen9_r32(sc, DPLL_CTRL1);
+	uint32_t dpll2 = intel_gen9_r32(sc, DPLL_CTRL2);
+
+	device_printf(sc->dev,
+	    "clock: CDCLK_CTL=0x%08x  (%s, cd2x_div=%u, freq_dec=0x%03x)\n",
+	    cdclk, intel_gen9_cdclk_decode(cdclk),
+	    (cdclk >> 22) & 0x7, cdclk & 0x7ff);
+	device_printf(sc->dev,
+	    "clock: LCPLL1_CTL=0x%08x  LCPLL2_CTL=0x%08x\n",
+	    lcpll1, lcpll2);
+	device_printf(sc->dev,
+	    "clock: DPLL_CTRL1=0x%08x  DPLL_CTRL2=0x%08x\n", dpll1, dpll2);
+
+	/*
+	 * DPLL_CTRL2 layout: bits[3] DDI_A_CLOCK_OFF, [4] DDI_B_OFF, [5] C_OFF,
+	 * [6] D_OFF, [7] E_OFF.  bits[15:13] DDI_E_CLOCK_SELECT (2 bits each).
+	 * 0 means clock-on; 1 means off.
+	 */
+	for (int port = 0; port < 5; port++) {
+		uint32_t off = (dpll2 >> (3 + port)) & 1;
+		uint32_t sel = (dpll2 >> (1 + port * 3)) & 0x3;
+		device_printf(sc->dev,
+		    "  DDI_%c: %s  DPLL_SEL=%u\n",
+		    'A' + port, off ? "CLOCK_OFF" : "clock-on", sel);
+	}
+	return (0);
+}
+
 /* --------------------------- vblank sync ---------------------------------- */
 
 /*
@@ -2193,10 +2288,13 @@ intel_gen9_irq_handler(void *arg)
 	intel_gen9_w32(sc, GEN8_MASTER_IRQ, master_w);
 
 	sc->irq_total_count++;
+	bool pipe_a_vblank = false;
 	if (master & GEN8_DE_PIPE_A_IRQ) {
 		uint32_t iir = intel_gen9_r32(sc, GEN8_DE_PIPE_IIR(0));
-		if (iir & GEN8_PIPE_VBLANK)
+		if (iir & GEN8_PIPE_VBLANK) {
 			sc->vblank_count_pipe_a++;
+			pipe_a_vblank = true;
+		}
 		intel_gen9_w32(sc, GEN8_DE_PIPE_IIR(0), iir);
 	}
 	if (master & GEN8_DE_PIPE_B_IRQ) {
@@ -2215,6 +2313,15 @@ intel_gen9_irq_handler(void *arg)
 	intel_gen9_w32(sc, GEN8_MASTER_IRQ,
 	    master_w | GEN8_MASTER_IRQ_CONTROL);
 	(void)intel_gen9_r32(sc, GEN8_MASTER_IRQ);	/* posting flush */
+
+	/*
+	 * Deliver to framework AFTER re-enabling master: kms_vblank_handler
+	 * takes mode_config.mutex (sleep-capable sx) and walks the per-file
+	 * pending-flip list to dispatch DRM_EVENT_FLIP_COMPLETE.  Cheap in
+	 * the no-pending-flip case (one locked check + sequence++).
+	 */
+	if (pipe_a_vblank)
+		kms_vblank_handler(&sc->crtc);
 }
 
 static int
