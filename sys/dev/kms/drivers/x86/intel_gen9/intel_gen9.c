@@ -2241,8 +2241,36 @@ intel_gen9_sysctl_clock_state(SYSCTL_HANDLER_ARGS)
 
 #define	PIPE_SRCSZ(p)		(0x7001c + (p) * 0x1000)
 #define	DDI_BUF_CTL(d)		(0x64000 + (d) * 0x100)
-#define	  DDI_BUF_CTL_ENABLE_BIT (1u << 31)
+#define	  DDI_BUF_CTL_ENABLE_BIT		(1u << 31)
+#define	  DDI_BUF_CTL_TRANS_SELECT_SHIFT	24
+#define	  DDI_BUF_CTL_PORT_WIDTH_X4		(3u << 1)
+#define	  DDI_BUF_CTL_INIT_DISPLAY_DETECTED	(1u << 0)
+#define	  DDI_BUF_CTL_IDLE_STATUS		(1u << 7)
 #define	DPLL_CTRL2_DDI_B_OFF	(1u << 4)
+
+/*
+ * DDI_BUF_TRANS table — analog voltage swing / pre-emphasis params
+ * per port.  Each port has its own 10-entry bank of (LO, HI) pairs
+ * at 0x64E00 + port*0x60.  DDI_BUF_CTL bits[27:24] picks the active
+ * entry.  Values lifted from i915's skl_ddi_translations_hdmi
+ * (intel_ddi.c) -- level 8 is the standard "1000 mV / 0 dB" entry
+ * that works for HDMI 1.4 up to 165 MHz pixclk.
+ */
+#define	DDI_BUF_TRANS_LO(p, i)	(0x64E00 + (p) * 0x60 + (i) * 8)
+#define	DDI_BUF_TRANS_HI(p, i)	(0x64E04 + (p) * 0x60 + (i) * 8)
+
+static const uint32_t skl_hdmi_ddi_trans[10][2] = {
+	{ 0x00000018, 0x000000A0 },
+	{ 0x00005012, 0x000000B0 },
+	{ 0x00007011, 0x000000CB },
+	{ 0x00000018, 0x000000E1 },
+	{ 0x00000018, 0x000000A1 },
+	{ 0x00000018, 0x000000B0 },
+	{ 0x00000018, 0x000000CA },
+	{ 0x00000018, 0x000000C0 },
+	{ 0x80008712, 0x000000C0 },	/* level 8 — default HDMI */
+	{ 0x80008712, 0x000000C7 },
+};
 
 static int
 intel_gen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS)
@@ -2287,8 +2315,37 @@ intel_gen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS)
 	intel_gen9_w32(sc, PLANE_CTL(0),
 	    PLANE_CTL_ENABLE | (0x4 << PLANE_CTL_FORMAT_SHIFT));
 
-	/* 6) Enable DDI_B output driver. */
-	intel_gen9_w32(sc, DDI_BUF_CTL(1), DDI_BUF_CTL_ENABLE_BIT);
+	/*
+	 * 6) Program DDI_B analog buffer: voltage swing table + control
+	 *    word per i915 intel_ddi_pre_enable_hdmi.  PORT=1 (DDI_B).
+	 *    TRANS_SELECT=8 picks the default HDMI 1000 mV / 0 dB entry,
+	 *    PORT_WIDTH_X4 is the mandatory HDMI 4-lane (TMDS clock + 3
+	 *    differential pairs), INIT_DISPLAY_DETECTED arms the
+	 *    "display present" gate.  ENABLE goes last.
+	 */
+	for (int i = 0; i < 10; i++) {
+		intel_gen9_w32(sc, DDI_BUF_TRANS_LO(1, i),
+		    skl_hdmi_ddi_trans[i][0]);
+		intel_gen9_w32(sc, DDI_BUF_TRANS_HI(1, i),
+		    skl_hdmi_ddi_trans[i][1]);
+	}
+	intel_gen9_w32(sc, DDI_BUF_CTL(1),
+	    DDI_BUF_CTL_ENABLE_BIT |
+	    (8u << DDI_BUF_CTL_TRANS_SELECT_SHIFT) |
+	    DDI_BUF_CTL_PORT_WIDTH_X4 |
+	    DDI_BUF_CTL_INIT_DISPLAY_DETECTED);
+
+	/* Poll IDLE_STATUS to clear; BSpec says < 600 us. */
+	for (int spin = 0; spin < 200; spin++) {
+		uint32_t bc = intel_gen9_r32(sc, DDI_BUF_CTL(1));
+		if ((bc & DDI_BUF_CTL_IDLE_STATUS) == 0) {
+			device_printf(sc->dev,
+			    "resume: DDI_B left IDLE after %d us\n",
+			    spin * 10);
+			break;
+		}
+		DELAY(10);
+	}
 
 	DELAY(20000);	/* ~20 ms for HW to stabilise */
 	device_printf(sc->dev,
