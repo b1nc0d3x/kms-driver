@@ -2109,6 +2109,25 @@ intel_gen9_sysctl_hpd_dump(SYSCTL_HANDLER_ARGS)
 	return (0);
 }
 
+/* --------------------------- vblank sync ---------------------------------- */
+
+/*
+ * Wait until PIPE_FRMCOUNT advances at least once.  At 60 Hz a vblank
+ * arrives every ~16.7 ms; the polled cost is bounded by the loop cap.
+ * Cap at 50 iterations of 1 ms (= 50 ms) so a stalled pipe never wedges
+ * atomic_commit.
+ */
+static void
+intel_gen9_wait_vblank(struct intel_gen9_softc *sc, int pipe)
+{
+	uint32_t start = intel_gen9_r32(sc, PIPE_FRMCOUNT(pipe));
+	for (int spin = 0; spin < 50; spin++) {
+		if (intel_gen9_r32(sc, PIPE_FRMCOUNT(pipe)) != start)
+			return;
+		pause("gen9vbl", hz / 1000);
+	}
+}
+
 /* ----------------------------- driver glue -------------------------------- */
 
 static const struct drm_driver intel_gen9_driver = {
@@ -2223,7 +2242,11 @@ intel_gen9_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 			/*
 			 * Generic dumb-buffer FB (CREATE_DUMB + ADDFB2 path).
 			 * Bind its GEM pages into our user-FB GTT range,
-			 * then point PLANE_SURF at that range.
+			 * then point PLANE_SURF at that range.  Sync the
+			 * PLANE_SURF write to a vblank edge so the frame
+			 * currently scanning out completes before HW
+			 * latches the new SURF -- eliminates partial-frame
+			 * tearing on the page-flip path.
 			 */
 			uint32_t new_surf = intel_gen9_gtt_bind_user_fb(sc,
 			    ps->fb);
@@ -2236,12 +2259,9 @@ intel_gen9_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 			if (!sc->scanout_held)
 				sc->scanout_prev_surf =
 				    intel_gen9_r32(sc, PLANE_SURF(0));
+			intel_gen9_wait_vblank(sc, 0);
 			intel_gen9_w32(sc, PLANE_SURF(0), new_surf);
 			sc->scanout_held = true;
-			device_printf(sc->dev,
-			    "atomic_commit: dumb FB_ID %u (%u pages) -> "
-			    "PLANE_SURF=0x%08x\n", ps->fb->base.id,
-			    (unsigned)ps->fb->gem_objs[0]->npages, new_surf);
 		} else if (ps->fb == NULL && sc->scanout_held) {
 			intel_gen9_w32(sc, PLANE_SURF(0), sc->scanout_prev_surf);
 			sc->scanout_held = false;
