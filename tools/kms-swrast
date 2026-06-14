@@ -1,0 +1,73 @@
+#!/bin/sh
+#
+# kms-swrast -- launch a program with Mesa forced into its kms_swrast
+# (software, dumb-buffer) winsys against the kms framework's /dev/dri.
+#
+# Why: Mesa's loader picks a gallium driver based on the kernel PCI
+# device's vendor/device id.  On an Intel HD 630 it tries iris, which
+# expects the I915_GEM_* command-stream ioctls we don't implement.
+# Forcing kms_swrast tells Mesa to use llvmpipe / softpipe to render
+# software-rasterised GL into a CREATE_DUMB buffer + present via the
+# atomic path -- using only the ioctls our framework actually serves.
+#
+# What's set:
+#   MESA_LOADER_DRIVER_OVERRIDE=kms_swrast  Skip the PCI-ID lookup,
+#       go straight to kms_swrast winsys
+#   LIBGL_ALWAYS_SOFTWARE=1                 Belt-and-suspenders for
+#       paths that bypass MESA_LOADER_DRIVER_OVERRIDE
+#   GALLIUM_DRIVER=llvmpipe                 LLVM-JIT'd rasterizer; if
+#       absent llvmpipe-as-default still chosen by kms_swrast
+#   GBM_PROVIDER=mesa                       Consumed by tools/gbm_dual
+#       to also exercise Mesa's libgbm path
+#
+# Usage:
+#   kms-swrast glxinfo
+#   kms-swrast weston --backend=drm-backend.so --renderer=gl
+#   kms-swrast es2_info
+#
+# Without arguments, prints the resolved environment + sanity checks
+# and exits 0.
+
+set -e
+
+: "${KMS_DEVICE:=/dev/dri/card0}"
+
+# Sanity: kernel modules + cdev present.
+warn=
+if ! kldstat -m kms >/dev/null 2>&1; then
+	warn="${warn}  warn: kms.ko not loaded (kldload /boot/modules/kms.ko)\n"
+fi
+if [ ! -e "$KMS_DEVICE" ]; then
+	warn="${warn}  warn: $KMS_DEVICE does not exist; no consumer driver attached?\n"
+fi
+
+# Mesa-side env to force the software path.
+export MESA_LOADER_DRIVER_OVERRIDE=kms_swrast
+export LIBGL_ALWAYS_SOFTWARE=1
+export GALLIUM_DRIVER="${GALLIUM_DRIVER:-llvmpipe}"
+export GBM_PROVIDER="${GBM_PROVIDER:-mesa}"
+export GBM_BACKEND="${GBM_BACKEND:-dri}"
+
+# DRM_DEVICE / WAYLAND_DISPLAY for the launched program.
+export DRM_DEVICE="$KMS_DEVICE"
+
+if [ $# -eq 0 ]; then
+	cat <<EOF
+kms-swrast: Mesa-via-kms_swrast launcher for the kms framework
+
+env:
+  KMS_DEVICE                       $KMS_DEVICE
+  DRM_DEVICE                       $DRM_DEVICE
+  MESA_LOADER_DRIVER_OVERRIDE      $MESA_LOADER_DRIVER_OVERRIDE
+  LIBGL_ALWAYS_SOFTWARE            $LIBGL_ALWAYS_SOFTWARE
+  GALLIUM_DRIVER                   $GALLIUM_DRIVER
+  GBM_PROVIDER                     $GBM_PROVIDER
+  GBM_BACKEND                      $GBM_BACKEND
+EOF
+	if [ -n "$warn" ]; then
+		printf "%b" "$warn" >&2
+	fi
+	exit 0
+fi
+
+exec "$@"
