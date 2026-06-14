@@ -496,6 +496,38 @@ intel_gen9_re_sysctls_fini(struct intel_gen9_softc *sc)
 
 #define	EDID_SLAVE		0x50
 
+#define	DDI_BUF_CTL_A		0x64000
+#define	DDI_BUF_CTL_B		0x64100
+#define	DDI_BUF_CTL_C		0x64200
+#define	DDI_BUF_CTL_D		0x64300
+#define	DDI_BUF_CTL_E		0x64400
+#define	DDI_BUF_CTL_ENABLE	(1u << 31)
+#define	DDI_BUF_IS_IDLE		(1u << 7)
+
+static void
+intel_gen9_ddi_buf_wake(struct intel_gen9_softc *sc, uint32_t buf_ctl_reg)
+{
+	uint32_t v = intel_gen9_r32(sc, buf_ctl_reg);
+
+	device_printf(sc->dev, "ddi_buf 0x%05x: pre=0x%08x (idle=%d)\n",
+	    buf_ctl_reg, v, (v & DDI_BUF_IS_IDLE) != 0);
+
+	/*
+	 * Touch ENABLE again; i915 sometimes does this explicitly to wake
+	 * the DDC line.  Then poll for !IDLE.  IDLE clear ~500us after
+	 * ENABLE rises per BSpec.
+	 */
+	intel_gen9_w32(sc, buf_ctl_reg, v | DDI_BUF_CTL_ENABLE);
+	for (int i = 0; i < 100; i++) {
+		v = intel_gen9_r32(sc, buf_ctl_reg);
+		if ((v & DDI_BUF_IS_IDLE) == 0)
+			break;
+		DELAY(10);
+	}
+	device_printf(sc->dev, "ddi_buf 0x%05x: post=0x%08x (idle=%d)\n",
+	    buf_ctl_reg, v, (v & DDI_BUF_IS_IDLE) != 0);
+}
+
 static int
 intel_gen9_gmbus_wait(struct intel_gen9_softc *sc, uint32_t bit)
 {
@@ -599,6 +631,80 @@ intel_gen9_sysctl_edid_read_b(SYSCTL_HANDLER_ARGS)
 		return (error);
 	if (trigger == 0)
 		return (0);
+
+	/*
+	 * trigger=4: scan slave addresses on the only electrically alive
+	 * pin (pin 4) with a 1-byte read.  ACK without NAK = slave present.
+	 */
+	if (trigger == 4) {
+		for (uint8_t s = 0x08; s <= 0x77; s++) {
+			uint8_t one = 0;
+			uint32_t cmd, val, snap;
+			error = 0;
+
+			intel_gen9_w32(sc, GMBUS0, 0);
+			intel_gen9_w32(sc, GMBUS4, 0);
+			intel_gen9_w32(sc, GMBUS5, 0);
+			intel_gen9_w32(sc, GMBUS1, GMBUS_SW_CLR_INT);
+			intel_gen9_w32(sc, GMBUS1, 0);
+			if (intel_gen9_r32(sc, GMBUS2) & GMBUS_INUSE)
+				intel_gen9_w32(sc, GMBUS2, GMBUS_INUSE);
+			intel_gen9_w32(sc, GMBUS0, 4 | GMBUS_RATE_100KHZ);
+
+			cmd = GMBUS_SW_RDY | GMBUS_CYCLE_STOP |
+			    ((uint32_t)1 << GMBUS_BYTE_COUNT_SHIFT) |
+			    ((uint32_t)s << GMBUS_SLAVE_ADDR_SHIFT) |
+			    GMBUS_SLAVE_READ;
+			intel_gen9_w32(sc, GMBUS1, cmd);
+
+			for (int spin = 0; spin < 5000; spin++) {
+				snap = intel_gen9_r32(sc, GMBUS2);
+				if (snap & (GMBUS_NAK | GMBUS_HW_RDY |
+				    GMBUS_HW_WAIT))
+					break;
+				DELAY(10);
+			}
+			val = (snap & GMBUS_HW_RDY) ?
+			    intel_gen9_r32(sc, GMBUS3) : 0;
+			one = val & 0xff;
+			if ((snap & GMBUS_NAK) == 0) {
+				device_printf(sc->dev,
+				    "scan: slave 0x%02x ACK!  GMBUS2=0x%08x"
+				    "  byte0=0x%02x\n", s, snap, one);
+			}
+			intel_gen9_w32(sc, GMBUS0, 0);
+		}
+		device_printf(sc->dev, "scan done\n");
+		return (0);
+	}
+
+	/*
+	 * trigger=3: wake DDI_BUF_CTL_B then read EDID on pin 5 (canonical
+	 * SKL+ DDI_B pin).  Goal: prove that the live HDMI port's DDC line
+	 * is gated on DDI_BUF being active rather than just having ENABLE
+	 * set passively.  Fallback to pin 4 if pin 5 still times out.
+	 */
+	if (trigger == 3) {
+		intel_gen9_ddi_buf_wake(sc, DDI_BUF_CTL_B);
+		DELAY(2000);
+		for (uint32_t pin = 5; pin >= 4; pin--) {
+			memset(edid, 0, sizeof(edid));
+			error = intel_gen9_gmbus_read_block(sc, pin,
+			    EDID_SLAVE, 0, edid, 16);
+			device_printf(sc->dev,
+			    "post-wake pin %u: err=%d  first16:"
+			    " %02x %02x %02x %02x %02x %02x %02x %02x"
+			    "  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+			    pin, error,
+			    edid[0], edid[1], edid[2], edid[3],
+			    edid[4], edid[5], edid[6], edid[7],
+			    edid[8], edid[9], edid[10], edid[11],
+			    edid[12], edid[13], edid[14], edid[15]);
+			if (error == 0)
+				break;
+		}
+		return (0);
+	}
 
 	/*
 	 * Pin sweep: try every GMBUS pin in [1..9] with the EDID slave.

@@ -44,11 +44,22 @@ Decoded conclusions for next bring-up steps:
 GMBus xfer status 2026-06-10:
   Controller is reachable (PCH GMBus at 0xc5100 responds to writes; INUSE
   W1C visible).  GMBus state machine completes electrically only on pin 4
-  (DDI_C) with NAK at EDID slave 0x50; pins 1/2/3/5/6/7/8/9 all timeout
-  on the address-write phase.  Pin 5 (DDI_B) being dead is in conflict
-  with TRANS_DDI_FUNC_CTL_A pointing PORT_SEL=1; firmware may have routed
-  to DDI_B logically but the physical DDC line is unplugged / disabled.
-  Likely fix: enable DDI_BUF_CTL_n bit 31 for the target port before
-  GMBus xfer to wake DDC power gate.  Validated GMBus protocol stack
-  (clear INUSE W1C, CYCLE_WAIT addr-phase, CYCLE_STOP read-phase, 4-byte
-  DWORD slicing of GMBUS3) is correct on the controller side.
+  (canonical DDI_C) with NAK at EDID slave 0x50; pins 1/2/3/5/6/7/8/9 all
+  timeout on the address-write phase.
+
+  Tested 2026-06-10:
+    a) Re-asserting DDI_BUF_CTL_B ENABLE (already was 0x80000000, idle=0)
+       made no difference — buffer was already awake; DDC line is not
+       gated by DDI_BUF state on this board.
+    b) Full slave-address scan 0x08..0x64 on pin 4: every address NAKs.
+       Beyond 0x65 the bus wedges with GMBUS2=0x00008000 (INUSE stuck).
+       Conclusion: no I2C slave answers on pin 4 either.
+
+  Net: firmware-programmed Pipe A is actively scanning to DDI_B but the
+  physical DDC line of whichever connector matters is either (1) on a
+  port not in the canonical SKL+ pin map for this desktop motherboard,
+  or (2) the monitor was unplugged after boot and the firmware-programmed
+  mode is scanning to nothing.  Next session should either VBT-parse
+  /dev/iopl mailbox 0x2 or sweep DDI_BUF_CTL_C/D/E for any other live
+  port + redo scan.  Validated GMBus protocol stack is correct on the
+  controller side.
