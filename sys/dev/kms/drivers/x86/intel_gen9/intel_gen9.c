@@ -116,6 +116,15 @@ MALLOC_DECLARE(M_KMS);
 struct intel_gen9_test_fb;	/* defined further down */
 
 /*
+ * User-FB GTT slot cache: each ADDFB2 dumb buffer gets one slot of
+ * 2048 PTEs (8 MiB) at USER_FB_GTT_FIRST + slot*USER_FB_GTT_SLOT_PAGES.
+ * Forward-declared here so the softc can size its slot table.
+ */
+#define	USER_FB_GTT_FIRST	0xa0000
+#define	USER_FB_GTT_SLOT_PAGES	2048
+#define	USER_FB_GTT_NSLOTS	8
+
+/*
  * Driver-owned drm_framebuffer wrapper.  The persistent scanout_fb gets
  * exposed to userspace via this -- ADDFB-style external creation is the
  * eventual general path; for now expose_scanout_fb sysctl wires the
@@ -195,6 +204,18 @@ struct intel_gen9_softc {
 	struct thread		*anim_td;
 	volatile bool		 anim_stop;
 	bool			 anim_active;
+
+	/*
+	 * Per-FB GTT slot cache.  When atomic_commit sees a dumb FB, it
+	 * looks it up here; if present, reuse the slot's GTT offset; if
+	 * absent, allocate the next slot, bind the FB's GEM pages, and
+	 * record it.  Cleared on detach.  Round-robin LRU when full.
+	 */
+	struct {
+		struct drm_framebuffer	*fb;	/* NULL = empty */
+		uint32_t		 surf;	/* GTT byte offset */
+	}			 user_fb_slots[USER_FB_GTT_NSLOTS];
+	uint32_t		 user_fb_next_slot;
 
 	/* MMIO RE scaffold (snapshot/diff/poke/bit-scan). */
 	struct sx		 re_lock;
@@ -1187,8 +1208,13 @@ struct intel_gen9_test_fb {
 
 /* Test-FB lives at GTT[0x80000..] — same safe-past-firmware zone. */
 #define	TEST_FB_GTT_FIRST	0x80000
-/* Userspace-allocated FBs bind to GTT[0xa0000..] (2.5 GiB GTT offset). */
-#define	USER_FB_GTT_FIRST	0xa0000
+/*
+ * USER_FB_GTT_* are forward-declared near the softc.  Each slot is
+ * 2048 entries (8 MiB scanout buffer) so a 1920x1080 XR24 FB fits in
+ * one slot.  Per-fb slot cache lives on the softc; 3-buffer animation
+ * gets 3 distinct PLANE_SURF addresses and HW never re-maps a live
+ * scanout buffer.
+ */
 
 /*
  * Bind a generic drm_framebuffer (whose GEM object holds the backing
@@ -1207,13 +1233,40 @@ intel_gen9_gtt_bind_user_fb(struct intel_gen9_softc *sc,
 
 	if (obj == NULL || obj->pages == NULL || obj->npages == 0)
 		return (0);
+	if (obj->npages > USER_FB_GTT_SLOT_PAGES) {
+		device_printf(sc->dev,
+		    "gtt_bind: FB too big (%u pages, slot=%u)\n",
+		    (unsigned)obj->npages, USER_FB_GTT_SLOT_PAGES);
+		return (0);
+	}
+
+	/* Cache hit: reuse the slot we already mapped this FB into. */
+	for (uint32_t i = 0; i < USER_FB_GTT_NSLOTS; i++)
+		if (sc->user_fb_slots[i].fb == fb)
+			return (sc->user_fb_slots[i].surf);
+
+	/* Find empty slot; if none, round-robin evict. */
+	uint32_t slot = USER_FB_GTT_NSLOTS;
+	for (uint32_t i = 0; i < USER_FB_GTT_NSLOTS; i++)
+		if (sc->user_fb_slots[i].fb == NULL) { slot = i; break; }
+	if (slot == USER_FB_GTT_NSLOTS) {
+		slot = sc->user_fb_next_slot;
+		sc->user_fb_next_slot =
+		    (sc->user_fb_next_slot + 1) % USER_FB_GTT_NSLOTS;
+	}
+
+	uint32_t first_idx = USER_FB_GTT_FIRST +
+	    slot * USER_FB_GTT_SLOT_PAGES;
 	for (size_t i = 0; i < obj->npages; i++) {
 		vm_paddr_t pa = VM_PAGE_TO_PHYS(obj->pages[i]);
 		uint64_t pte = (pa & ~0xfffULL) | GTT_PTE_VALID |
 		    GTT_PTE_WRITEABLE;
-		intel_gen9_gtt_write(sc, USER_FB_GTT_FIRST + i, pte);
+		intel_gen9_gtt_write(sc, first_idx + i, pte);
 	}
-	return ((uint32_t)USER_FB_GTT_FIRST * PAGE_SIZE);
+	uint32_t surf = first_idx * PAGE_SIZE;
+	sc->user_fb_slots[slot].fb = fb;
+	sc->user_fb_slots[slot].surf = surf;
+	return (surf);
 }
 
 static int
