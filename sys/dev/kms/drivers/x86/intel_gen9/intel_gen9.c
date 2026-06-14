@@ -489,7 +489,18 @@ intel_gen9_re_sysctls_fini(struct intel_gen9_softc *sc)
 #define	GMBUS4			0x000c5110
 #define	GMBUS5			0x000c5120
 
+/*
+ * SKL/KBL/CFL Display WA #0868: PCH GMBus unit clock is gated by default
+ * on Sunrise Point / Kaby Point PCH.  Without explicitly disabling the
+ * gate before a transaction, GMBUS0 writes go through but the IOs never
+ * drive — pins look electrically dead with no NAK and no HW_RDY.
+ * Bit 31 of SOUTH_DSPCLK_GATE_D is the gate-disable.
+ */
+#define	SOUTH_DSPCLK_GATE_D		0x000c2020
+#define	  PCH_GMBUSUNIT_CLK_GATE_DIS	(1u << 31)
+
 #define	GMBUS_RATE_100KHZ	(0 << 8)
+#define	GMBUS_BYTE_CNT_OVERRIDE	(1u << 6)	/* GMBUS0 — allow >9 byte */
 #define	GMBUS_PIN_DDI_C		4
 #define	GMBUS_PIN_DDI_B		5
 #define	GMBUS_PIN_DDI_D		6
@@ -571,6 +582,17 @@ intel_gen9_gmbus_read_block(struct intel_gen9_softc *sc, uint32_t pin,
 		return (EINVAL);
 
 	/*
+	 * Display WA #0868: disable PCH GMBus clock gating.  Keep it
+	 * disabled across transactions — toggling per-xfer leaves the
+	 * controller in a transient state that causes the next xfer to
+	 * NAK or wedge.  Power cost is negligible for a polled DDC path.
+	 */
+	uint32_t gate = intel_gen9_r32(sc, SOUTH_DSPCLK_GATE_D);
+	if ((gate & PCH_GMBUSUNIT_CLK_GATE_DIS) == 0)
+		intel_gen9_w32(sc, SOUTH_DSPCLK_GATE_D,
+		    gate | PCH_GMBUSUNIT_CLK_GATE_DIS);
+
+	/*
 	 * Quiesce the controller: clear any stuck interrupt, ensure 2-byte
 	 * index off, then park GMBUS0=0 before reprogramming the pin.
 	 * GMBUS2 INUSE is write-1-to-clear; without explicitly W1C-ing it
@@ -605,9 +627,20 @@ intel_gen9_gmbus_read_block(struct intel_gen9_softc *sc, uint32_t pin,
 		    error);
 		goto out;
 	}
+	/*
+	 * EDID EEPROMs need a settle delay between offset-pointer write and
+	 * the read phase; without it the EEPROM clocks out stale-pointer
+	 * data (often 0x00) for the first few bytes.
+	 */
+	DELAY(500);
 
-	/* Phase 2: read `len` bytes. */
-	cmd = GMBUS_SW_RDY | GMBUS_CYCLE_STOP |
+	/*
+	 * Phase 2: read `len` bytes.  CYCLE_WAIT (not STOP) here matches
+	 * i915: it keeps the bus open for the whole multi-byte read and
+	 * relies on the unconditional STOP terminator in the `out:` block
+	 * to drive STOP on the wire after the last byte.
+	 */
+	cmd = GMBUS_SW_RDY | GMBUS_CYCLE_WAIT |
 	    ((uint32_t)len << GMBUS_BYTE_COUNT_SHIFT) |
 	    ((uint32_t)slave << GMBUS_SLAVE_ADDR_SHIFT) |
 	    GMBUS_SLAVE_READ;
@@ -627,10 +660,18 @@ intel_gen9_gmbus_read_block(struct intel_gen9_softc *sc, uint32_t pin,
 			buf[got++] = (val >> (i * 8)) & 0xff;
 	}
 out:
-	/* Tri-state bus + clear status. */
+	/*
+	 * Per i915: always terminate with an explicit CYCLE_STOP+SW_RDY
+	 * write to GMBUS1 to drive STOP on the wire and re-park the FSM,
+	 * even on success.  Then tri-state pin, W1C INUSE, leave the
+	 * clock-gate disabled for the next xfer.
+	 */
+	intel_gen9_w32(sc, GMBUS1, GMBUS_SW_RDY | GMBUS_CYCLE_STOP);
+	(void)intel_gen9_gmbus_wait(sc, GMBUS_HW_WAIT);
 	intel_gen9_w32(sc, GMBUS0, 0);
 	intel_gen9_w32(sc, GMBUS1, GMBUS_SW_CLR_INT);
 	intel_gen9_w32(sc, GMBUS1, 0);
+	intel_gen9_w32(sc, GMBUS2, GMBUS_INUSE);
 	return (error);
 }
 

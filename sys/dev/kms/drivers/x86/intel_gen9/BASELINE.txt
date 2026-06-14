@@ -41,7 +41,22 @@ Decoded conclusions for next bring-up steps:
   - active mode is the classic 1080p60 CEA-VIC 16; safe target to re-program
   - 8bpc, HDMI mode; no DP link training needed for round-trip
 
-GMBus xfer status 2026-06-10:
+GMBus xfer status 2026-06-13 -- EDID WORKING:
+  XYM W156F1, mfg=632d, product=0x1566.
+  DTD 0: pixclk=148.50 MHz, HActive=1920, HBlank=280, HTotal=2200,
+         VActive=1080.  Matches firmware-programmed Pipe A mode exactly.
+  Unblocked by two fixes:
+    (a) Display WA #0868 — set PCH_GMBUSUNIT_CLK_GATE_DIS (bit 31 of
+        SOUTH_DSPCLK_GATE_D at 0xc2020) and KEEP it disabled across
+        xfers.  Toggling per-xfer left the controller in a transient
+        state that caused intermittent NAK / wedge.
+    (b) Explicit W1C of GMBUS_INUSE (bit 15 of GMBUS2) at end of every
+        xfer.  Without this, the next attempt sees INUSE stuck and the
+        controller doesn't actually run on the wire.
+  Pin map confirmed by working read: pin 5 = HDMI-B = canonical SKL+
+  mapping (matches VBT child[1]).
+
+Earlier (pre-fix) GMBus xfer status 2026-06-10:
   Controller is reachable (PCH GMBus at 0xc5100 responds to writes; INUSE
   W1C visible).  GMBus state machine completes electrically only on pin 4
   (canonical DDI_C) with NAK at EDID slave 0x50; pins 1/2/3/5/6/7/8/9 all
