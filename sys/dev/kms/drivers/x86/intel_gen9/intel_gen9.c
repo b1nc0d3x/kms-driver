@@ -1087,8 +1087,16 @@ intel_gen9_sysctl_vbt_dump(SYSCTL_HANDLER_ARGS)
 #define	GTT_PTE_VALID		(1u << 0)
 #define	GTT_PTE_WRITEABLE	(1u << 1)
 
-/* Primary plane registers — defined here so test_fb_flip can use them. */
+/*
+ * Primary-plane registers needed for the page-flip path.  PLANE_SURF is
+ * the armed (next-vblank) surface offset; PLANE_SURFLIVE reads back the
+ * surface address HW is currently scanning out.  PIPE_FRMCOUNT is the
+ * vblank-incremented frame counter — a sanity check that the pipe is
+ * actually running (not just that we wrote a register).
+ */
 #define	PLANE_SURF(p)		(0x7019c + (p) * 0x1000)
+#define	PLANE_SURFLIVE(p)	(0x701ac + (p) * 0x1000)
+#define	PIPE_FRMCOUNT(p)	(0x70040 + (p) * 0x1000)
 
 static uint64_t
 intel_gen9_gtt_read(struct intel_gen9_softc *sc, uint32_t entry_idx)
@@ -1218,17 +1226,46 @@ intel_gen9_sysctl_test_fb_flip(SYSCTL_HANDLER_ARGS)
 	 */
 	uint32_t prev_surf = intel_gen9_r32(sc, PLANE_SURF(0));
 	uint32_t new_surf  = fb.gtt_first_idx * PAGE_SIZE;
+	uint32_t live_before = intel_gen9_r32(sc, PLANE_SURFLIVE(0));
+	uint32_t frm_before  = intel_gen9_r32(sc, PIPE_FRMCOUNT(0));
 
 	device_printf(sc->dev,
 	    "test_fb_flip: PLANE_SURF 0x%08x -> 0x%08x (hold %d s)\n",
 	    prev_surf, new_surf, hold_sec);
+	device_printf(sc->dev,
+	    "  pre:   SURFLIVE=0x%08x  FRMCOUNT=%u\n",
+	    live_before, frm_before);
 
 	intel_gen9_w32(sc, PLANE_SURF(0), new_surf);
+
+	/*
+	 * Sample SURFLIVE shortly after the arm to confirm HW latched it
+	 * at the next vblank.  At 60 Hz a vblank arrives every ~16.7 ms;
+	 * 50 ms of pause is plenty.
+	 */
+	pause("gen9arm", hz / 20);
+	uint32_t live_armed = intel_gen9_r32(sc, PLANE_SURFLIVE(0));
+	device_printf(sc->dev,
+	    "  armed: SURFLIVE=0x%08x  %s\n", live_armed,
+	    ((live_armed & 0xfffff000) == new_surf) ?
+	    "FLIP TOOK" : "FLIP DID NOT TAKE");
+
 	pause("gen9flp", hold_sec * hz);
+	uint32_t live_end = intel_gen9_r32(sc, PLANE_SURFLIVE(0));
+	uint32_t frm_end  = intel_gen9_r32(sc, PIPE_FRMCOUNT(0));
+
 	intel_gen9_w32(sc, PLANE_SURF(0), prev_surf);
+	pause("gen9rst", hz / 20);
+	uint32_t live_restored = intel_gen9_r32(sc, PLANE_SURFLIVE(0));
 
 	device_printf(sc->dev,
-	    "test_fb_flip: PLANE_SURF restored to 0x%08x\n", prev_surf);
+	    "  during: SURFLIVE=0x%08x  FRMCOUNT=%u  (advanced %u frames)\n",
+	    live_end, frm_end, frm_end - frm_before);
+	device_printf(sc->dev,
+	    "  after restore: SURFLIVE=0x%08x  %s\n",
+	    live_restored,
+	    ((live_restored & 0xfffff000) == (prev_surf & 0xfffff000)) ?
+	    "RESTORED OK" : "RESTORE FAILED");
 	intel_gen9_test_fb_free(sc, &fb);
 	return (0);
 }
