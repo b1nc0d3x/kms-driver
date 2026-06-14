@@ -55,7 +55,10 @@
 #include <kms/drm_mode_config.h>
 #include <kms/drm_modes.h>
 #include <kms/drm_framebuffer.h>
+#include <kms/drm_gem.h>
 #include <kms/drm_plane.h>
+
+#include <vm/vm_page.h>
 
 #define	INTEL_PCI_VENDOR	0x8086
 
@@ -1184,6 +1187,34 @@ struct intel_gen9_test_fb {
 
 /* Test-FB lives at GTT[0x80000..] — same safe-past-firmware zone. */
 #define	TEST_FB_GTT_FIRST	0x80000
+/* Userspace-allocated FBs bind to GTT[0xa0000..] (2.5 GiB GTT offset). */
+#define	USER_FB_GTT_FIRST	0xa0000
+
+/*
+ * Bind a generic drm_framebuffer (whose GEM object holds the backing
+ * pages) into the GTT so HW can scan from it.  Walks ps->fb->gem_objs[0]
+ * page array, writes one GTT PTE per page at USER_FB_GTT_FIRST.
+ * Returns the GTT byte offset usable in PLANE_SURF, or 0 on error.
+ *
+ * Caller-owned: we don't unmap on FB destroy because the same range is
+ * reused for the next user FB.  Single active scanout buffer at a time.
+ */
+static uint32_t
+intel_gen9_gtt_bind_user_fb(struct intel_gen9_softc *sc,
+    struct drm_framebuffer *fb)
+{
+	struct drm_gem_object *obj = fb->gem_objs[0];
+
+	if (obj == NULL || obj->pages == NULL || obj->npages == 0)
+		return (0);
+	for (size_t i = 0; i < obj->npages; i++) {
+		vm_paddr_t pa = VM_PAGE_TO_PHYS(obj->pages[i]);
+		uint64_t pte = (pa & ~0xfffULL) | GTT_PTE_VALID |
+		    GTT_PTE_WRITEABLE;
+		intel_gen9_gtt_write(sc, USER_FB_GTT_FIRST + i, pte);
+	}
+	return ((uint32_t)USER_FB_GTT_FIRST * PAGE_SIZE);
+}
 
 static int
 intel_gen9_test_fb_alloc(struct intel_gen9_softc *sc,
@@ -2135,6 +2166,29 @@ intel_gen9_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 			device_printf(sc->dev,
 			    "atomic_commit: plane FB_ID %u -> PLANE_SURF=0x%08x\n",
 			    ps->fb->base.id, new_surf);
+		} else if (ps->fb != NULL) {
+			/*
+			 * Generic dumb-buffer FB (CREATE_DUMB + ADDFB2 path).
+			 * Bind its GEM pages into our user-FB GTT range,
+			 * then point PLANE_SURF at that range.
+			 */
+			uint32_t new_surf = intel_gen9_gtt_bind_user_fb(sc,
+			    ps->fb);
+			if (new_surf == 0) {
+				device_printf(sc->dev,
+				    "atomic_commit: FB_ID %u has no GEM"
+				    " backing\n", ps->fb->base.id);
+				continue;
+			}
+			if (!sc->scanout_held)
+				sc->scanout_prev_surf =
+				    intel_gen9_r32(sc, PLANE_SURF(0));
+			intel_gen9_w32(sc, PLANE_SURF(0), new_surf);
+			sc->scanout_held = true;
+			device_printf(sc->dev,
+			    "atomic_commit: dumb FB_ID %u (%u pages) -> "
+			    "PLANE_SURF=0x%08x\n", ps->fb->base.id,
+			    (unsigned)ps->fb->gem_objs[0]->npages, new_surf);
 		} else if (ps->fb == NULL && sc->scanout_held) {
 			intel_gen9_w32(sc, PLANE_SURF(0), sc->scanout_prev_surf);
 			sc->scanout_held = false;
