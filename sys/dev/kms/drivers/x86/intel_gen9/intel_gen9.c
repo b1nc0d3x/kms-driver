@@ -25,9 +25,11 @@
 #include <sys/systm.h>
 #include <sys/bus.h>
 #include <sys/kernel.h>
+#include <sys/kthread.h>
 #include <sys/lock.h>
 #include <sys/malloc.h>
 #include <sys/module.h>
+#include <sys/proc.h>
 #include <sys/rman.h>
 #include <sys/sx.h>
 #include <sys/sysctl.h>
@@ -169,6 +171,11 @@ struct intel_gen9_softc {
 	struct intel_gen9_test_fb *scanout_fb;
 	uint32_t		 scanout_prev_surf;
 	bool			 scanout_held;
+
+	/* Animation kthread: while running, advances a moving dot per tick. */
+	struct thread		*anim_td;
+	volatile bool		 anim_stop;
+	bool			 anim_active;
 
 	/* MMIO RE scaffold (snapshot/diff/poke/bit-scan). */
 	struct sx		 re_lock;
@@ -504,8 +511,8 @@ intel_gen9_re_sysctls_init(struct intel_gen9_softc *sc)
 	    "scanout_hold",
 	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
 	    sc, 0, intel_gen9_sysctl_scanout_hold, "I",
-	    "1 = alloc + GTT-map + flip PLANE_SURF to checker FB and HOLD;"
-	    " 0 = restore + free");
+	    "1 = checker, 2 = diagnostic gradient+grid, both flip PLANE_SURF"
+	    " and HOLD;  0 = restore firmware FB + free");
 }
 
 static void
@@ -1214,6 +1221,121 @@ intel_gen9_test_fb_fill_checker(struct intel_gen9_test_fb *fb,
 }
 
 /*
+ * Self-describing diagnostic pattern in XRGB8888:
+ *   - horizontal R gradient, vertical G gradient (proves color depth)
+ *   - black grid every 100 px (proves x/y addressing + stride)
+ *   - solid white 32-px squares in each corner (anchors orientation)
+ *   - solid red 64-px band along top, green 64-px band along bottom
+ *     (immediately recognisable as "this is our buffer not the desktop")
+ */
+static void
+intel_gen9_test_fb_fill_diag(struct intel_gen9_test_fb *fb)
+{
+	uint32_t *px = (uint32_t *)fb->va;
+	uint32_t row_stride_px = fb->stride / 4;
+	uint32_t w = fb->width;
+	uint32_t h = fb->height;
+
+	for (uint32_t y = 0; y < h; y++) {
+		for (uint32_t x = 0; x < w; x++) {
+			uint32_t r = (x * 255) / (w - 1);
+			uint32_t g = (y * 255) / (h - 1);
+			uint32_t color = (r << 16) | (g << 8);
+
+			if ((x % 100) == 0 || (y % 100) == 0)
+				color = 0;
+			if (y < 64)
+				color = 0x00ff0000;	/* top red band */
+			else if (y >= h - 64)
+				color = 0x0000ff00;	/* bottom green band */
+			if ((x < 32 && y < 32) ||
+			    (x >= w - 32 && y < 32) ||
+			    (x < 32 && y >= h - 32) ||
+			    (x >= w - 32 && y >= h - 32))
+				color = 0x00ffffff;	/* corner anchors */
+			px[y * row_stride_px + x] = color;
+		}
+	}
+}
+
+/*
+ * Animation kthread.  Owns the held FB while it's alive: each tick
+ * stamps a moving white dot onto the FB at a new position, demonstrating
+ * that CPU writes through the kernel mapping reach physical memory that
+ * HW reads via GTT.  Sleeps 16 ms between frames (~60 Hz) to align with
+ * scanout rate.
+ */
+static void
+intel_gen9_anim_thread(void *arg)
+{
+	struct intel_gen9_softc *sc = arg;
+	uint32_t frame = 0;
+	uint32_t prev_x = 0, prev_y = 0;
+
+	while (!sc->anim_stop && sc->scanout_held && sc->scanout_fb != NULL) {
+		struct intel_gen9_test_fb *fb = sc->scanout_fb;
+		uint32_t *px = (uint32_t *)fb->va;
+		uint32_t row_stride_px = fb->stride / 4;
+
+		/* Lissajous figure scaled to interior of FB minus 64-px banding. */
+		uint32_t cx = fb->width  / 2;
+		uint32_t cy = fb->height / 2;
+		uint32_t r1 = (fb->width  / 2) - 100;
+		uint32_t r2 = (fb->height / 2) - 100;
+		uint32_t t = frame;
+		int sin_t1 = (int)((int64_t)r1 *
+		    (int)((t * 3) % 360) / 180 - r1);
+		int sin_t2 = (int)((int64_t)r2 *
+		    (int)((t * 5) % 360) / 180 - r2);
+		uint32_t x = cx + sin_t1;
+		uint32_t y = cy + sin_t2;
+		if (x >= fb->width)  x = fb->width - 32;
+		if (y >= fb->height) y = fb->height - 32;
+
+		/* Erase previous 32x32 dot. */
+		for (uint32_t dy = 0; dy < 32 && (prev_y + dy) < fb->height; dy++) {
+			for (uint32_t dx = 0; dx < 32 && (prev_x + dx) < fb->width; dx++)
+				px[(prev_y + dy) * row_stride_px + (prev_x + dx)] =
+				    0x00202020;	/* dark grey trail */
+		}
+		/* Draw new dot. */
+		for (uint32_t dy = 0; dy < 32 && (y + dy) < fb->height; dy++) {
+			for (uint32_t dx = 0; dx < 32 && (x + dx) < fb->width; dx++)
+				px[(y + dy) * row_stride_px + (x + dx)] = 0x00ffffff;
+		}
+		prev_x = x; prev_y = y;
+		frame++;
+		pause("gen9ani", hz / 60);
+	}
+	sc->anim_active = false;
+	kthread_exit();
+}
+
+static void
+intel_gen9_anim_start(struct intel_gen9_softc *sc)
+{
+	if (sc->anim_active)
+		return;
+	sc->anim_stop = false;
+	sc->anim_active = true;
+	if (kthread_add(intel_gen9_anim_thread, sc, NULL, &sc->anim_td,
+	    0, 0, "gen9anim") != 0) {
+		sc->anim_active = false;
+		device_printf(sc->dev, "anim: kthread_add failed\n");
+	}
+}
+
+static void
+intel_gen9_anim_stop(struct intel_gen9_softc *sc)
+{
+	if (!sc->anim_active)
+		return;
+	sc->anim_stop = true;
+	while (sc->anim_active)
+		pause("gen9axw", hz / 100);
+}
+
+/*
  * scanout_hold: persistent flip.  Write 1 to allocate + flip; write 0
  * to restore + free.  Lets userspace observe arbitrary work happening
  * over the static checker buffer.  Idempotent in both directions.
@@ -1240,8 +1362,18 @@ intel_gen9_sysctl_scanout_hold(SYSCTL_HANDLER_ARGS)
 			sc->scanout_fb = NULL;
 			return (0);
 		}
-		intel_gen9_test_fb_fill_checker(sc->scanout_fb,
-		    0x00ff0000, 0x000000ff);
+		/*
+		 * hold value picks pattern:
+		 *   1 -> checker (red/blue)
+		 *   2 -> self-describing diagnostic gradient + grid
+		 *   3 -> diagnostic + animation kthread (moving dot)
+		 * Anything else > 0 -> checker.
+		 */
+		if (hold == 2 || hold == 3)
+			intel_gen9_test_fb_fill_diag(sc->scanout_fb);
+		else
+			intel_gen9_test_fb_fill_checker(sc->scanout_fb,
+			    0x00ff0000, 0x000000ff);
 
 		sc->scanout_prev_surf = intel_gen9_r32(sc, PLANE_SURF(0));
 		uint32_t new_surf = sc->scanout_fb->gtt_first_idx * PAGE_SIZE;
@@ -1251,7 +1383,11 @@ intel_gen9_sysctl_scanout_hold(SYSCTL_HANDLER_ARGS)
 		device_printf(sc->dev,
 		    "scanout_hold: ON  PLANE_SURF 0x%08x -> 0x%08x\n",
 		    sc->scanout_prev_surf, new_surf);
+
+		if (hold == 3)
+			intel_gen9_anim_start(sc);
 	} else if (!hold && sc->scanout_held) {
+		intel_gen9_anim_stop(sc);
 		intel_gen9_w32(sc, PLANE_SURF(0), sc->scanout_prev_surf);
 		pause("gen9rst", hz / 20);
 		intel_gen9_test_fb_free(sc, sc->scanout_fb);
@@ -1995,6 +2131,7 @@ intel_gen9_detach(device_t dev)
 	struct intel_gen9_softc *sc = device_get_softc(dev);
 
 	if (sc->scanout_held && sc->scanout_fb != NULL) {
+		intel_gen9_anim_stop(sc);
 		intel_gen9_w32(sc, PLANE_SURF(0), sc->scanout_prev_surf);
 		pause("gen9rst", hz / 20);
 		intel_gen9_test_fb_free(sc, sc->scanout_fb);
