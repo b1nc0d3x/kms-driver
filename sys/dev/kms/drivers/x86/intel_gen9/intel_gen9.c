@@ -114,6 +114,22 @@ static const struct {
 
 MALLOC_DECLARE(M_KMS);
 
+/*
+ * 4-level debug print idiom shared with rk_kms / fusb302 / rk_cdn_dp.
+ *   level 0  milestones (attach, modeset, scanout swap)
+ *   level 1  protocol (GMBus xfer, atomic_commit per call)
+ *   level 2  per-frame (vblank, page flip rate)
+ *   level 3  hex dumps (snapshot diffs, register sweeps)
+ * Gated on the softc's sc_debug counter so the cold path is one branch.
+ * Settable at runtime via dev.intel_gen9.<n>.debug or boot-time via the
+ * matching loader tunable.
+ */
+#define	DPRINTF(sc, level, ...)						\
+	do {								\
+		if ((sc)->sc_debug > (level))				\
+			device_printf((sc)->dev, __VA_ARGS__);		\
+	} while (0)
+
 struct intel_gen9_test_fb;	/* defined further down */
 
 /*
@@ -193,6 +209,9 @@ struct intel_gen9_softc {
 	uint64_t		 vblank_count_pipe_b;
 	uint64_t		 vblank_count_pipe_c;
 	uint64_t		 irq_total_count;
+
+	/* Debug verbosity level (0 = silent except errors). */
+	int			 sc_debug;
 
 	/* Minimal KMS topology — one of each, all stubs. */
 	struct drm_crtc		 crtc;
@@ -484,6 +503,18 @@ intel_gen9_re_sysctls_init(struct intel_gen9_softc *sc)
 	    OID_AUTO, "re", CTLFLAG_RD | CTLFLAG_MPSAFE, NULL,
 	    "MMIO reverse-engineering scaffold");
 	children = SYSCTL_CHILDREN(sc->re_sysctl_tree);
+
+	/*
+	 * Debug verbosity at the device root (not under .re/) so the
+	 * tunable name dev.intel_gen9.<n>.debug matches the cross-driver
+	 * convention.  CTLFLAG_RWTUN makes it settable both at boot via
+	 * loader.conf and at runtime via sysctl.
+	 */
+	SYSCTL_ADD_INT(&sc->re_sysctl_ctx,
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(sc->dev)),
+	    OID_AUTO, "debug", CTLFLAG_RWTUN, &sc->sc_debug, 0,
+	    "Debug verbosity: 0=silent, 1=milestones, 2=protocol,"
+	    " 3=per-frame, 4=hex");
 
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "mmio_snapshot_save",
@@ -1587,7 +1618,7 @@ intel_gen9_sysctl_scanout_hold(SYSCTL_HANDLER_ARGS)
 		intel_gen9_w32(sc, PLANE_SURF(0), new_surf);
 		sc->scanout_held = true;
 
-		device_printf(sc->dev,
+		DPRINTF(sc, 0,
 		    "scanout_hold: ON  PLANE_SURF 0x%08x -> 0x%08x\n",
 		    sc->scanout_prev_surf, new_surf);
 
@@ -1601,7 +1632,7 @@ intel_gen9_sysctl_scanout_hold(SYSCTL_HANDLER_ARGS)
 		free(sc->scanout_fb, M_KMS);
 		sc->scanout_fb = NULL;
 		sc->scanout_held = false;
-		device_printf(sc->dev,
+		DPRINTF(sc, 0,
 		    "scanout_hold: OFF  PLANE_SURF restored to 0x%08x\n",
 		    sc->scanout_prev_surf);
 	}
@@ -2045,7 +2076,7 @@ intel_gen9_attach_edid_modes(struct intel_gen9_softc *sc)
 		    EDID_SLAVE, 0, edid, sizeof(edid));
 		if (error == 0)
 			break;
-		device_printf(sc->dev,
+		DPRINTF(sc, 1,
 		    "edid: GMBus read attempt %d failed (%d), retrying\n",
 		    try + 1, error);
 		DELAY(5000);
@@ -2699,7 +2730,7 @@ intel_gen9_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 			continue;
 		if (!cs->active) {
 			/* Pipe-off: also TODO, but logging is harmless. */
-			device_printf(sc->dev,
+			DPRINTF(sc, 1,
 			    "atomic_commit: pipe %u off-request (no-op)\n", i);
 			continue;
 		}
@@ -2718,7 +2749,7 @@ intel_gen9_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 			    live.htotal, live.vtotal);
 			return (ENOTSUP);
 		}
-		device_printf(sc->dev,
+		DPRINTF(sc, 1,
 		    "atomic_commit: pipe %u — requested matches live"
 		    " %ux%u  (no-op)\n", i, live.hdisplay, live.vdisplay);
 	}
@@ -2746,7 +2777,7 @@ intel_gen9_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 				    intel_gen9_r32(sc, PLANE_SURF(0));
 			intel_gen9_w32(sc, PLANE_SURF(0), new_surf);
 			sc->scanout_held = true;
-			device_printf(sc->dev,
+			DPRINTF(sc, 1,
 			    "atomic_commit: plane FB_ID %u -> PLANE_SURF=0x%08x\n",
 			    ps->fb->base.id, new_surf);
 		} else if (ps->fb != NULL) {
@@ -2776,7 +2807,7 @@ intel_gen9_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 		} else if (ps->fb == NULL && sc->scanout_held) {
 			intel_gen9_w32(sc, PLANE_SURF(0), sc->scanout_prev_surf);
 			sc->scanout_held = false;
-			device_printf(sc->dev,
+			DPRINTF(sc, 1,
 			    "atomic_commit: plane fb=NULL -> PLANE_SURF"
 			    " restored to 0x%08x\n", sc->scanout_prev_surf);
 		}
