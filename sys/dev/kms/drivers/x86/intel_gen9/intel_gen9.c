@@ -2372,6 +2372,35 @@ intel_gen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS)
 	 *   6. Poll LOCK (BSpec says <5 ms)
 	 */
 	uint32_t lcpll2 = intel_gen9_r32(sc, SKL_DPLL1_ENABLE);
+	/*
+	 * Diagnostic: dump all 4 SKL DPLLs so we can see which one
+	 * firmware actually uses for the live HDMI scanout.  DPLL1
+	 * (LCPLL2) had ENABLE=1 LOCK=0 — a dead PLL — so it can't be
+	 * the source; this lets us find the real one.
+	 *   DPLL0 = LCPLL1 @ 0x46010 (usually CDCLK)
+	 *   DPLL1 = LCPLL2 @ 0x46014
+	 *   DPLL2 = WRPLL1 @ 0x46040
+	 *   DPLL3 = WRPLL2 @ 0x46060
+	 */
+	for (int id = 0; id < 4; id++) {
+		uint32_t off = (id == 0) ? 0x46010 :
+		    (id == 1) ? 0x46014 :
+		    (id == 2) ? 0x46040 : 0x46060;
+		uint32_t v = intel_gen9_r32(sc, off);
+		device_printf(sc->dev,
+		    "resume: DPLL%d @0x%05x = 0x%08x  (ENABLE=%d LOCK=%d)\n",
+		    id, off, v,
+		    (v & DPLL_ENABLE_BIT) ? 1 : 0,
+		    (v & DPLL_LOCK_BIT) ? 1 : 0);
+	}
+	uint32_t ctrl2 = intel_gen9_r32(sc, DPLL_CTRL2);
+	for (int port = 0; port < 5; port++) {
+		uint32_t sel = (ctrl2 >> (port * 3 + 1)) & 0x3;
+		bool off_bit = (ctrl2 >> (port + 15)) & 0x1;
+		device_printf(sc->dev,
+		    "resume: DDI_%c clk_sel=DPLL%u  clk_off=%d\n",
+		    'A' + port, sel, off_bit ? 1 : 0);
+	}
 	intel_gen9_w32(sc, SKL_DPLL1_ENABLE, lcpll2 & ~DPLL_ENABLE_BIT);
 	(void)intel_gen9_r32(sc, SKL_DPLL1_ENABLE);
 
