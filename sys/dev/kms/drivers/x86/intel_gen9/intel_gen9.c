@@ -394,6 +394,7 @@ static int	intel_gen9_sysctl_current_mode(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_gtt_dump(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_gtt_alloc_test(SYSCTL_HANDLER_ARGS);
 static int	intel_gen9_sysctl_test_fb_make(SYSCTL_HANDLER_ARGS);
+static int	intel_gen9_sysctl_test_fb_flip(SYSCTL_HANDLER_ARGS);
 static void	intel_gen9_edid_to_mode(const uint8_t *dtd,
 		    struct drm_display_mode *m);
 static int	intel_gen9_attach_edid_modes(struct intel_gen9_softc *sc);
@@ -480,6 +481,12 @@ intel_gen9_re_sysctls_init(struct intel_gen9_softc *sc)
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
 	    sc, 0, intel_gen9_sysctl_test_fb_make, "I",
 	    "write 1 to alloc + GTT-map + checker-fill an 8 MiB 1920x1080 FB");
+	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "test_fb_flip",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, intel_gen9_sysctl_test_fb_flip, "I",
+	    "write N (seconds 1..10) to flip PLANE_SURF to our checker FB"
+	    " then restore");
 }
 
 static void
@@ -1080,6 +1087,9 @@ intel_gen9_sysctl_vbt_dump(SYSCTL_HANDLER_ARGS)
 #define	GTT_PTE_VALID		(1u << 0)
 #define	GTT_PTE_WRITEABLE	(1u << 1)
 
+/* Primary plane registers — defined here so test_fb_flip can use them. */
+#define	PLANE_SURF(p)		(0x7019c + (p) * 0x1000)
+
 static uint64_t
 intel_gen9_gtt_read(struct intel_gen9_softc *sc, uint32_t entry_idx)
 {
@@ -1174,6 +1184,53 @@ intel_gen9_test_fb_fill_checker(struct intel_gen9_test_fb *fb,
 			px[y * row_stride_px + x] = tile ? color_a : color_b;
 		}
 	}
+}
+
+static int
+intel_gen9_sysctl_test_fb_flip(SYSCTL_HANDLER_ARGS)
+{
+	struct intel_gen9_softc *sc = arg1;
+	int hold_sec = 0;
+	int error = sysctl_handle_int(oidp, &hold_sec, 0, req);
+
+	if (error || req->newptr == NULL)
+		return (error);
+	if (hold_sec <= 0)
+		return (0);
+	if (hold_sec > 10)
+		hold_sec = 10;
+
+	struct intel_gen9_test_fb fb = { 0 };
+	error = intel_gen9_test_fb_alloc(sc, &fb, 1920, 1080);
+	if (error != 0) {
+		device_printf(sc->dev, "test_fb_flip: alloc failed: %d\n",
+		    error);
+		return (0);
+	}
+	intel_gen9_test_fb_fill_checker(&fb, 0x00ff0000, 0x000000ff);
+
+	/*
+	 * Flip plane 1 of pipe A to scan from our buffer.  Our FB matches
+	 * the firmware-programmed scanout in every observable parameter
+	 * (1920x1080, XRGB8888, linear, stride 7680) so a single PLANE_SURF
+	 * write is the entire change.  PLANE_SURF is the "armed" register —
+	 * the change takes effect at the next vblank.
+	 */
+	uint32_t prev_surf = intel_gen9_r32(sc, PLANE_SURF(0));
+	uint32_t new_surf  = fb.gtt_first_idx * PAGE_SIZE;
+
+	device_printf(sc->dev,
+	    "test_fb_flip: PLANE_SURF 0x%08x -> 0x%08x (hold %d s)\n",
+	    prev_surf, new_surf, hold_sec);
+
+	intel_gen9_w32(sc, PLANE_SURF(0), new_surf);
+	pause("gen9flp", hold_sec * hz);
+	intel_gen9_w32(sc, PLANE_SURF(0), prev_surf);
+
+	device_printf(sc->dev,
+	    "test_fb_flip: PLANE_SURF restored to 0x%08x\n", prev_surf);
+	intel_gen9_test_fb_free(sc, &fb);
+	return (0);
 }
 
 static int
@@ -1355,7 +1412,6 @@ intel_gen9_sysctl_gtt_dump(SYSCTL_HANDLER_ARGS)
 #define	PLANE_STRIDE(p)		(0x70188 + (p) * 0x1000)
 #define	PLANE_POS(p)		(0x7018c + (p) * 0x1000)
 #define	PLANE_SIZE(p)		(0x70190 + (p) * 0x1000)
-#define	PLANE_SURF(p)		(0x7019c + (p) * 0x1000)
 #define	PLANE_OFFSET(p)		(0x701a4 + (p) * 0x1000)
 
 static const char *
