@@ -2043,7 +2043,7 @@ static const struct drm_driver igen9_driver = {
  * per-fb mappings so repeated arming of the same fb is cheap.
  */
 static void
-igen9_arm_scanout(struct igen9_softc *sc, struct drm_framebuffer *fb)
+igen9_program_scanout(struct igen9_softc *sc, struct drm_framebuffer *fb)
 {
 	uint32_t surf;
 	uint32_t stride;
@@ -2054,7 +2054,7 @@ igen9_arm_scanout(struct igen9_softc *sc, struct drm_framebuffer *fb)
 	surf = igen9_gtt_bind_user_fb(sc, fb);
 	if (surf == 0) {
 		device_printf(sc->dev,
-		    "arm_scanout: gtt_bind failed for fb %u (%ux%u, pitch=%u)\n",
+		    "program_scanout: gtt_bind failed for fb %u (%ux%u, pitch=%u)\n",
 		    fb->base.id, fb->width, fb->height, fb->pitches[0]);
 		return;
 	}
@@ -2064,7 +2064,7 @@ igen9_arm_scanout(struct igen9_softc *sc, struct drm_framebuffer *fb)
 	igen9_w32(sc, PLANE_STRIDE(0), stride);
 	igen9_w32(sc, PLANE_SURF(0), surf);
 	DPRINTF(sc, 1,
-	    "arm_scanout: fb %u (%ux%u pitch=%u) -> PLANE_SURF=0x%08x"
+	    "program_scanout: fb %u (%ux%u pitch=%u) -> PLANE_SURF=0x%08x"
 	    " STRIDE=%u\n",
 	    fb->base.id, fb->width, fb->height, fb->pitches[0],
 	    surf, stride);
@@ -2094,7 +2094,7 @@ igen9_legacy_set_config(struct drm_mode_set *set)
 	crtc->x = set->x;
 	crtc->y = set->y;
 
-	igen9_arm_scanout(sc, set->fb);
+	igen9_program_scanout(sc, set->fb);
 	return (0);
 }
 
@@ -2108,7 +2108,7 @@ igen9_legacy_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
 		return (EINVAL);
 	sc = crtc->dev->driver_priv;
 	crtc->primary_fb = fb;
-	igen9_arm_scanout(sc, fb);
+	igen9_program_scanout(sc, fb);
 	return (0);
 }
 
