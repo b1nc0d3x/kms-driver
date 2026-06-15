@@ -84,6 +84,14 @@ kms_open(struct cdev *cdev, int oflags __unused, int devtype __unused,
 	file->dev = dev;
 	file->authenticated = false;
 	file->is_master = false;
+	/*
+	 * Tag opens of /dev/dri/renderD<128+N> so kms_ioctl can reject the
+	 * KMS-only ioctls per Linux render-node ABI.  Compare the cdev we
+	 * were opened on to the device's render_cdev pointer rather than
+	 * sniff the minor — render_cdev may be NULL when the render node
+	 * wasn't created (kms_dev_register continues without it).
+	 */
+	file->is_render_node = (cdev == dev->render_cdev);
 	file->magic = 0;
 	sx_init(&file->handle_lock, "drmgem");
 	TAILQ_INIT(&file->handles);

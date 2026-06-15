@@ -42,6 +42,15 @@ struct drm_file {
 	struct drm_device	*dev;
 	bool			 authenticated;
 	bool			 is_master;
+	/*
+	 * Render-node opens (/dev/dri/renderD<128+N>) get is_render_node=true
+	 * and a tighter ioctl whitelist enforced in kms_ioctl: no SET_MASTER,
+	 * no MODE_SETCRTC / PAGE_FLIP / ATOMIC, no ADDFB(2) / RMFB,
+	 * no WAIT_VBLANK.  PRIME + dumb-buffer + GET_CAP / GET_RESOURCES
+	 * stay permitted so Mesa can allocate render buffers without
+	 * needing master.
+	 */
+	bool			 is_render_node;
 	uint32_t		 magic;
 	uint32_t		 client_caps;
 	TAILQ_ENTRY(drm_file)	 link;

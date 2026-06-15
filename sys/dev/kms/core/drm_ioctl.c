@@ -137,10 +137,37 @@ drm_ioctl_get_cap(struct drm_file *file __unused, struct drm_get_cap *c)
 		c->value = 1;
 		return (0);
 	case DRM_CAP_VBLANK_HIGH_CRTC:
-	case DRM_CAP_ASYNC_PAGE_FLIP:
+		/*
+		 * WAIT_VBLANK accepts the high-CRTC bits in arg.request.type
+		 * to disambiguate which pipe to wait on — supported.
+		 */
+		c->value = 1;
+		return (0);
 	case DRM_CAP_CURSOR_WIDTH:
 	case DRM_CAP_CURSOR_HEIGHT:
+		/*
+		 * Wayland compositors (kwin_wayland, weston) read these
+		 * before they will composite a pointer surface.  Reporting
+		 * 0 made kwin stall trying to allocate a cursor BO of
+		 * "max-supported" 0×0.  We don't have a hardware cursor
+		 * plane yet so the compositor will draw the cursor into
+		 * the primary surface (software-cursor), but it needs a
+		 * non-zero hint to make that decision.  64×64 is the
+		 * universal "small enough for any plane" SKL+ legal size.
+		 */
+		c->value = 64;
+		return (0);
 	case DRM_CAP_ADDFB2_MODIFIERS:
+		/*
+		 * We accept ADDFB2 with the FB_MODIFIERS flag set — the
+		 * modifier value is ignored (we treat every surface as
+		 * linear) but the ioctl shape is supported, which is what
+		 * the cap actually advertises.  Mesa's GBM backend gates
+		 * dmabuf import on this.
+		 */
+		c->value = 1;
+		return (0);
+	case DRM_CAP_ASYNC_PAGE_FLIP:
 	case DRM_CAP_PAGE_FLIP_TARGET:
 	case DRM_CAP_SYNCOBJ:
 	case DRM_CAP_SYNCOBJ_TIMELINE:
@@ -161,6 +188,32 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 	error = devfs_get_cdevpriv((void **)&file);
 	if (error != 0)
 		return (error);
+
+	/*
+	 * Render-node ioctl gate.  Per Linux DRM render-node ABI, opens of
+	 * /dev/dri/renderD<128+N> must reject KMS modesetting and event
+	 * paths so Mesa's "which node am I on" probe identifies the cdev
+	 * correctly and routes buffer allocation to the render node while
+	 * keeping modesetting on the card node.  Permit GET_CAP /
+	 * SET_CLIENT_CAP / VERSION / GET_RESOURCES (read-only inventory),
+	 * dumb-buffer + PRIME (Mesa allocation surface), GEM CLOSE.
+	 */
+	if (file->is_render_node) {
+		switch (cmd) {
+		case DRM_IOCTL_SET_MASTER:
+		case DRM_IOCTL_DROP_MASTER:
+		case DRM_IOCTL_AUTH_MAGIC:
+		case DRM_IOCTL_GET_MAGIC:
+		case DRM_IOCTL_MODE_SETCRTC:
+		case DRM_IOCTL_MODE_PAGE_FLIP:
+		case DRM_IOCTL_MODE_ATOMIC:
+		case DRM_IOCTL_MODE_ADDFB:
+		case DRM_IOCTL_MODE_ADDFB2:
+		case DRM_IOCTL_MODE_RMFB:
+		case DRM_IOCTL_WAIT_VBLANK:
+			return (EACCES);
+		}
+	}
 
 	switch (cmd) {
 	case DRM_IOCTL_MODE_LIST_LESSEES: {
