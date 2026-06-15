@@ -250,9 +250,16 @@ igen_sysctl_gt_status(SYSCTL_HANDLER_ARGS)
  * (write 2) is the live path; refused if any pipe is active.
  */
 
-/* GTT entry decoded bits — see igen_gtt.c for the full PTE format. */
-#define	IGT_GTT_FIRST_RCS_RING		0x80800	/* well above scanout slots */
-#define	IGT_GTT_FIRST_RCS_LRC		0x80808
+/*
+ * GTT slot reservations for the GT scaffold.  Well above scanout (the
+ * user-FB cache tops out at 0xa0000 - 0xa0fff and the test_fb at
+ * 0x80000 - 0x807ff).  Ring is 2 pages (i915 minimum); LRC is 1 page.
+ */
+#define	IGT_GTT_FIRST_RCS_RING		0x80800
+#define	IGT_RCS_RING_PAGES		2
+#define	IGT_GTT_FIRST_RCS_LRC		(IGT_GTT_FIRST_RCS_RING + \
+					    IGT_RCS_RING_PAGES)
+#define	IGT_RCS_LRC_PAGES		1
 
 /*
  * Context descriptor field layout for gen 9 (i915 v4.19 intel_lrc.h):
@@ -295,10 +302,20 @@ igen_gt_context_desc(uint64_t lrca_ggtt)
  * as those four registers carry sane values the rest defaults to zero
  * and the engine completes the no-op batch.
  *
+ * `ring_tail` is the byte offset into the ring that the engine should
+ * stop at — set to the length of the batch we wrote at ring[0].  With
+ * HEAD=0 and TAIL=ring_tail the engine reads exactly that many bytes.
+ * `ring_len_bytes` is the total ring size (must be a multiple of
+ * PAGE_SIZE and >= 2*PAGE_SIZE per BSpec — single-page rings are
+ * technically allowed but i915 refuses them in practice because the
+ * LENGTH field in RING_CTL encodes (pages - 1) so a 1-page ring
+ * collides with the "ring disabled" encoding).
+ *
  * Returns the byte length written.  Caller owns the buffer.
  */
 static size_t
-igen_gt_compose_lrc(uint32_t *lrc, uint32_t ring_ggtt, uint32_t ring_len_bytes)
+igen_gt_compose_lrc(uint32_t *lrc, uint32_t ring_ggtt, uint32_t ring_len_bytes,
+    uint32_t ring_tail)
 {
 	uint32_t *p = lrc;
 
@@ -312,12 +329,13 @@ igen_gt_compose_lrc(uint32_t *lrc, uint32_t ring_ggtt, uint32_t ring_len_bytes)
 	*p++ = (1u << 0) | (1u << 18);
 	*p++ = 0x34;	/* RING_BUFFER_HEAD */
 	*p++ = 0;
-	*p++ = 0x30;	/* RING_BUFFER_TAIL */
-	*p++ = 0;
+	*p++ = 0x30;	/* RING_BUFFER_TAIL — engine stops here */
+	*p++ = ring_tail;
 	*p++ = 0x38;	/* RING_BUFFER_START */
 	*p++ = ring_ggtt;
-	*p++ = 0x3c;	/* RING_BUFFER_CTL */
-	*p++ = ((ring_len_bytes - PAGE_SIZE) & 0x1ff000u) | 1u;
+	*p++ = 0x3c;	/* RING_BUFFER_CTL — LENGTH field is bits 20:12,
+			 * encoded as (pages - 1); VALID is bit 0 */
+	*p++ = (((ring_len_bytes / PAGE_SIZE) - 1u) << 12) | 1u;
 	*p++ = 0x2c;	/* BB_HEAD_U (zero high bits of batch start) */
 	*p++ = 0;
 	*p++ = MI_NOOP;
@@ -336,36 +354,42 @@ igen_gt_compose_batch_noop(uint32_t *ring)
 }
 
 /*
- * Allocate one page of contig kernel memory and bind it into the
- * driver's GGTT at the chosen index.  Returns the GGTT byte offset
- * (== the address the engine will see) on success, 0 on failure.
+ * Allocate `n_pages` of contig kernel memory and bind n consecutive
+ * GGTT entries starting at gtt_first_idx pointing at the n physical
+ * pages.  Returns the GGTT byte offset of page 0 on success, 0 on
+ * failure.  Caller owns the VA + must call igen_gt_free_pages_gtt.
  */
 static uint32_t
-igen_gt_alloc_page_gtt(struct igen_softc *sc, uint32_t gtt_idx,
-    void **out_va, vm_paddr_t *out_pa)
+igen_gt_alloc_pages_gtt(struct igen_softc *sc, uint32_t gtt_first_idx,
+    uint32_t n_pages, void **out_va, vm_paddr_t *out_pa)
 {
 	void *va;
 	vm_paddr_t pa;
-	uint64_t pte;
+	size_t len = (size_t)n_pages * PAGE_SIZE;
 
-	va = contigmalloc(PAGE_SIZE, M_KMS, M_WAITOK | M_ZERO,
+	va = contigmalloc(len, M_KMS, M_WAITOK | M_ZERO,
 	    0, ~(vm_paddr_t)0, PAGE_SIZE, 0);
 	if (va == NULL)
 		return (0);
 	pa = pmap_kextract((vm_offset_t)va);
-	pte = (pa & ~0xfffULL) | 0x1ULL | 0x2ULL; /* VALID | WRITEABLE */
-	igen_gtt_write(sc, gtt_idx, pte);
+	for (uint32_t i = 0; i < n_pages; i++) {
+		uint64_t pte = ((pa + (uint64_t)i * PAGE_SIZE) & ~0xfffULL) |
+		    0x1ULL | 0x2ULL;	/* VALID | WRITEABLE */
+		igen_gtt_write(sc, gtt_first_idx + i, pte);
+	}
 	*out_va = va;
 	*out_pa = pa;
-	return (gtt_idx * PAGE_SIZE);
+	return (gtt_first_idx * PAGE_SIZE);
 }
 
 static void
-igen_gt_free_page_gtt(struct igen_softc *sc, uint32_t gtt_idx, void *va)
+igen_gt_free_pages_gtt(struct igen_softc *sc, uint32_t gtt_first_idx,
+    uint32_t n_pages, void *va)
 {
-	igen_gtt_write(sc, gtt_idx, 0);
+	for (uint32_t i = 0; i < n_pages; i++)
+		igen_gtt_write(sc, gtt_first_idx + i, 0);
 	if (va != NULL)
-		contigfree(va, PAGE_SIZE, M_KMS);
+		contigfree(va, (size_t)n_pages * PAGE_SIZE, M_KMS);
 }
 
 /*
@@ -389,24 +413,26 @@ igen_sysctl_gt_first_batch_dry(SYSCTL_HANDLER_ARGS)
 	if (error || req->newptr == NULL || trigger == 0)
 		return (error);
 
-	ring_ggtt = igen_gt_alloc_page_gtt(sc, IGT_GTT_FIRST_RCS_RING,
-	    &ring_va, &ring_pa);
+	ring_ggtt = igen_gt_alloc_pages_gtt(sc, IGT_GTT_FIRST_RCS_RING,
+	    IGT_RCS_RING_PAGES, &ring_va, &ring_pa);
 	if (ring_ggtt == 0) {
 		device_printf(sc->dev,
 		    "gt_first_batch_dry: ring alloc failed\n");
 		return (ENOMEM);
 	}
-	lrc_ggtt = igen_gt_alloc_page_gtt(sc, IGT_GTT_FIRST_RCS_LRC,
-	    &lrc_va, &lrc_pa);
+	lrc_ggtt = igen_gt_alloc_pages_gtt(sc, IGT_GTT_FIRST_RCS_LRC,
+	    IGT_RCS_LRC_PAGES, &lrc_va, &lrc_pa);
 	if (lrc_ggtt == 0) {
-		igen_gt_free_page_gtt(sc, IGT_GTT_FIRST_RCS_RING, ring_va);
+		igen_gt_free_pages_gtt(sc, IGT_GTT_FIRST_RCS_RING,
+		    IGT_RCS_RING_PAGES, ring_va);
 		device_printf(sc->dev,
 		    "gt_first_batch_dry: lrc alloc failed\n");
 		return (ENOMEM);
 	}
 
 	batch_len = igen_gt_compose_batch_noop(ring_va);
-	lrc_len   = igen_gt_compose_lrc(lrc_va, ring_ggtt, PAGE_SIZE);
+	lrc_len   = igen_gt_compose_lrc(lrc_va, ring_ggtt,
+	    IGT_RCS_RING_PAGES * PAGE_SIZE, batch_len);
 	ctx_desc  = igen_gt_context_desc(lrc_ggtt);
 
 	device_printf(sc->dev,
@@ -434,8 +460,10 @@ igen_sysctl_gt_first_batch_dry(SYSCTL_HANDLER_ARGS)
 	device_printf(sc->dev,
 	    "gt: DRY-RUN — nothing written to ELSP, LRC not handed to HW\n");
 
-	igen_gt_free_page_gtt(sc, IGT_GTT_FIRST_RCS_LRC, lrc_va);
-	igen_gt_free_page_gtt(sc, IGT_GTT_FIRST_RCS_RING, ring_va);
+	igen_gt_free_pages_gtt(sc, IGT_GTT_FIRST_RCS_LRC, IGT_RCS_LRC_PAGES,
+	    lrc_va);
+	igen_gt_free_pages_gtt(sc, IGT_GTT_FIRST_RCS_RING, IGT_RCS_RING_PAGES,
+	    ring_va);
 	return (0);
 }
 
@@ -475,25 +503,31 @@ igen_sysctl_gt_first_batch_submit(SYSCTL_HANDLER_ARGS)
 		}
 	}
 
-	ring_ggtt = igen_gt_alloc_page_gtt(sc, IGT_GTT_FIRST_RCS_RING,
-	    &ring_va, &ring_pa);
+	ring_ggtt = igen_gt_alloc_pages_gtt(sc, IGT_GTT_FIRST_RCS_RING,
+	    IGT_RCS_RING_PAGES, &ring_va, &ring_pa);
 	if (ring_ggtt == 0)
 		return (ENOMEM);
-	lrc_ggtt = igen_gt_alloc_page_gtt(sc, IGT_GTT_FIRST_RCS_LRC,
-	    &lrc_va, &lrc_pa);
+	lrc_ggtt = igen_gt_alloc_pages_gtt(sc, IGT_GTT_FIRST_RCS_LRC,
+	    IGT_RCS_LRC_PAGES, &lrc_va, &lrc_pa);
 	if (lrc_ggtt == 0) {
-		igen_gt_free_page_gtt(sc, IGT_GTT_FIRST_RCS_RING, ring_va);
+		igen_gt_free_pages_gtt(sc, IGT_GTT_FIRST_RCS_RING,
+		    IGT_RCS_RING_PAGES, ring_va);
 		return (ENOMEM);
 	}
 
-	(void)igen_gt_compose_batch_noop(ring_va);
-	(void)igen_gt_compose_lrc(lrc_va, ring_ggtt, PAGE_SIZE);
+	{
+		size_t blen = igen_gt_compose_batch_noop(ring_va);
+		(void)igen_gt_compose_lrc(lrc_va, ring_ggtt,
+		    IGT_RCS_RING_PAGES * PAGE_SIZE, blen);
+	}
 	ctx_desc = igen_gt_context_desc(lrc_ggtt);
 
 	error = igen_gt_fw_render_take(sc);
 	if (error != 0) {
-		igen_gt_free_page_gtt(sc, IGT_GTT_FIRST_RCS_LRC, lrc_va);
-		igen_gt_free_page_gtt(sc, IGT_GTT_FIRST_RCS_RING, ring_va);
+		igen_gt_free_pages_gtt(sc, IGT_GTT_FIRST_RCS_LRC,
+		    IGT_RCS_LRC_PAGES, lrc_va);
+		igen_gt_free_pages_gtt(sc, IGT_GTT_FIRST_RCS_RING,
+		    IGT_RCS_RING_PAGES, ring_va);
 		return (error);
 	}
 
@@ -539,8 +573,10 @@ igen_sysctl_gt_first_batch_submit(SYSCTL_HANDLER_ARGS)
 		    "LRC layout almost certainly needs BSpec verification.\n");
 
 	igen_gt_fw_render_release(sc);
-	igen_gt_free_page_gtt(sc, IGT_GTT_FIRST_RCS_LRC, lrc_va);
-	igen_gt_free_page_gtt(sc, IGT_GTT_FIRST_RCS_RING, ring_va);
+	igen_gt_free_pages_gtt(sc, IGT_GTT_FIRST_RCS_LRC, IGT_RCS_LRC_PAGES,
+	    lrc_va);
+	igen_gt_free_pages_gtt(sc, IGT_GTT_FIRST_RCS_RING, IGT_RCS_RING_PAGES,
+	    ring_va);
 	return (0);
 }
 
