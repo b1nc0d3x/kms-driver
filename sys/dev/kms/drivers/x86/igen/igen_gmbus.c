@@ -3,18 +3,18 @@
  *
  * Copyright (c) 2026 Kyle Crenshaw <b1nc0d3x@gmail.com>
  *
- * igen9 PCH GMBus driver + EDID read sysctl.  Split out of igen9.c
+ * igen PCH GMBus driver + EDID read sysctl.  Split out of igen.c
  * for size + topical cohesion: the I2C transfer layer for all DDI DDC
  * paths, plus the user-triggered sysctl that exercises it.  The
- * EDID -> drm_display_mode parser stays in igen9.c since it's tightly
+ * EDID -> drm_display_mode parser stays in igen.c since it's tightly
  * coupled to the connector attach flow.
  *
  * Exported entry points:
- *   int  igen9_gmbus_read_block(sc, pin, slave, offset, buf, len);
- *   void igen9_gmbus_register_sysctls(sc);
+ *   int  igen_gmbus_read_block(sc, pin, slave, offset, buf, len);
+ *   void igen_gmbus_register_sysctls(sc);
  *
  * Sysctl registered here:
- *   dev.igen9.<n>.re.edid_read_b   =1 reads 128 EDID bytes on DDI_B,
+ *   dev.igen.<n>.re.edid_read_b   =1 reads 128 EDID bytes on DDI_B,
  *                                  =2 sweeps pins 1..9, =3 wakes
  *                                  DDI_BUF_B then retries pin 5/4,
  *                                  =4 sweeps slave addresses on pin 4.
@@ -26,7 +26,7 @@
 #include <sys/kernel.h>
 #include <sys/sysctl.h>
 
-#include "igen9_internal.h"
+#include "igen_internal.h"
 
 /* ---------------------------- GMBus / EDID -------------------------------- */
 
@@ -92,9 +92,9 @@
 #define	DDI_BUF_IS_IDLE		(1u << 7)
 
 static void
-igen9_ddi_buf_wake(struct igen9_softc *sc, uint32_t buf_ctl_reg)
+igen_ddi_buf_wake(struct igen_softc *sc, uint32_t buf_ctl_reg)
 {
-	uint32_t v = igen9_r32(sc, buf_ctl_reg);
+	uint32_t v = igen_r32(sc, buf_ctl_reg);
 
 	device_printf(sc->dev, "ddi_buf 0x%05x: pre=0x%08x (idle=%d)\n",
 	    buf_ctl_reg, v, (v & DDI_BUF_IS_IDLE) != 0);
@@ -104,9 +104,9 @@ igen9_ddi_buf_wake(struct igen9_softc *sc, uint32_t buf_ctl_reg)
 	 * the DDC line.  Then poll for !IDLE.  IDLE clear ~500us after
 	 * ENABLE rises per BSpec.
 	 */
-	igen9_w32(sc, buf_ctl_reg, v | DDI_BUF_CTL_ENABLE);
+	igen_w32(sc, buf_ctl_reg, v | DDI_BUF_CTL_ENABLE);
 	for (int i = 0; i < 100; i++) {
-		v = igen9_r32(sc, buf_ctl_reg);
+		v = igen_r32(sc, buf_ctl_reg);
 		if ((v & DDI_BUF_IS_IDLE) == 0)
 			break;
 		DELAY(10);
@@ -116,12 +116,12 @@ igen9_ddi_buf_wake(struct igen9_softc *sc, uint32_t buf_ctl_reg)
 }
 
 static int
-igen9_gmbus_wait(struct igen9_softc *sc, uint32_t bit)
+igen_gmbus_wait(struct igen_softc *sc, uint32_t bit)
 {
 	uint32_t s;
 
 	for (int spin = 0; spin < 50000; spin++) {
-		s = igen9_r32(sc, GMBUS2);
+		s = igen_r32(sc, GMBUS2);
 		if (s & GMBUS_NAK)
 			return (EIO);
 		if (s & bit)
@@ -132,7 +132,7 @@ igen9_gmbus_wait(struct igen9_softc *sc, uint32_t bit)
 }
 
 int
-igen9_gmbus_read_block(struct igen9_softc *sc, uint32_t pin,
+igen_gmbus_read_block(struct igen_softc *sc, uint32_t pin,
     uint8_t slave, uint8_t offset, uint8_t *buf, size_t len)
 {
 	uint32_t cmd, val;
@@ -148,9 +148,9 @@ igen9_gmbus_read_block(struct igen9_softc *sc, uint32_t pin,
 	 * controller in a transient state that causes the next xfer to
 	 * NAK or wedge.  Power cost is negligible for a polled DDC path.
 	 */
-	uint32_t gate = igen9_r32(sc, SOUTH_DSPCLK_GATE_D);
+	uint32_t gate = igen_r32(sc, SOUTH_DSPCLK_GATE_D);
 	if ((gate & PCH_GMBUSUNIT_CLK_GATE_DIS) == 0)
-		igen9_w32(sc, SOUTH_DSPCLK_GATE_D,
+		igen_w32(sc, SOUTH_DSPCLK_GATE_D,
 		    gate | PCH_GMBUSUNIT_CLK_GATE_DIS);
 
 	/*
@@ -160,16 +160,16 @@ igen9_gmbus_read_block(struct igen9_softc *sc, uint32_t pin,
 	 * a failed prior transaction (or BIOS hand-off) wedges every
 	 * subsequent xfer at HW_RDY because the bus stays "in use".
 	 */
-	igen9_w32(sc, GMBUS0, 0);
-	igen9_w32(sc, GMBUS4, 0);
-	igen9_w32(sc, GMBUS5, 0);
-	igen9_w32(sc, GMBUS1, GMBUS_SW_CLR_INT);
-	igen9_w32(sc, GMBUS1, 0);
-	if (igen9_r32(sc, GMBUS2) & GMBUS_INUSE) {
+	igen_w32(sc, GMBUS0, 0);
+	igen_w32(sc, GMBUS4, 0);
+	igen_w32(sc, GMBUS5, 0);
+	igen_w32(sc, GMBUS1, GMBUS_SW_CLR_INT);
+	igen_w32(sc, GMBUS1, 0);
+	if (igen_r32(sc, GMBUS2) & GMBUS_INUSE) {
 		DPRINTF(sc, 1, "gmbus: INUSE stuck, clearing\n");
-		igen9_w32(sc, GMBUS2, GMBUS_INUSE);
+		igen_w32(sc, GMBUS2, GMBUS_INUSE);
 	}
-	igen9_w32(sc, GMBUS0, pin | GMBUS_RATE_100KHZ);
+	igen_w32(sc, GMBUS0, pin | GMBUS_RATE_100KHZ);
 
 	/*
 	 * Phase 1: write the EDID byte offset (segment 0).  CYCLE_WAIT
@@ -180,9 +180,9 @@ igen9_gmbus_read_block(struct igen9_softc *sc, uint32_t pin,
 	    ((uint32_t)1 << GMBUS_BYTE_COUNT_SHIFT) |
 	    ((uint32_t)slave << GMBUS_SLAVE_ADDR_SHIFT) |
 	    GMBUS_SLAVE_WRITE;
-	igen9_w32(sc, GMBUS3, offset);
-	igen9_w32(sc, GMBUS1, cmd);
-	error = igen9_gmbus_wait(sc, GMBUS_HW_WAIT);
+	igen_w32(sc, GMBUS3, offset);
+	igen_w32(sc, GMBUS1, cmd);
+	error = igen_gmbus_wait(sc, GMBUS_HW_WAIT);
 	if (error != 0) {
 		DPRINTF(sc, 1, "gmbus: wait HW_WAIT after addr: %d\n", error);
 		goto out;
@@ -204,18 +204,18 @@ igen9_gmbus_read_block(struct igen9_softc *sc, uint32_t pin,
 	    ((uint32_t)len << GMBUS_BYTE_COUNT_SHIFT) |
 	    ((uint32_t)slave << GMBUS_SLAVE_ADDR_SHIFT) |
 	    GMBUS_SLAVE_READ;
-	igen9_w32(sc, GMBUS1, cmd);
+	igen_w32(sc, GMBUS1, cmd);
 
 	while (got < len) {
-		error = igen9_gmbus_wait(sc, GMBUS_HW_RDY);
+		error = igen_gmbus_wait(sc, GMBUS_HW_RDY);
 		if (error != 0) {
-			uint32_t s = igen9_r32(sc, GMBUS2);
+			uint32_t s = igen_r32(sc, GMBUS2);
 			DPRINTF(sc, 1,
 			    "gmbus: wait HW_RDY at %zu/%zu: %d  GMBUS2=0x%08x\n",
 			    got, len, error, s);
 			goto out;
 		}
-		val = igen9_r32(sc, GMBUS3);
+		val = igen_r32(sc, GMBUS3);
 		for (int i = 0; i < 4 && got < len; i++)
 			buf[got++] = (val >> (i * 8)) & 0xff;
 	}
@@ -226,19 +226,19 @@ out:
 	 * even on success.  Then tri-state pin, W1C INUSE, leave the
 	 * clock-gate disabled for the next xfer.
 	 */
-	igen9_w32(sc, GMBUS1, GMBUS_SW_RDY | GMBUS_CYCLE_STOP);
-	(void)igen9_gmbus_wait(sc, GMBUS_HW_WAIT);
-	igen9_w32(sc, GMBUS0, 0);
-	igen9_w32(sc, GMBUS1, GMBUS_SW_CLR_INT);
-	igen9_w32(sc, GMBUS1, 0);
-	igen9_w32(sc, GMBUS2, GMBUS_INUSE);
+	igen_w32(sc, GMBUS1, GMBUS_SW_RDY | GMBUS_CYCLE_STOP);
+	(void)igen_gmbus_wait(sc, GMBUS_HW_WAIT);
+	igen_w32(sc, GMBUS0, 0);
+	igen_w32(sc, GMBUS1, GMBUS_SW_CLR_INT);
+	igen_w32(sc, GMBUS1, 0);
+	igen_w32(sc, GMBUS2, GMBUS_INUSE);
 	return (error);
 }
 
 static int
-igen9_sysctl_edid_read_b(SYSCTL_HANDLER_ARGS)
+igen_sysctl_edid_read_b(SYSCTL_HANDLER_ARGS)
 {
-	struct igen9_softc *sc = arg1;
+	struct igen_softc *sc = arg1;
 	uint8_t edid[128];
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
@@ -258,37 +258,37 @@ igen9_sysctl_edid_read_b(SYSCTL_HANDLER_ARGS)
 			uint32_t cmd, val, snap;
 			error = 0;
 
-			igen9_w32(sc, GMBUS0, 0);
-			igen9_w32(sc, GMBUS4, 0);
-			igen9_w32(sc, GMBUS5, 0);
-			igen9_w32(sc, GMBUS1, GMBUS_SW_CLR_INT);
-			igen9_w32(sc, GMBUS1, 0);
-			if (igen9_r32(sc, GMBUS2) & GMBUS_INUSE)
-				igen9_w32(sc, GMBUS2, GMBUS_INUSE);
-			igen9_w32(sc, GMBUS0, 4 | GMBUS_RATE_100KHZ);
+			igen_w32(sc, GMBUS0, 0);
+			igen_w32(sc, GMBUS4, 0);
+			igen_w32(sc, GMBUS5, 0);
+			igen_w32(sc, GMBUS1, GMBUS_SW_CLR_INT);
+			igen_w32(sc, GMBUS1, 0);
+			if (igen_r32(sc, GMBUS2) & GMBUS_INUSE)
+				igen_w32(sc, GMBUS2, GMBUS_INUSE);
+			igen_w32(sc, GMBUS0, 4 | GMBUS_RATE_100KHZ);
 
 			cmd = GMBUS_SW_RDY | GMBUS_CYCLE_STOP |
 			    ((uint32_t)1 << GMBUS_BYTE_COUNT_SHIFT) |
 			    ((uint32_t)s << GMBUS_SLAVE_ADDR_SHIFT) |
 			    GMBUS_SLAVE_READ;
-			igen9_w32(sc, GMBUS1, cmd);
+			igen_w32(sc, GMBUS1, cmd);
 
 			for (int spin = 0; spin < 5000; spin++) {
-				snap = igen9_r32(sc, GMBUS2);
+				snap = igen_r32(sc, GMBUS2);
 				if (snap & (GMBUS_NAK | GMBUS_HW_RDY |
 				    GMBUS_HW_WAIT))
 					break;
 				DELAY(10);
 			}
 			val = (snap & GMBUS_HW_RDY) ?
-			    igen9_r32(sc, GMBUS3) : 0;
+			    igen_r32(sc, GMBUS3) : 0;
 			one = val & 0xff;
 			if ((snap & GMBUS_NAK) == 0) {
 				device_printf(sc->dev,
 				    "scan: slave 0x%02x ACK!  GMBUS2=0x%08x"
 				    "  byte0=0x%02x\n", s, snap, one);
 			}
-			igen9_w32(sc, GMBUS0, 0);
+			igen_w32(sc, GMBUS0, 0);
 		}
 		device_printf(sc->dev, "scan done\n");
 		return (0);
@@ -301,11 +301,11 @@ igen9_sysctl_edid_read_b(SYSCTL_HANDLER_ARGS)
 	 * set passively.  Fallback to pin 4 if pin 5 still times out.
 	 */
 	if (trigger == 3) {
-		igen9_ddi_buf_wake(sc, DDI_BUF_CTL_B);
+		igen_ddi_buf_wake(sc, DDI_BUF_CTL_B);
 		DELAY(2000);
 		for (uint32_t pin = 5; pin >= 4; pin--) {
 			memset(edid, 0, sizeof(edid));
-			error = igen9_gmbus_read_block(sc, pin,
+			error = igen_gmbus_read_block(sc, pin,
 			    EDID_SLAVE, 0, edid, 16);
 			device_printf(sc->dev,
 			    "post-wake pin %u: err=%d  first16:"
@@ -331,7 +331,7 @@ igen9_sysctl_edid_read_b(SYSCTL_HANDLER_ARGS)
 	if (trigger == 2) {
 		for (uint32_t pin = 1; pin <= 9; pin++) {
 			memset(edid, 0, sizeof(edid));
-			error = igen9_gmbus_read_block(sc, pin, EDID_SLAVE,
+			error = igen_gmbus_read_block(sc, pin, EDID_SLAVE,
 			    0, edid, 16);
 			device_printf(sc->dev,
 			    "pin %u: err=%d  first16: %02x %02x %02x %02x"
@@ -346,7 +346,7 @@ igen9_sysctl_edid_read_b(SYSCTL_HANDLER_ARGS)
 	}
 
 	memset(edid, 0, sizeof(edid));
-	error = igen9_gmbus_read_block(sc, GMBUS_PIN_DDI_B, EDID_SLAVE,
+	error = igen_gmbus_read_block(sc, GMBUS_PIN_DDI_B, EDID_SLAVE,
 	    0, edid, sizeof(edid));
 	if (error != 0) {
 		device_printf(sc->dev,
@@ -375,11 +375,11 @@ igen9_sysctl_edid_read_b(SYSCTL_HANDLER_ARGS)
 }
 
 /*
- * Register the GMBus-driven sysctls under dev.igen9.<n>.re.  Called
- * from igen9_re_sysctls_init in igen9.c.
+ * Register the GMBus-driven sysctls under dev.igen.<n>.re.  Called
+ * from igen_re_sysctls_init in igen.c.
  */
 void
-igen9_gmbus_register_sysctls(struct igen9_softc *sc)
+igen_gmbus_register_sysctls(struct igen_softc *sc)
 {
 	struct sysctl_ctx_list *ctx = &sc->re_sysctl_ctx;
 	struct sysctl_oid_list *children =
@@ -387,6 +387,6 @@ igen9_gmbus_register_sysctls(struct igen9_softc *sc)
 
 	SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "edid_read_b",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, igen9_sysctl_edid_read_b, "I",
+	    sc, 0, igen_sysctl_edid_read_b, "I",
 	    "write 1 to GMBus-read 128 bytes of EDID block 0 from DDI_B");
 }

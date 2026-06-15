@@ -1,10 +1,10 @@
-.PATH: ${SRCTOP}/sys/dev/kms/drivers/x86/igen9
+.PATH: ${SRCTOP}/sys/dev/kms/drivers/x86/igen
 
-KMOD=	igen9
+KMOD=	igen
 
-SRCS=	igen9.c \
-	igen9_dpll.c \
-	igen9_gmbus.c \
+SRCS=	igen.c \
+	igen_dpll.c \
+	igen_gmbus.c \
 	bus_if.h device_if.h pci_if.h \
 	opt_platform.h
 

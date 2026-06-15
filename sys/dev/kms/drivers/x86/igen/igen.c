@@ -59,7 +59,7 @@
 #include <kms/drm_plane.h>
 #include <kms/drm_vblank.h>
 
-#include "igen9_internal.h"
+#include "igen_internal.h"
 
 #include <vm/vm_page.h>
 
@@ -72,58 +72,66 @@
  * the gen9 / gen9.5 display engine).  Add more here as they're observed
  * in the wild.
  */
+/*
+ * Each PCI ID carries the silicon generation it belongs to (9 for
+ * Skylake / Kabylake / Coffee Lake — they share the gen9/9.5 display
+ * engine; future entries will carry 11, 12, etc.).  igen_attach copies
+ * gen into the softc so per-gen code paths can branch on it without
+ * re-scanning the ID table.
+ */
 static const struct {
 	uint16_t	id;
+	uint8_t		gen;
 	const char	*desc;
-} igen9_ids[] = {
-	{ 0x1902, "Intel HD 510 (Skylake GT1)" },
-	{ 0x1906, "Intel HD 510 (Skylake GT1 ULT)" },
-	{ 0x190b, "Intel HD 510 (Skylake GT1 Halo)" },
-	{ 0x190e, "Intel HD 510 (Skylake GT1 Mobile)" },
-	{ 0x1912, "Intel HD 530 (Skylake GT2)" },
-	{ 0x1916, "Intel HD 520 (Skylake GT2 ULT)" },
-	{ 0x191b, "Intel HD 530 (Skylake GT2 Halo)" },
-	{ 0x191d, "Intel HD P530 (Skylake GT2 Workstation)" },
-	{ 0x191e, "Intel HD 515 (Skylake GT2 Mobile)" },
-	{ 0x1921, "Intel HD 520 (Skylake GT2F)" },
-	{ 0x1923, "Intel Iris 540 (Skylake GT3)" },
-	{ 0x1926, "Intel Iris 540/550 (Skylake GT3e)" },
-	{ 0x1927, "Intel Iris 550 (Skylake GT3e)" },
-	{ 0x192b, "Intel Iris Pro 580 (Skylake GT4e)" },
-	{ 0x5902, "Intel HD 610 (Kabylake GT1)" },
-	{ 0x5906, "Intel HD 610 (Kabylake GT1 ULT)" },
-	{ 0x590b, "Intel HD 610 (Kabylake GT1 Halo)" },
-	{ 0x590e, "Intel HD 610 (Kabylake GT1 Mobile)" },
-	{ 0x5912, "Intel HD 630 (Kabylake GT2)" },
-	{ 0x5916, "Intel HD 620 (Kabylake GT2 ULT)" },
-	{ 0x591a, "Intel HD P630 (Kabylake GT2 Mobile WS)" },
-	{ 0x591b, "Intel HD 630 (Kabylake GT2 Halo)" },
-	{ 0x591d, "Intel HD P630 (Kabylake GT2 Workstation)" },
-	{ 0x591e, "Intel HD 615 (Kabylake GT2 Mobile)" },
-	{ 0x5921, "Intel HD 620 (Kabylake GT2F)" },
-	{ 0x5923, "Intel Iris Plus 640 (Kabylake GT3)" },
-	{ 0x5926, "Intel Iris Plus 640 (Kabylake GT3e)" },
-	{ 0x5927, "Intel Iris Plus 650 (Kabylake GT3e)" },
-	{ 0x3e90, "Intel UHD 610 (Coffee Lake GT1)" },
-	{ 0x3e91, "Intel UHD 630 (Coffee Lake GT2)" },
-	{ 0x3e92, "Intel UHD 630 (Coffee Lake GT2)" },
-	{ 0x3e93, "Intel UHD 610 (Coffee Lake GT1)" },
-	{ 0x3e96, "Intel UHD P630 (Coffee Lake GT2 Workstation)" },
-	{ 0x3e98, "Intel UHD 630 (Coffee Lake GT2)" },
-	{ 0x3e9b, "Intel UHD 630 (Coffee Lake GT2 Halo)" },
-	{ 0x3ea5, "Intel Iris Plus 655 (Coffee Lake GT3e)" },
+} igen_ids[] = {
+	{ 0x1902, 9, "Intel HD 510 (Skylake GT1)" },
+	{ 0x1906, 9, "Intel HD 510 (Skylake GT1 ULT)" },
+	{ 0x190b, 9, "Intel HD 510 (Skylake GT1 Halo)" },
+	{ 0x190e, 9, "Intel HD 510 (Skylake GT1 Mobile)" },
+	{ 0x1912, 9, "Intel HD 530 (Skylake GT2)" },
+	{ 0x1916, 9, "Intel HD 520 (Skylake GT2 ULT)" },
+	{ 0x191b, 9, "Intel HD 530 (Skylake GT2 Halo)" },
+	{ 0x191d, 9, "Intel HD P530 (Skylake GT2 Workstation)" },
+	{ 0x191e, 9, "Intel HD 515 (Skylake GT2 Mobile)" },
+	{ 0x1921, 9, "Intel HD 520 (Skylake GT2F)" },
+	{ 0x1923, 9, "Intel Iris 540 (Skylake GT3)" },
+	{ 0x1926, 9, "Intel Iris 540/550 (Skylake GT3e)" },
+	{ 0x1927, 9, "Intel Iris 550 (Skylake GT3e)" },
+	{ 0x192b, 9, "Intel Iris Pro 580 (Skylake GT4e)" },
+	{ 0x5902, 9, "Intel HD 610 (Kabylake GT1)" },
+	{ 0x5906, 9, "Intel HD 610 (Kabylake GT1 ULT)" },
+	{ 0x590b, 9, "Intel HD 610 (Kabylake GT1 Halo)" },
+	{ 0x590e, 9, "Intel HD 610 (Kabylake GT1 Mobile)" },
+	{ 0x5912, 9, "Intel HD 630 (Kabylake GT2)" },
+	{ 0x5916, 9, "Intel HD 620 (Kabylake GT2 ULT)" },
+	{ 0x591a, 9, "Intel HD P630 (Kabylake GT2 Mobile WS)" },
+	{ 0x591b, 9, "Intel HD 630 (Kabylake GT2 Halo)" },
+	{ 0x591d, 9, "Intel HD P630 (Kabylake GT2 Workstation)" },
+	{ 0x591e, 9, "Intel HD 615 (Kabylake GT2 Mobile)" },
+	{ 0x5921, 9, "Intel HD 620 (Kabylake GT2F)" },
+	{ 0x5923, 9, "Intel Iris Plus 640 (Kabylake GT3)" },
+	{ 0x5926, 9, "Intel Iris Plus 640 (Kabylake GT3e)" },
+	{ 0x5927, 9, "Intel Iris Plus 650 (Kabylake GT3e)" },
+	{ 0x3e90, 9, "Intel UHD 610 (Coffee Lake GT1)" },
+	{ 0x3e91, 9, "Intel UHD 630 (Coffee Lake GT2)" },
+	{ 0x3e92, 9, "Intel UHD 630 (Coffee Lake GT2)" },
+	{ 0x3e93, 9, "Intel UHD 610 (Coffee Lake GT1)" },
+	{ 0x3e96, 9, "Intel UHD P630 (Coffee Lake GT2 Workstation)" },
+	{ 0x3e98, 9, "Intel UHD 630 (Coffee Lake GT2)" },
+	{ 0x3e9b, 9, "Intel UHD 630 (Coffee Lake GT2 Halo)" },
+	{ 0x3ea5, 9, "Intel Iris Plus 655 (Coffee Lake GT3e)" },
 };
 
 MALLOC_DECLARE(M_KMS);
 
 /*
- * DPRINTF, USER_FB_GTT_*, struct igen9_owned_fb, struct igen9_softc, and
- * the inline igen9_r32 / igen9_w32 accessors all live in
- * igen9_internal.h so both compilation units share them.
+ * DPRINTF, USER_FB_GTT_*, struct igen_owned_fb, struct igen_softc, and
+ * the inline igen_r32 / igen_w32 accessors all live in
+ * igen_internal.h so both compilation units share them.
  */
 
-static void igen9_owned_fb_destroy(struct drm_framebuffer *fb);
-static const struct drm_framebuffer_funcs igen9_owned_fb_funcs;
+static void igen_owned_fb_destroy(struct drm_framebuffer *fb);
+static const struct drm_framebuffer_funcs igen_owned_fb_funcs;
 
 /*
  * MMIO ranges we care about on gen9 display.  Bracket the regions, not
@@ -133,13 +141,13 @@ static const struct drm_framebuffer_funcs igen9_owned_fb_funcs;
  * Stride is 4 bytes (32-bit registers) for every range; gen9 doesn't have
  * any 8/16-bit-only MMIO that matters for display.
  */
-struct igen9_range {
+struct igen_range {
 	uint32_t	start;
 	uint32_t	end;	/* inclusive */
 	const char	*name;
 };
 
-static const struct igen9_range igen9_ranges[] = {
+static const struct igen_range igen_ranges[] = {
 	{ 0x00044000, 0x00044100, "INT/HOTPLUG" },
 	{ 0x00045000, 0x000455ff, "PWR/DC_STATE" },
 	{ 0x00046000, 0x000460ff, "CDCLK/DPLL_CTRL" },
@@ -160,23 +168,23 @@ static const struct igen9_range igen9_ranges[] = {
 	{ 0x000c6000, 0x000c61ff, "PCH_GMBUS" },
 };
 
-/* struct igen9_softc + igen9_r32/igen9_w32 live in igen9_internal.h. */
+/* struct igen_softc + igen_r32/igen_w32 live in igen_internal.h. */
 
 /* ----------------------------- MMIO RE helpers ---------------------------- */
 
 /*
- * Compute how many 32-bit words a full snapshot of igen9_ranges[]
+ * Compute how many 32-bit words a full snapshot of igen_ranges[]
  * occupies.  Caller-relative offset of register `addr` within the
- * snapshot is the prefix-sum walk in igen9_snapshot_index().
+ * snapshot is the prefix-sum walk in igen_snapshot_index().
  */
 static size_t
-igen9_snapshot_total_words(void)
+igen_snapshot_total_words(void)
 {
 	size_t words = 0;
 
-	for (size_t i = 0; i < nitems(igen9_ranges); i++) {
-		words += (igen9_ranges[i].end -
-		    igen9_ranges[i].start) / 4 + 1;
+	for (size_t i = 0; i < nitems(igen_ranges); i++) {
+		words += (igen_ranges[i].end -
+		    igen_ranges[i].start) / 4 + 1;
 	}
 	return (words);
 }
@@ -187,12 +195,12 @@ igen9_snapshot_total_words(void)
  * range table — N is ~20 so this is fine in sysctl/debug paths.
  */
 static ssize_t
-igen9_snapshot_index(uint32_t addr)
+igen_snapshot_index(uint32_t addr)
 {
 	size_t base = 0;
 
-	for (size_t i = 0; i < nitems(igen9_ranges); i++) {
-		const struct igen9_range *r = &igen9_ranges[i];
+	for (size_t i = 0; i < nitems(igen_ranges); i++) {
+		const struct igen_range *r = &igen_ranges[i];
 		size_t words = (r->end - r->start) / 4 + 1;
 
 		if (addr >= r->start && addr <= r->end)
@@ -203,19 +211,19 @@ igen9_snapshot_index(uint32_t addr)
 }
 
 static void
-igen9_snapshot_save(struct igen9_softc *sc)
+igen_snapshot_save(struct igen_softc *sc)
 {
 	sx_xlock(&sc->re_lock);
 	if (sc->snapshot == NULL) {
-		sc->snapshot_words = igen9_snapshot_total_words();
+		sc->snapshot_words = igen_snapshot_total_words();
 		sc->snapshot = malloc(sc->snapshot_words * sizeof(uint32_t),
 		    M_KMS, M_WAITOK | M_ZERO);
 	}
 	size_t idx = 0;
-	for (size_t i = 0; i < nitems(igen9_ranges); i++) {
-		const struct igen9_range *r = &igen9_ranges[i];
+	for (size_t i = 0; i < nitems(igen_ranges); i++) {
+		const struct igen_range *r = &igen_ranges[i];
 		for (uint32_t a = r->start; a <= r->end; a += 4)
-			sc->snapshot[idx++] = igen9_r32(sc, a);
+			sc->snapshot[idx++] = igen_r32(sc, a);
 	}
 	sc->snapshot_valid = true;
 	sx_xunlock(&sc->re_lock);
@@ -224,7 +232,7 @@ igen9_snapshot_save(struct igen9_softc *sc)
 }
 
 static void
-igen9_snapshot_diff(struct igen9_softc *sc)
+igen_snapshot_diff(struct igen_softc *sc)
 {
 	uint32_t changes = 0;
 
@@ -236,10 +244,10 @@ igen9_snapshot_diff(struct igen9_softc *sc)
 		return;
 	}
 	size_t idx = 0;
-	for (size_t i = 0; i < nitems(igen9_ranges); i++) {
-		const struct igen9_range *r = &igen9_ranges[i];
+	for (size_t i = 0; i < nitems(igen_ranges); i++) {
+		const struct igen_range *r = &igen_ranges[i];
 		for (uint32_t a = r->start; a <= r->end; a += 4, idx++) {
-			uint32_t cur = igen9_r32(sc, a);
+			uint32_t cur = igen_r32(sc, a);
 
 			if (cur != sc->snapshot[idx]) {
 				device_printf(sc->dev,
@@ -260,19 +268,19 @@ igen9_snapshot_diff(struct igen9_softc *sc)
  * landing, plus side-effect discovery for poorly documented bits.
  */
 static void
-igen9_bit_scan(struct igen9_softc *sc)
+igen_bit_scan(struct igen_softc *sc)
 {
 	uint32_t addr = sc->bit_scan_addr;
 	uint32_t orig, observed, bit_mask;
 
-	if (igen9_snapshot_index(addr) < 0) {
+	if (igen_snapshot_index(addr) < 0) {
 		device_printf(sc->dev,
 		    "bit_scan: 0x%08x not in any tracked range\n", addr);
 		return;
 	}
-	igen9_snapshot_save(sc);
+	igen_snapshot_save(sc);
 	sx_xlock(&sc->re_lock);
-	orig = igen9_r32(sc, addr);
+	orig = igen_r32(sc, addr);
 	device_printf(sc->dev,
 	    "bit_scan @0x%08x: orig=0x%08x (will toggle 32 bits)\n",
 	    addr, orig);
@@ -280,56 +288,56 @@ igen9_bit_scan(struct igen9_softc *sc)
 		if (sc->bit_scan_skip & (1u << bit))
 			continue;
 		bit_mask = 1u << bit;
-		igen9_w32(sc, addr, orig ^ bit_mask);
-		observed = igen9_r32(sc, addr);
+		igen_w32(sc, addr, orig ^ bit_mask);
+		observed = igen_r32(sc, addr);
 		device_printf(sc->dev,
 		    "  bit %2d: wrote 0x%08x, readback 0x%08x %s\n",
 		    bit, orig ^ bit_mask, observed,
 		    ((observed ^ orig) & bit_mask) ? "RW" : "RO/clamped");
-		igen9_w32(sc, addr, orig);
+		igen_w32(sc, addr, orig);
 	}
 	sx_xunlock(&sc->re_lock);
 	device_printf(sc->dev, "bit_scan done; running side-effect diff:\n");
-	igen9_snapshot_diff(sc);
+	igen_snapshot_diff(sc);
 }
 
 static int
-igen9_sysctl_snapshot_save(SYSCTL_HANDLER_ARGS)
+igen_sysctl_snapshot_save(SYSCTL_HANDLER_ARGS)
 {
-	struct igen9_softc *sc = arg1;
+	struct igen_softc *sc = arg1;
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
 
 	if (error || req->newptr == NULL)
 		return (error);
 	if (trigger != 0)
-		igen9_snapshot_save(sc);
+		igen_snapshot_save(sc);
 	return (0);
 }
 
 static int
-igen9_sysctl_snapshot_diff(SYSCTL_HANDLER_ARGS)
+igen_sysctl_snapshot_diff(SYSCTL_HANDLER_ARGS)
 {
-	struct igen9_softc *sc = arg1;
+	struct igen_softc *sc = arg1;
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
 
 	if (error || req->newptr == NULL)
 		return (error);
 	if (trigger != 0)
-		igen9_snapshot_diff(sc);
+		igen_snapshot_diff(sc);
 	return (0);
 }
 
 static int
-igen9_sysctl_mmio_read(SYSCTL_HANDLER_ARGS)
+igen_sysctl_mmio_read(SYSCTL_HANDLER_ARGS)
 {
-	struct igen9_softc *sc = arg1;
+	struct igen_softc *sc = arg1;
 	uint32_t addr = sc->poke_addr;
 	uint32_t val;
 	int error;
 
-	val = igen9_r32(sc, addr);
+	val = igen_r32(sc, addr);
 	error = sysctl_handle_int(oidp, &val, 0, req);
 	if (req->newptr != NULL)
 		return (EPERM);
@@ -337,9 +345,9 @@ igen9_sysctl_mmio_read(SYSCTL_HANDLER_ARGS)
 }
 
 static int
-igen9_sysctl_mmio_write(SYSCTL_HANDLER_ARGS)
+igen_sysctl_mmio_write(SYSCTL_HANDLER_ARGS)
 {
-	struct igen9_softc *sc = arg1;
+	struct igen_softc *sc = arg1;
 	uint32_t val = 0;
 	int error = sysctl_handle_int(oidp, &val, 0, req);
 
@@ -347,46 +355,46 @@ igen9_sysctl_mmio_write(SYSCTL_HANDLER_ARGS)
 		return (error);
 	device_printf(sc->dev, "mmio_write: 0x%08x <- 0x%08x\n",
 	    sc->poke_addr, val);
-	igen9_w32(sc, sc->poke_addr, val);
+	igen_w32(sc, sc->poke_addr, val);
 	return (0);
 }
 
 static int
-igen9_sysctl_bit_scan(SYSCTL_HANDLER_ARGS)
+igen_sysctl_bit_scan(SYSCTL_HANDLER_ARGS)
 {
-	struct igen9_softc *sc = arg1;
+	struct igen_softc *sc = arg1;
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
 
 	if (error || req->newptr == NULL)
 		return (error);
 	if (trigger != 0)
-		igen9_bit_scan(sc);
+		igen_bit_scan(sc);
 	return (0);
 }
 
-/* igen9_sysctl_edid_read_b lives in igen9_gmbus.c. */
-static int	igen9_sysctl_vbt_dump(SYSCTL_HANDLER_ARGS);
-static int	igen9_sysctl_hpd_dump(SYSCTL_HANDLER_ARGS);
-static int	igen9_sysctl_cap_dump(SYSCTL_HANDLER_ARGS);
-/* DPLL/WRPLL/pw1 sysctl handlers live in igen9_dpll.c. */
-static int	igen9_sysctl_current_mode(SYSCTL_HANDLER_ARGS);
-static int	igen9_sysctl_gtt_dump(SYSCTL_HANDLER_ARGS);
-static int	igen9_sysctl_gtt_alloc_test(SYSCTL_HANDLER_ARGS);
-static int	igen9_sysctl_test_fb_make(SYSCTL_HANDLER_ARGS);
-static int	igen9_sysctl_test_fb_flip(SYSCTL_HANDLER_ARGS);
-static int	igen9_sysctl_scanout_hold(SYSCTL_HANDLER_ARGS);
-static int	igen9_sysctl_expose_scanout_fb(SYSCTL_HANDLER_ARGS);
-static void	igen9_edid_to_mode(const uint8_t *dtd,
+/* igen_sysctl_edid_read_b lives in igen_gmbus.c. */
+static int	igen_sysctl_vbt_dump(SYSCTL_HANDLER_ARGS);
+static int	igen_sysctl_hpd_dump(SYSCTL_HANDLER_ARGS);
+static int	igen_sysctl_cap_dump(SYSCTL_HANDLER_ARGS);
+/* DPLL/WRPLL/pw1 sysctl handlers live in igen_dpll.c. */
+static int	igen_sysctl_current_mode(SYSCTL_HANDLER_ARGS);
+static int	igen_sysctl_gtt_dump(SYSCTL_HANDLER_ARGS);
+static int	igen_sysctl_gtt_alloc_test(SYSCTL_HANDLER_ARGS);
+static int	igen_sysctl_test_fb_make(SYSCTL_HANDLER_ARGS);
+static int	igen_sysctl_test_fb_flip(SYSCTL_HANDLER_ARGS);
+static int	igen_sysctl_scanout_hold(SYSCTL_HANDLER_ARGS);
+static int	igen_sysctl_expose_scanout_fb(SYSCTL_HANDLER_ARGS);
+static void	igen_edid_to_mode(const uint8_t *dtd,
 		    struct drm_display_mode *m);
-static int	igen9_attach_edid_modes(struct igen9_softc *sc);
+static int	igen_attach_edid_modes(struct igen_softc *sc);
 
 static void
-igen9_re_sysctls_init(struct igen9_softc *sc)
+igen_re_sysctls_init(struct igen_softc *sc)
 {
 	struct sysctl_oid_list *children;
 
-	sx_init(&sc->re_lock, "igen9_re");
+	sx_init(&sc->re_lock, "igen_re");
 	sysctl_ctx_init(&sc->re_sysctl_ctx);
 	sc->re_sysctl_tree = SYSCTL_ADD_NODE(&sc->re_sysctl_ctx,
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(sc->dev)),
@@ -396,7 +404,7 @@ igen9_re_sysctls_init(struct igen9_softc *sc)
 
 	/*
 	 * Debug verbosity at the device root (not under .re/) so the
-	 * tunable name dev.igen9.<n>.debug matches the cross-driver
+	 * tunable name dev.igen.<n>.debug matches the cross-driver
 	 * convention.  CTLFLAG_RWTUN makes it settable both at boot via
 	 * loader.conf and at runtime via sysctl.
 	 */
@@ -409,12 +417,12 @@ igen9_re_sysctls_init(struct igen9_softc *sc)
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "mmio_snapshot_save",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, igen9_sysctl_snapshot_save, "I",
+	    sc, 0, igen_sysctl_snapshot_save, "I",
 	    "write 1 to snapshot all tracked MMIO ranges");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "mmio_snapshot_diff",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, igen9_sysctl_snapshot_diff, "I",
+	    sc, 0, igen_sysctl_snapshot_diff, "I",
 	    "write 1 to log changes since last snapshot");
 	SYSCTL_ADD_UINT(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "mmio_addr", CTLFLAG_RW, &sc->poke_addr, 0,
@@ -422,12 +430,12 @@ igen9_re_sysctls_init(struct igen9_softc *sc)
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "mmio_read",
 	    CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, igen9_sysctl_mmio_read, "IU",
+	    sc, 0, igen_sysctl_mmio_read, "IU",
 	    "read [mmio_addr] (32-bit)");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "mmio_write",
 	    CTLTYPE_UINT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, igen9_sysctl_mmio_write, "IU",
+	    sc, 0, igen_sysctl_mmio_write, "IU",
 	    "write value to [mmio_addr] (32-bit)");
 	SYSCTL_ADD_UINT(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "bit_scan_addr", CTLFLAG_RW, &sc->bit_scan_addr, 0,
@@ -438,68 +446,68 @@ igen9_re_sysctls_init(struct igen9_softc *sc)
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "bit_scan",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, igen9_sysctl_bit_scan, "I",
+	    sc, 0, igen_sysctl_bit_scan, "I",
 	    "write 1 to scan bit_scan_addr and diff side-effects");
-	/* edid_read_b sysctl is owned by igen9_gmbus.c. */
-	igen9_gmbus_register_sysctls(sc);
+	/* edid_read_b sysctl is owned by igen_gmbus.c. */
+	igen_gmbus_register_sysctls(sc);
 
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "vbt_dump",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, igen9_sysctl_vbt_dump, "I",
+	    sc, 0, igen_sysctl_vbt_dump, "I",
 	    "write 1 to map OpRegion via ASLS and walk VBT child devices");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "hpd_dump",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, igen9_sysctl_hpd_dump, "I",
+	    sc, 0, igen_sysctl_hpd_dump, "I",
 	    "write 1 to dump SFUSE_STRAP / SHOTPLUG_CTL_DDI / SDEISR live HPD");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "cap_dump",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, igen9_sysctl_cap_dump, "I",
+	    sc, 0, igen_sysctl_cap_dump, "I",
 	    "write 1 to print per-DDI capability table (VBT x SFUSE x HPD)");
 	/*
 	 * DPLL / WRPLL / clock_state / try_pipe_resume / pw1_up sysctls
-	 * are owned by igen9_dpll.c.
+	 * are owned by igen_dpll.c.
 	 */
-	igen9_dpll_register_sysctls(sc);
+	igen_dpll_register_sysctls(sc);
 
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "current_mode",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, igen9_sysctl_current_mode, "I",
+	    sc, 0, igen_sysctl_current_mode, "I",
 	    "write 1 to read back live pipe/transcoder timing as a mode");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "gtt_dump",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, igen9_sysctl_gtt_dump, "I",
+	    sc, 0, igen_sysctl_gtt_dump, "I",
 	    "write 1 to scan first 2048 GTT PTEs and print first 8");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "gtt_alloc_test",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, igen9_sysctl_gtt_alloc_test, "I",
+	    sc, 0, igen_sysctl_gtt_alloc_test, "I",
 	    "write 1 to alloc 1 page, map at GTT[2048], read back, free");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "test_fb_make",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, igen9_sysctl_test_fb_make, "I",
+	    sc, 0, igen_sysctl_test_fb_make, "I",
 	    "write 1 to alloc + GTT-map + checker-fill an 8 MiB 1920x1080 FB");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "test_fb_flip",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, igen9_sysctl_test_fb_flip, "I",
+	    sc, 0, igen_sysctl_test_fb_flip, "I",
 	    "write N (seconds 1..10) to flip PLANE_SURF to our checker FB"
 	    " then restore");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "scanout_hold",
 	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, igen9_sysctl_scanout_hold, "I",
+	    sc, 0, igen_sysctl_scanout_hold, "I",
 	    "1 = checker, 2 = diagnostic gradient+grid, both flip PLANE_SURF"
 	    " and HOLD;  0 = restore firmware FB + free");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "expose_scanout_fb",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, igen9_sysctl_expose_scanout_fb, "I",
+	    sc, 0, igen_sysctl_expose_scanout_fb, "I",
 	    "write 1 to allocate + register a driver-owned drm_framebuffer"
 	    " for userspace MODE_ATOMIC; prints FB_ID, CRTC_ID, PLANE_ID");
 	SYSCTL_ADD_U64(&sc->re_sysctl_ctx, children, OID_AUTO,
@@ -511,7 +519,7 @@ igen9_re_sysctls_init(struct igen9_softc *sc)
 }
 
 static void
-igen9_re_sysctls_fini(struct igen9_softc *sc)
+igen_re_sysctls_fini(struct igen_softc *sc)
 {
 	sysctl_ctx_free(&sc->re_sysctl_ctx);
 	if (sc->snapshot != NULL) {
@@ -604,7 +612,7 @@ struct child_device_config {
 } __packed;
 
 static const char *
-igen9_dvo_port_name(uint8_t p)
+igen_dvo_port_name(uint8_t p)
 {
 	switch (p) {
 	case 0:  return "HDMI-A";
@@ -625,7 +633,7 @@ igen9_dvo_port_name(uint8_t p)
 }
 
 static const char *
-igen9_device_type_name(uint16_t t)
+igen_device_type_name(uint16_t t)
 {
 	switch (t) {
 	case 0x1806: return "eDP";
@@ -639,9 +647,9 @@ igen9_device_type_name(uint16_t t)
 }
 
 static int
-igen9_sysctl_vbt_dump(SYSCTL_HANDLER_ARGS)
+igen_sysctl_vbt_dump(SYSCTL_HANDLER_ARGS)
 {
-	struct igen9_softc *sc = arg1;
+	struct igen_softc *sc = arg1;
 	uint32_t asls;
 	void *va;
 	uint8_t *blob;
@@ -725,10 +733,10 @@ igen9_sysctl_vbt_dump(SYSCTL_HANDLER_ARGS)
 					    "  ddc_pin=%u  aux_ch=0x%02x"
 					    "\n",
 					    n, cd->handle, cd->device_type,
-					    igen9_device_type_name(
+					    igen_device_type_name(
 						cd->device_type),
 					    cd->dvo_port,
-					    igen9_dvo_port_name(
+					    igen_dvo_port_name(
 						cd->dvo_port),
 					    cd->ddc_pin, cd->aux_channel);
 				}
@@ -774,21 +782,21 @@ igen9_sysctl_vbt_dump(SYSCTL_HANDLER_ARGS)
 #define	PIPE_FRMCOUNT(p)	(0x70040 + (p) * 0x1000)
 
 static uint64_t
-igen9_gtt_read(struct igen9_softc *sc, uint32_t entry_idx)
+igen_gtt_read(struct igen_softc *sc, uint32_t entry_idx)
 {
 	uint32_t off = GTT_BASE + entry_idx * GTT_PTE_SIZE;
-	uint32_t lo = igen9_r32(sc, off);
-	uint32_t hi = igen9_r32(sc, off + 4);
+	uint32_t lo = igen_r32(sc, off);
+	uint32_t hi = igen_r32(sc, off + 4);
 	return ((uint64_t)hi << 32) | lo;
 }
 
 static void
-igen9_gtt_write(struct igen9_softc *sc, uint32_t entry_idx,
+igen_gtt_write(struct igen_softc *sc, uint32_t entry_idx,
     uint64_t pte)
 {
 	uint32_t off = GTT_BASE + entry_idx * GTT_PTE_SIZE;
-	igen9_w32(sc, off, (uint32_t)pte);
-	igen9_w32(sc, off + 4, (uint32_t)(pte >> 32));
+	igen_w32(sc, off, (uint32_t)pte);
+	igen_w32(sc, off + 4, (uint32_t)(pte >> 32));
 }
 
 /*
@@ -796,7 +804,7 @@ igen9_gtt_write(struct igen9_softc *sc, uint32_t entry_idx,
  * offset.  Lives on the softc so a follow-up page-flip sysctl can swap
  * PLANE_SURF to test_fb.gtt_offset and back to 0.
  */
-struct igen9_test_fb {
+struct igen_test_fb {
 	void		*va;
 	vm_paddr_t	 pa;
 	size_t		 size;
@@ -828,7 +836,7 @@ struct igen9_test_fb {
  * reused for the next user FB.  Single active scanout buffer at a time.
  */
 static uint32_t
-igen9_gtt_bind_user_fb(struct igen9_softc *sc,
+igen_gtt_bind_user_fb(struct igen_softc *sc,
     struct drm_framebuffer *fb)
 {
 	struct drm_gem_object *obj = fb->gem_objs[0];
@@ -863,7 +871,7 @@ igen9_gtt_bind_user_fb(struct igen9_softc *sc,
 		vm_paddr_t pa = VM_PAGE_TO_PHYS(obj->pages[i]);
 		uint64_t pte = (pa & ~0xfffULL) | GTT_PTE_VALID |
 		    GTT_PTE_WRITEABLE;
-		igen9_gtt_write(sc, first_idx + i, pte);
+		igen_gtt_write(sc, first_idx + i, pte);
 	}
 	uint32_t surf = first_idx * PAGE_SIZE;
 	sc->user_fb_slots[slot].fb = fb;
@@ -872,8 +880,8 @@ igen9_gtt_bind_user_fb(struct igen9_softc *sc,
 }
 
 static int
-igen9_test_fb_alloc(struct igen9_softc *sc,
-    struct igen9_test_fb *fb, uint32_t w, uint32_t h)
+igen_test_fb_alloc(struct igen_softc *sc,
+    struct igen_test_fb *fb, uint32_t w, uint32_t h)
 {
 	fb->width = w;
 	fb->height = h;
@@ -892,19 +900,19 @@ igen9_test_fb_alloc(struct igen9_softc *sc,
 	for (uint32_t i = 0; i < fb->gtt_count; i++) {
 		uint64_t pte = ((fb->pa + (uint64_t)i * PAGE_SIZE) & ~0xfffULL)
 		    | GTT_PTE_VALID | GTT_PTE_WRITEABLE;
-		igen9_gtt_write(sc, fb->gtt_first_idx + i, pte);
+		igen_gtt_write(sc, fb->gtt_first_idx + i, pte);
 	}
 	fb->mapped = true;
 	return (0);
 }
 
 static void
-igen9_test_fb_free(struct igen9_softc *sc,
-    struct igen9_test_fb *fb)
+igen_test_fb_free(struct igen_softc *sc,
+    struct igen_test_fb *fb)
 {
 	if (fb->mapped) {
 		for (uint32_t i = 0; i < fb->gtt_count; i++)
-			igen9_gtt_write(sc, fb->gtt_first_idx + i, 0);
+			igen_gtt_write(sc, fb->gtt_first_idx + i, 0);
 		fb->mapped = false;
 	}
 	if (fb->va != NULL) {
@@ -915,7 +923,7 @@ igen9_test_fb_free(struct igen9_softc *sc,
 
 /* 64×64 checkerboard, two-color, in XRGB8888. */
 static void
-igen9_test_fb_fill_checker(struct igen9_test_fb *fb,
+igen_test_fb_fill_checker(struct igen_test_fb *fb,
     uint32_t color_a, uint32_t color_b)
 {
 	uint32_t *px = (uint32_t *)fb->va;
@@ -938,7 +946,7 @@ igen9_test_fb_fill_checker(struct igen9_test_fb *fb,
  *     (immediately recognisable as "this is our buffer not the desktop")
  */
 static void
-igen9_test_fb_fill_diag(struct igen9_test_fb *fb)
+igen_test_fb_fill_diag(struct igen_test_fb *fb)
 {
 	uint32_t *px = (uint32_t *)fb->va;
 	uint32_t row_stride_px = fb->stride / 4;
@@ -975,14 +983,14 @@ igen9_test_fb_fill_diag(struct igen9_test_fb *fb)
  * scanout rate.
  */
 static void
-igen9_anim_thread(void *arg)
+igen_anim_thread(void *arg)
 {
-	struct igen9_softc *sc = arg;
+	struct igen_softc *sc = arg;
 	uint32_t frame = 0;
 	uint32_t prev_x = 0, prev_y = 0;
 
 	while (!sc->anim_stop && sc->scanout_held && sc->scanout_fb != NULL) {
-		struct igen9_test_fb *fb = sc->scanout_fb;
+		struct igen_test_fb *fb = sc->scanout_fb;
 		uint32_t *px = (uint32_t *)fb->va;
 		uint32_t row_stride_px = fb->stride / 4;
 
@@ -1021,13 +1029,13 @@ igen9_anim_thread(void *arg)
 }
 
 static void
-igen9_anim_start(struct igen9_softc *sc)
+igen_anim_start(struct igen_softc *sc)
 {
 	if (sc->anim_active)
 		return;
 	sc->anim_stop = false;
 	sc->anim_active = true;
-	if (kthread_add(igen9_anim_thread, sc, NULL, &sc->anim_td,
+	if (kthread_add(igen_anim_thread, sc, NULL, &sc->anim_td,
 	    0, 0, "gen9anim") != 0) {
 		sc->anim_active = false;
 		device_printf(sc->dev, "anim: kthread_add failed\n");
@@ -1035,7 +1043,7 @@ igen9_anim_start(struct igen9_softc *sc)
 }
 
 static void
-igen9_anim_stop(struct igen9_softc *sc)
+igen_anim_stop(struct igen_softc *sc)
 {
 	if (!sc->anim_active)
 		return;
@@ -1053,32 +1061,32 @@ igen9_anim_stop(struct igen9_softc *sc)
  * One-shot: subsequent triggers print the existing FB_ID without
  * allocating again.  Cleared on detach.
  */
-static struct igen9_owned_fb *igen9_exposed_fb = NULL;
+static struct igen_owned_fb *igen_exposed_fb = NULL;
 
 static int
-igen9_sysctl_expose_scanout_fb(SYSCTL_HANDLER_ARGS)
+igen_sysctl_expose_scanout_fb(SYSCTL_HANDLER_ARGS)
 {
-	struct igen9_softc *sc = arg1;
+	struct igen_softc *sc = arg1;
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
 
 	if (error || req->newptr == NULL || trigger == 0)
 		return (error);
 
-	if (igen9_exposed_fb != NULL) {
+	if (igen_exposed_fb != NULL) {
 		device_printf(sc->dev,
 		    "expose_scanout_fb: already exposed as FB_ID=%u"
 		    "  CRTC_ID=%u  PLANE_ID=%u\n",
-		    igen9_exposed_fb->base.base.id,
+		    igen_exposed_fb->base.base.id,
 		    sc->crtc.base.id, sc->primary.base.id);
 		return (0);
 	}
 
-	struct igen9_owned_fb *ofb = malloc(sizeof(*ofb), M_KMS,
+	struct igen_owned_fb *ofb = malloc(sizeof(*ofb), M_KMS,
 	    M_WAITOK | M_ZERO);
-	struct igen9_test_fb *tfb = malloc(sizeof(*tfb), M_KMS,
+	struct igen_test_fb *tfb = malloc(sizeof(*tfb), M_KMS,
 	    M_WAITOK | M_ZERO);
-	error = igen9_test_fb_alloc(sc, tfb, 1920, 1080);
+	error = igen_test_fb_alloc(sc, tfb, 1920, 1080);
 	if (error != 0) {
 		device_printf(sc->dev,
 		    "expose_scanout_fb: alloc failed %d\n", error);
@@ -1086,7 +1094,7 @@ igen9_sysctl_expose_scanout_fb(SYSCTL_HANDLER_ARGS)
 		free(ofb, M_KMS);
 		return (0);
 	}
-	igen9_test_fb_fill_diag(tfb);
+	igen_test_fb_fill_diag(tfb);
 	ofb->test_fb = tfb;
 
 	ofb->base.width  = tfb->width;
@@ -1094,16 +1102,16 @@ igen9_sysctl_expose_scanout_fb(SYSCTL_HANDLER_ARGS)
 	ofb->base.format = 0x34325258;	/* XR24 */
 	ofb->base.pitches[0] = tfb->stride;
 	error = kms_framebuffer_init(sc->drm_dev, &ofb->base,
-	    &igen9_owned_fb_funcs);
+	    &igen_owned_fb_funcs);
 	if (error != 0) {
 		device_printf(sc->dev,
 		    "expose_scanout_fb: framebuffer_init failed %d\n", error);
-		igen9_test_fb_free(sc, tfb);
+		igen_test_fb_free(sc, tfb);
 		free(tfb, M_KMS);
 		free(ofb, M_KMS);
 		return (0);
 	}
-	igen9_exposed_fb = ofb;
+	igen_exposed_fb = ofb;
 
 	device_printf(sc->dev,
 	    "expose_scanout_fb: exposed FB_ID=%u  CRTC_ID=%u  PLANE_ID=%u\n",
@@ -1121,9 +1129,9 @@ igen9_sysctl_expose_scanout_fb(SYSCTL_HANDLER_ARGS)
  * over the static checker buffer.  Idempotent in both directions.
  */
 static int
-igen9_sysctl_scanout_hold(SYSCTL_HANDLER_ARGS)
+igen_sysctl_scanout_hold(SYSCTL_HANDLER_ARGS)
 {
-	struct igen9_softc *sc = arg1;
+	struct igen_softc *sc = arg1;
 	int hold = sc->scanout_held ? 1 : 0;
 	int error = sysctl_handle_int(oidp, &hold, 0, req);
 
@@ -1133,7 +1141,7 @@ igen9_sysctl_scanout_hold(SYSCTL_HANDLER_ARGS)
 	if (hold && !sc->scanout_held) {
 		sc->scanout_fb = malloc(sizeof(*sc->scanout_fb),
 		    M_KMS, M_WAITOK | M_ZERO);
-		error = igen9_test_fb_alloc(sc, sc->scanout_fb,
+		error = igen_test_fb_alloc(sc, sc->scanout_fb,
 		    1920, 1080);
 		if (error != 0) {
 			device_printf(sc->dev,
@@ -1150,14 +1158,14 @@ igen9_sysctl_scanout_hold(SYSCTL_HANDLER_ARGS)
 		 * Anything else > 0 -> checker.
 		 */
 		if (hold == 2 || hold == 3)
-			igen9_test_fb_fill_diag(sc->scanout_fb);
+			igen_test_fb_fill_diag(sc->scanout_fb);
 		else
-			igen9_test_fb_fill_checker(sc->scanout_fb,
+			igen_test_fb_fill_checker(sc->scanout_fb,
 			    0x00ff0000, 0x000000ff);
 
-		sc->scanout_prev_surf = igen9_r32(sc, PLANE_SURF(0));
+		sc->scanout_prev_surf = igen_r32(sc, PLANE_SURF(0));
 		uint32_t new_surf = sc->scanout_fb->gtt_first_idx * PAGE_SIZE;
-		igen9_w32(sc, PLANE_SURF(0), new_surf);
+		igen_w32(sc, PLANE_SURF(0), new_surf);
 		sc->scanout_held = true;
 
 		DPRINTF(sc, 0,
@@ -1165,12 +1173,12 @@ igen9_sysctl_scanout_hold(SYSCTL_HANDLER_ARGS)
 		    sc->scanout_prev_surf, new_surf);
 
 		if (hold == 3)
-			igen9_anim_start(sc);
+			igen_anim_start(sc);
 	} else if (!hold && sc->scanout_held) {
-		igen9_anim_stop(sc);
-		igen9_w32(sc, PLANE_SURF(0), sc->scanout_prev_surf);
+		igen_anim_stop(sc);
+		igen_w32(sc, PLANE_SURF(0), sc->scanout_prev_surf);
 		pause("gen9rst", hz / 20);
-		igen9_test_fb_free(sc, sc->scanout_fb);
+		igen_test_fb_free(sc, sc->scanout_fb);
 		free(sc->scanout_fb, M_KMS);
 		sc->scanout_fb = NULL;
 		sc->scanout_held = false;
@@ -1182,9 +1190,9 @@ igen9_sysctl_scanout_hold(SYSCTL_HANDLER_ARGS)
 }
 
 static int
-igen9_sysctl_test_fb_flip(SYSCTL_HANDLER_ARGS)
+igen_sysctl_test_fb_flip(SYSCTL_HANDLER_ARGS)
 {
-	struct igen9_softc *sc = arg1;
+	struct igen_softc *sc = arg1;
 	int hold_sec = 0;
 	int error = sysctl_handle_int(oidp, &hold_sec, 0, req);
 
@@ -1195,14 +1203,14 @@ igen9_sysctl_test_fb_flip(SYSCTL_HANDLER_ARGS)
 	if (hold_sec > 10)
 		hold_sec = 10;
 
-	struct igen9_test_fb fb = { 0 };
-	error = igen9_test_fb_alloc(sc, &fb, 1920, 1080);
+	struct igen_test_fb fb = { 0 };
+	error = igen_test_fb_alloc(sc, &fb, 1920, 1080);
 	if (error != 0) {
 		device_printf(sc->dev, "test_fb_flip: alloc failed: %d\n",
 		    error);
 		return (0);
 	}
-	igen9_test_fb_fill_checker(&fb, 0x00ff0000, 0x000000ff);
+	igen_test_fb_fill_checker(&fb, 0x00ff0000, 0x000000ff);
 
 	/*
 	 * Flip plane 1 of pipe A to scan from our buffer.  Our FB matches
@@ -1211,10 +1219,10 @@ igen9_sysctl_test_fb_flip(SYSCTL_HANDLER_ARGS)
 	 * write is the entire change.  PLANE_SURF is the "armed" register —
 	 * the change takes effect at the next vblank.
 	 */
-	uint32_t prev_surf = igen9_r32(sc, PLANE_SURF(0));
+	uint32_t prev_surf = igen_r32(sc, PLANE_SURF(0));
 	uint32_t new_surf  = fb.gtt_first_idx * PAGE_SIZE;
-	uint32_t live_before = igen9_r32(sc, PLANE_SURFLIVE(0));
-	uint32_t frm_before  = igen9_r32(sc, PIPE_FRMCOUNT(0));
+	uint32_t live_before = igen_r32(sc, PLANE_SURFLIVE(0));
+	uint32_t frm_before  = igen_r32(sc, PIPE_FRMCOUNT(0));
 
 	device_printf(sc->dev,
 	    "test_fb_flip: PLANE_SURF 0x%08x -> 0x%08x (hold %d s)\n",
@@ -1223,7 +1231,7 @@ igen9_sysctl_test_fb_flip(SYSCTL_HANDLER_ARGS)
 	    "  pre:   SURFLIVE=0x%08x  FRMCOUNT=%u\n",
 	    live_before, frm_before);
 
-	igen9_w32(sc, PLANE_SURF(0), new_surf);
+	igen_w32(sc, PLANE_SURF(0), new_surf);
 
 	/*
 	 * Sample SURFLIVE shortly after the arm to confirm HW latched it
@@ -1231,19 +1239,19 @@ igen9_sysctl_test_fb_flip(SYSCTL_HANDLER_ARGS)
 	 * 50 ms of pause is plenty.
 	 */
 	pause("gen9arm", hz / 20);
-	uint32_t live_armed = igen9_r32(sc, PLANE_SURFLIVE(0));
+	uint32_t live_armed = igen_r32(sc, PLANE_SURFLIVE(0));
 	device_printf(sc->dev,
 	    "  armed: SURFLIVE=0x%08x  %s\n", live_armed,
 	    ((live_armed & 0xfffff000) == new_surf) ?
 	    "FLIP TOOK" : "FLIP DID NOT TAKE");
 
 	pause("gen9flp", hold_sec * hz);
-	uint32_t live_end = igen9_r32(sc, PLANE_SURFLIVE(0));
-	uint32_t frm_end  = igen9_r32(sc, PIPE_FRMCOUNT(0));
+	uint32_t live_end = igen_r32(sc, PLANE_SURFLIVE(0));
+	uint32_t frm_end  = igen_r32(sc, PIPE_FRMCOUNT(0));
 
-	igen9_w32(sc, PLANE_SURF(0), prev_surf);
+	igen_w32(sc, PLANE_SURF(0), prev_surf);
 	pause("gen9rst", hz / 20);
-	uint32_t live_restored = igen9_r32(sc, PLANE_SURFLIVE(0));
+	uint32_t live_restored = igen_r32(sc, PLANE_SURFLIVE(0));
 
 	device_printf(sc->dev,
 	    "  during: SURFLIVE=0x%08x  FRMCOUNT=%u  (advanced %u frames)\n",
@@ -1253,29 +1261,29 @@ igen9_sysctl_test_fb_flip(SYSCTL_HANDLER_ARGS)
 	    live_restored,
 	    ((live_restored & 0xfffff000) == (prev_surf & 0xfffff000)) ?
 	    "RESTORED OK" : "RESTORE FAILED");
-	igen9_test_fb_free(sc, &fb);
+	igen_test_fb_free(sc, &fb);
 	return (0);
 }
 
 static int
-igen9_sysctl_test_fb_make(SYSCTL_HANDLER_ARGS)
+igen_sysctl_test_fb_make(SYSCTL_HANDLER_ARGS)
 {
-	struct igen9_softc *sc = arg1;
+	struct igen_softc *sc = arg1;
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
 
 	if (error || req->newptr == NULL || trigger == 0)
 		return (error);
 
-	struct igen9_test_fb fb = { 0 };
-	error = igen9_test_fb_alloc(sc, &fb, 1920, 1080);
+	struct igen_test_fb fb = { 0 };
+	error = igen_test_fb_alloc(sc, &fb, 1920, 1080);
 	if (error != 0) {
 		device_printf(sc->dev,
 		    "test_fb: alloc failed (%d) — need %u KiB contig\n",
 		    error, 1920 * 1080 * 4 / 1024);
 		return (0);
 	}
-	igen9_test_fb_fill_checker(&fb, 0x00ff0000, 0x000000ff);
+	igen_test_fb_fill_checker(&fb, 0x00ff0000, 0x000000ff);
 
 	uint32_t *first = (uint32_t *)fb.va;
 	device_printf(sc->dev,
@@ -1292,9 +1300,9 @@ igen9_sysctl_test_fb_make(SYSCTL_HANDLER_ARGS)
 	device_printf(sc->dev,
 	    "  GTT[%u] readback = 0x%016llx (expect VALID+WRITEABLE + pa)\n",
 	    fb.gtt_first_idx,
-	    (unsigned long long)igen9_gtt_read(sc, fb.gtt_first_idx));
+	    (unsigned long long)igen_gtt_read(sc, fb.gtt_first_idx));
 
-	igen9_test_fb_free(sc, &fb);
+	igen_test_fb_free(sc, &fb);
 	device_printf(sc->dev, "test_fb: freed cleanly\n");
 	return (0);
 }
@@ -1306,9 +1314,9 @@ igen9_sysctl_test_fb_make(SYSCTL_HANDLER_ARGS)
  * works before we build the page-flip logic on top.
  */
 static int
-igen9_sysctl_gtt_alloc_test(SYSCTL_HANDLER_ARGS)
+igen_sysctl_gtt_alloc_test(SYSCTL_HANDLER_ARGS)
 {
-	struct igen9_softc *sc = arg1;
+	struct igen_softc *sc = arg1;
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
 
@@ -1331,9 +1339,9 @@ igen9_sysctl_gtt_alloc_test(SYSCTL_HANDLER_ARGS)
 	vm_paddr_t pa = pmap_kextract((vm_offset_t)va);
 	uint64_t pte = (pa & ~0xfffULL) | GTT_PTE_VALID | GTT_PTE_WRITEABLE;
 
-	uint64_t before = igen9_gtt_read(sc, test_idx);
-	igen9_gtt_write(sc, test_idx, pte);
-	uint64_t after = igen9_gtt_read(sc, test_idx);
+	uint64_t before = igen_gtt_read(sc, test_idx);
+	igen_gtt_write(sc, test_idx, pte);
+	uint64_t after = igen_gtt_read(sc, test_idx);
 
 	device_printf(sc->dev,
 	    "gtt_alloc_test: va=%p  pa=0x%llx  wrote PTE=0x%llx\n",
@@ -1349,15 +1357,15 @@ igen9_sysctl_gtt_alloc_test(SYSCTL_HANDLER_ARGS)
 	 * dangling-ref it AND any firmware mapping that happened to live
 	 * here stays intact.
 	 */
-	igen9_gtt_write(sc, test_idx, before);
+	igen_gtt_write(sc, test_idx, before);
 	contigfree(va, PAGE_SIZE, M_KMS);
 	return (0);
 }
 
 static int
-igen9_sysctl_gtt_dump(SYSCTL_HANDLER_ARGS)
+igen_sysctl_gtt_dump(SYSCTL_HANDLER_ARGS)
 {
-	struct igen9_softc *sc = arg1;
+	struct igen_softc *sc = arg1;
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
 
@@ -1367,7 +1375,7 @@ igen9_sysctl_gtt_dump(SYSCTL_HANDLER_ARGS)
 	uint32_t valid_count = 0, last_pfn = 0, runs = 0;
 	uint64_t first_pfn = 0;
 	for (uint32_t i = 0; i < 2048; i++) {	/* first 8 MiB of GTT */
-		uint64_t pte = igen9_gtt_read(sc, i);
+		uint64_t pte = igen_gtt_read(sc, i);
 		if (pte & GTT_PTE_VALID) {
 			uint64_t pfn = (pte >> 12);
 			if (valid_count == 0)
@@ -1387,7 +1395,7 @@ igen9_sysctl_gtt_dump(SYSCTL_HANDLER_ARGS)
 
 	/* Pretty-print the first 8 PTEs verbatim. */
 	for (uint32_t i = 0; i < 8; i++) {
-		uint64_t pte = igen9_gtt_read(sc, i);
+		uint64_t pte = igen_gtt_read(sc, i);
 		device_printf(sc->dev,
 		    "  GTT[%u] = 0x%016llx  %s%s  PFN=0x%llx\n",
 		    i, (unsigned long long)pte,
@@ -1439,7 +1447,7 @@ igen9_sysctl_gtt_dump(SYSCTL_HANDLER_ARGS)
 #define	PLANE_OFFSET(p)		(0x701a4 + (p) * 0x1000)
 
 static const char *
-igen9_plane_format_name(uint32_t f)
+igen_plane_format_name(uint32_t f)
 {
 	switch (f) {
 	case 0x0: return "YUV422-8";
@@ -1455,7 +1463,7 @@ igen9_plane_format_name(uint32_t f)
 }
 
 static const char *
-igen9_plane_tiling_name(uint32_t t)
+igen_plane_tiling_name(uint32_t t)
 {
 	switch (t) {
 	case 0: return "linear";
@@ -1467,14 +1475,14 @@ igen9_plane_tiling_name(uint32_t t)
 }
 
 static void
-igen9_read_pipe_mode(struct igen9_softc *sc, int pipe,
+igen_read_pipe_mode(struct igen_softc *sc, int pipe,
     struct drm_display_mode *m)
 {
-	uint32_t htotal = igen9_r32(sc, TRANS_HTOTAL(pipe));
-	uint32_t hsync  = igen9_r32(sc, TRANS_HSYNC(pipe));
-	uint32_t vtotal = igen9_r32(sc, TRANS_VTOTAL(pipe));
-	uint32_t vsync  = igen9_r32(sc, TRANS_VSYNC(pipe));
-	uint32_t fctl   = igen9_r32(sc, TRANS_DDI_FUNC_CTL(pipe));
+	uint32_t htotal = igen_r32(sc, TRANS_HTOTAL(pipe));
+	uint32_t hsync  = igen_r32(sc, TRANS_HSYNC(pipe));
+	uint32_t vtotal = igen_r32(sc, TRANS_VTOTAL(pipe));
+	uint32_t vsync  = igen_r32(sc, TRANS_VSYNC(pipe));
+	uint32_t fctl   = igen_r32(sc, TRANS_DDI_FUNC_CTL(pipe));
 
 	memset(m, 0, sizeof(*m));
 	m->hdisplay    = (htotal & 0x1fff) + 1;
@@ -1498,9 +1506,9 @@ igen9_read_pipe_mode(struct igen9_softc *sc, int pipe,
 }
 
 static int
-igen9_sysctl_current_mode(SYSCTL_HANDLER_ARGS)
+igen_sysctl_current_mode(SYSCTL_HANDLER_ARGS)
 {
-	struct igen9_softc *sc = arg1;
+	struct igen_softc *sc = arg1;
 	struct drm_display_mode m;
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
@@ -1509,7 +1517,7 @@ igen9_sysctl_current_mode(SYSCTL_HANDLER_ARGS)
 		return (error);
 
 	for (int pipe = 0; pipe < 3; pipe++) {
-		uint32_t pconf = igen9_r32(sc, PIPE_CONF(pipe));
+		uint32_t pconf = igen_r32(sc, PIPE_CONF(pipe));
 		bool active = (pconf & (PIPE_CONF_ENABLE | PIPE_CONF_STATE))
 		    == (PIPE_CONF_ENABLE | PIPE_CONF_STATE);
 		device_printf(sc->dev,
@@ -1517,7 +1525,7 @@ igen9_sysctl_current_mode(SYSCTL_HANDLER_ARGS)
 		    'A' + pipe, pconf, active ? "ACTIVE" : "idle");
 		if (!active)
 			continue;
-		igen9_read_pipe_mode(sc, pipe, &m);
+		igen_read_pipe_mode(sc, pipe, &m);
 		device_printf(sc->dev,
 		    "  %ux%u  htotal=%u  vtotal=%u  hs=%u..%u  vs=%u..%u"
 		    "  flags=0x%x\n",
@@ -1525,11 +1533,11 @@ igen9_sysctl_current_mode(SYSCTL_HANDLER_ARGS)
 		    m.hsync_start, m.hsync_end,
 		    m.vsync_start, m.vsync_end, m.flags);
 
-		uint32_t pctl  = igen9_r32(sc, PLANE_CTL(pipe));
-		uint32_t psurf = igen9_r32(sc, PLANE_SURF(pipe));
-		uint32_t pstr  = igen9_r32(sc, PLANE_STRIDE(pipe));
-		uint32_t psize = igen9_r32(sc, PLANE_SIZE(pipe));
-		uint32_t poff  = igen9_r32(sc, PLANE_OFFSET(pipe));
+		uint32_t pctl  = igen_r32(sc, PLANE_CTL(pipe));
+		uint32_t psurf = igen_r32(sc, PLANE_SURF(pipe));
+		uint32_t pstr  = igen_r32(sc, PLANE_STRIDE(pipe));
+		uint32_t psize = igen_r32(sc, PLANE_SIZE(pipe));
+		uint32_t poff  = igen_r32(sc, PLANE_OFFSET(pipe));
 		uint32_t fmt   = (pctl & PLANE_CTL_FORMAT_MASK) >>
 		    PLANE_CTL_FORMAT_SHIFT;
 		uint32_t tile  = (pctl & PLANE_CTL_TILED_MASK) >>
@@ -1539,8 +1547,8 @@ igen9_sysctl_current_mode(SYSCTL_HANDLER_ARGS)
 		device_printf(sc->dev,
 		    "  plane1: CTL=0x%08x  en=%d  fmt=%s  tile=%s\n",
 		    pctl, !!(pctl & PLANE_CTL_ENABLE),
-		    igen9_plane_format_name(fmt),
-		    igen9_plane_tiling_name(tile));
+		    igen_plane_format_name(fmt),
+		    igen_plane_tiling_name(tile));
 		device_printf(sc->dev,
 		    "          SURF=0x%08x  STRIDE=%u (raw=0x%x)"
 		    "  SIZE=%ux%u  OFFSET=0x%08x\n",
@@ -1572,7 +1580,7 @@ igen9_sysctl_current_mode(SYSCTL_HANDLER_ARGS)
  *   17:   feature flags incl sync polarity bits [2:1] (h=2, v=1)
  */
 static void
-igen9_edid_to_mode(const uint8_t *d, struct drm_display_mode *m)
+igen_edid_to_mode(const uint8_t *d, struct drm_display_mode *m)
 {
 	uint32_t pixclk_10kHz = d[0] | ((uint32_t)d[1] << 8);
 	uint16_t hactive = d[2] | ((uint16_t)(d[4] >> 4) << 8);
@@ -1603,7 +1611,7 @@ igen9_edid_to_mode(const uint8_t *d, struct drm_display_mode *m)
 }
 
 static int
-igen9_attach_edid_modes(struct igen9_softc *sc)
+igen_attach_edid_modes(struct igen_softc *sc)
 {
 	uint8_t edid[128];
 	int error = EIO;
@@ -1614,7 +1622,7 @@ igen9_attach_edid_modes(struct igen9_softc *sc)
 	 * 2nd attempt the bus is consistently warm.
 	 */
 	for (int try = 0; try < 4; try++) {
-		error = igen9_gmbus_read_block(sc, GMBUS_PIN_DDI_B,
+		error = igen_gmbus_read_block(sc, GMBUS_PIN_DDI_B,
 		    EDID_SLAVE, 0, edid, sizeof(edid));
 		if (error == 0)
 			break;
@@ -1640,7 +1648,7 @@ igen9_attach_edid_modes(struct igen9_softc *sc)
 		struct drm_display_mode *m = kms_mode_create();
 		if (m == NULL)
 			return (ENOMEM);
-		igen9_edid_to_mode(&edid[i], m);
+		igen_edid_to_mode(&edid[i], m);
 		kms_connector_add_mode(&sc->connector, m);
 		DPRINTF(sc, 0,
 		    "edid: added mode %s @%u kHz  %u Hz  flags=0x%x\n",
@@ -1668,9 +1676,9 @@ igen9_attach_edid_modes(struct igen9_softc *sc)
 #define	SDEISR			0x000c4000
 
 static int
-igen9_sysctl_hpd_dump(SYSCTL_HANDLER_ARGS)
+igen_sysctl_hpd_dump(SYSCTL_HANDLER_ARGS)
 {
-	struct igen9_softc *sc = arg1;
+	struct igen_softc *sc = arg1;
 	uint32_t sfuse, hot, sde;
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
@@ -1678,9 +1686,9 @@ igen9_sysctl_hpd_dump(SYSCTL_HANDLER_ARGS)
 	if (error || req->newptr == NULL || trigger == 0)
 		return (error);
 
-	sfuse = igen9_r32(sc, SFUSE_STRAP);
-	hot   = igen9_r32(sc, SHOTPLUG_CTL_DDI);
-	sde   = igen9_r32(sc, SDEISR);
+	sfuse = igen_r32(sc, SFUSE_STRAP);
+	hot   = igen_r32(sc, SHOTPLUG_CTL_DDI);
+	sde   = igen_r32(sc, SDEISR);
 
 	device_printf(sc->dev,
 	    "hpd: SFUSE_STRAP=0x%08x  SHOTPLUG_CTL_DDI=0x%08x  SDEISR=0x%08x\n",
@@ -1736,9 +1744,9 @@ igen9_sysctl_hpd_dump(SYSCTL_HANDLER_ARGS)
  * Conclusion: max 2 concurrent displays on this SKU (DDI_B + DDI_C).
  */
 static int
-igen9_sysctl_cap_dump(SYSCTL_HANDLER_ARGS)
+igen_sysctl_cap_dump(SYSCTL_HANDLER_ARGS)
 {
-	struct igen9_softc *sc = arg1;
+	struct igen_softc *sc = arg1;
 	uint32_t asls, sfuse, sde;
 	void *va;
 	uint8_t *blob;
@@ -1751,8 +1759,8 @@ igen9_sysctl_cap_dump(SYSCTL_HANDLER_ARGS)
 	if (error || req->newptr == NULL || trigger == 0)
 		return (error);
 
-	sfuse = igen9_r32(sc, SFUSE_STRAP);
-	sde   = igen9_r32(sc, SDEISR);
+	sfuse = igen_r32(sc, SFUSE_STRAP);
+	sde   = igen_r32(sc, SDEISR);
 
 	/*
 	 * Walk the VBT to fill per_ddi_type[].  We map dvo_port back to a
@@ -1827,7 +1835,7 @@ igen9_sysctl_cap_dump(SYSCTL_HANDLER_ARGS)
 		int silicon = 0;
 		int hpd = 0;
 		const char *vtype = per_ddi_type[ddi] ?
-		    igen9_device_type_name(per_ddi_type[ddi]) : "(none)";
+		    igen_device_type_name(per_ddi_type[ddi]) : "(none)";
 
 		switch (ddi) {
 		case 1: silicon = (sfuse >> 2) & 1; break;	/* DDI_B */
@@ -1887,44 +1895,44 @@ igen9_sysctl_cap_dump(SYSCTL_HANDLER_ARGS)
 #define	GEN8_PIPE_VBLANK		(1u << 0)
 
 static void
-igen9_irq_handler(void *arg)
+igen_irq_handler(void *arg)
 {
-	struct igen9_softc *sc = arg;
+	struct igen_softc *sc = arg;
 	uint32_t master, master_w;
 
-	master = igen9_r32(sc, GEN8_MASTER_IRQ);
+	master = igen_r32(sc, GEN8_MASTER_IRQ);
 	if ((master & GEN8_MASTER_IRQ_CONTROL) == 0)
 		return;
 	/* Disable master while servicing; re-enable at end. */
 	master_w = master & ~GEN8_MASTER_IRQ_CONTROL;
-	igen9_w32(sc, GEN8_MASTER_IRQ, master_w);
+	igen_w32(sc, GEN8_MASTER_IRQ, master_w);
 
 	sc->irq_total_count++;
 	bool pipe_a_vblank = false;
 	if (master & GEN8_DE_PIPE_A_IRQ) {
-		uint32_t iir = igen9_r32(sc, GEN8_DE_PIPE_IIR(0));
+		uint32_t iir = igen_r32(sc, GEN8_DE_PIPE_IIR(0));
 		if (iir & GEN8_PIPE_VBLANK) {
 			sc->vblank_count_pipe_a++;
 			pipe_a_vblank = true;
 		}
-		igen9_w32(sc, GEN8_DE_PIPE_IIR(0), iir);
+		igen_w32(sc, GEN8_DE_PIPE_IIR(0), iir);
 	}
 	if (master & GEN8_DE_PIPE_B_IRQ) {
-		uint32_t iir = igen9_r32(sc, GEN8_DE_PIPE_IIR(1));
+		uint32_t iir = igen_r32(sc, GEN8_DE_PIPE_IIR(1));
 		if (iir & GEN8_PIPE_VBLANK)
 			sc->vblank_count_pipe_b++;
-		igen9_w32(sc, GEN8_DE_PIPE_IIR(1), iir);
+		igen_w32(sc, GEN8_DE_PIPE_IIR(1), iir);
 	}
 	if (master & GEN8_DE_PIPE_C_IRQ) {
-		uint32_t iir = igen9_r32(sc, GEN8_DE_PIPE_IIR(2));
+		uint32_t iir = igen_r32(sc, GEN8_DE_PIPE_IIR(2));
 		if (iir & GEN8_PIPE_VBLANK)
 			sc->vblank_count_pipe_c++;
-		igen9_w32(sc, GEN8_DE_PIPE_IIR(2), iir);
+		igen_w32(sc, GEN8_DE_PIPE_IIR(2), iir);
 	}
 
-	igen9_w32(sc, GEN8_MASTER_IRQ,
+	igen_w32(sc, GEN8_MASTER_IRQ,
 	    master_w | GEN8_MASTER_IRQ_CONTROL);
-	(void)igen9_r32(sc, GEN8_MASTER_IRQ);	/* posting flush */
+	(void)igen_r32(sc, GEN8_MASTER_IRQ);	/* posting flush */
 
 	/*
 	 * Deliver to framework AFTER re-enabling master: kms_vblank_handler
@@ -1937,7 +1945,7 @@ igen9_irq_handler(void *arg)
 }
 
 static int
-igen9_irq_setup(struct igen9_softc *sc)
+igen_irq_setup(struct igen_softc *sc)
 {
 	int msi_count = 1;
 	int error;
@@ -1947,13 +1955,13 @@ igen9_irq_setup(struct igen9_softc *sc)
 	 * Pipes B/C stay fully off (no scanout there); Pipe A gets the
 	 * vblank source unmasked + enabled after MSI is hooked.
 	 */
-	igen9_w32(sc, GEN8_MASTER_IRQ, 0);
+	igen_w32(sc, GEN8_MASTER_IRQ, 0);
 	for (int p = 0; p < 3; p++) {
-		igen9_w32(sc, GEN8_DE_PIPE_IMR(p), 0xffffffff);
-		igen9_w32(sc, GEN8_DE_PIPE_IER(p), 0);
-		igen9_w32(sc, GEN8_DE_PIPE_IIR(p), 0xffffffff);
+		igen_w32(sc, GEN8_DE_PIPE_IMR(p), 0xffffffff);
+		igen_w32(sc, GEN8_DE_PIPE_IER(p), 0);
+		igen_w32(sc, GEN8_DE_PIPE_IIR(p), 0xffffffff);
 	}
-	(void)igen9_r32(sc, GEN8_MASTER_IRQ);
+	(void)igen_r32(sc, GEN8_MASTER_IRQ);
 
 	if (pci_alloc_msi(sc->dev, &msi_count) != 0 || msi_count < 1) {
 		device_printf(sc->dev, "MSI alloc failed; falling back to INTx\n");
@@ -1970,7 +1978,7 @@ igen9_irq_setup(struct igen9_softc *sc)
 		return (ENXIO);
 	}
 	error = bus_setup_intr(sc->dev, sc->irq_res,
-	    INTR_TYPE_MISC | INTR_MPSAFE, NULL, igen9_irq_handler, sc,
+	    INTR_TYPE_MISC | INTR_MPSAFE, NULL, igen_irq_handler, sc,
 	    &sc->irq_cookie);
 	if (error != 0) {
 		device_printf(sc->dev, "bus_setup_intr: %d\n", error);
@@ -1986,27 +1994,27 @@ igen9_irq_setup(struct igen9_softc *sc)
 	 * Arm Pipe A vblank only (the firmware-active pipe).  B/C remain
 	 * fully masked.  Master IRQ_CONTROL turns the whole tree on last.
 	 */
-	igen9_w32(sc, GEN8_DE_PIPE_IIR(0), 0xffffffff);
-	igen9_w32(sc, GEN8_DE_PIPE_IMR(0), ~GEN8_PIPE_VBLANK);
-	igen9_w32(sc, GEN8_DE_PIPE_IER(0), GEN8_PIPE_VBLANK);
-	igen9_w32(sc, GEN8_MASTER_IRQ,
+	igen_w32(sc, GEN8_DE_PIPE_IIR(0), 0xffffffff);
+	igen_w32(sc, GEN8_DE_PIPE_IMR(0), ~GEN8_PIPE_VBLANK);
+	igen_w32(sc, GEN8_DE_PIPE_IER(0), GEN8_PIPE_VBLANK);
+	igen_w32(sc, GEN8_MASTER_IRQ,
 	    GEN8_MASTER_IRQ_CONTROL | GEN8_DE_PIPE_A_IRQ);
-	(void)igen9_r32(sc, GEN8_MASTER_IRQ);
+	(void)igen_r32(sc, GEN8_MASTER_IRQ);
 	DPRINTF(sc, 0, "irq: MSI armed, Pipe A vblank enabled\n");
 	return (0);
 }
 
 static void
-igen9_irq_teardown(struct igen9_softc *sc)
+igen_irq_teardown(struct igen_softc *sc)
 {
 	if (sc->irq_res == NULL)
 		return;
 	/* Master off, per-pipe banks masked + cleared. */
-	igen9_w32(sc, GEN8_MASTER_IRQ, 0);
+	igen_w32(sc, GEN8_MASTER_IRQ, 0);
 	for (int p = 0; p < 3; p++) {
-		igen9_w32(sc, GEN8_DE_PIPE_IMR(p), 0xffffffff);
-		igen9_w32(sc, GEN8_DE_PIPE_IER(p), 0);
-		igen9_w32(sc, GEN8_DE_PIPE_IIR(p), 0xffffffff);
+		igen_w32(sc, GEN8_DE_PIPE_IMR(p), 0xffffffff);
+		igen_w32(sc, GEN8_DE_PIPE_IER(p), 0);
+		igen_w32(sc, GEN8_DE_PIPE_IIR(p), 0xffffffff);
 	}
 
 	bus_teardown_intr(sc->dev, sc->irq_res, sc->irq_cookie);
@@ -2018,8 +2026,8 @@ igen9_irq_teardown(struct igen9_softc *sc)
 
 /* ----------------------------- driver glue -------------------------------- */
 
-static const struct drm_driver igen9_driver = {
-	.name		= "igen9",
+static const struct drm_driver igen_driver = {
+	.name		= "igen",
 	.desc		= "Intel Gen9 iGPU (kms framework)",
 	.date		= "20260613",
 	.major		= 0,
@@ -2039,11 +2047,11 @@ static const struct drm_driver igen9_driver = {
 /*
  * Map the user-allocated dumb buffer into the GTT and arm PLANE_SURF /
  * PLANE_STRIDE to scan from it.  Called from both set_config and
- * page_flip.  The GTT slot allocator (igen9_gtt_bind_user_fb) caches
+ * page_flip.  The GTT slot allocator (igen_gtt_bind_user_fb) caches
  * per-fb mappings so repeated arming of the same fb is cheap.
  */
 static void
-igen9_program_scanout(struct igen9_softc *sc, struct drm_framebuffer *fb)
+igen_program_scanout(struct igen_softc *sc, struct drm_framebuffer *fb)
 {
 	uint32_t surf;
 	uint32_t stride;
@@ -2051,7 +2059,7 @@ igen9_program_scanout(struct igen9_softc *sc, struct drm_framebuffer *fb)
 	if (fb == NULL)
 		return;
 
-	surf = igen9_gtt_bind_user_fb(sc, fb);
+	surf = igen_gtt_bind_user_fb(sc, fb);
 	if (surf == 0) {
 		device_printf(sc->dev,
 		    "program_scanout: gtt_bind failed for fb %u (%ux%u, pitch=%u)\n",
@@ -2061,8 +2069,8 @@ igen9_program_scanout(struct igen9_softc *sc, struct drm_framebuffer *fb)
 
 	/* PLANE_STRIDE encodes bytes-per-row / 64. */
 	stride = fb->pitches[0] / 64;
-	igen9_w32(sc, PLANE_STRIDE(0), stride);
-	igen9_w32(sc, PLANE_SURF(0), surf);
+	igen_w32(sc, PLANE_STRIDE(0), stride);
+	igen_w32(sc, PLANE_SURF(0), surf);
 	DPRINTF(sc, 1,
 	    "program_scanout: fb %u (%ux%u pitch=%u) -> PLANE_SURF=0x%08x"
 	    " STRIDE=%u\n",
@@ -2071,10 +2079,10 @@ igen9_program_scanout(struct igen9_softc *sc, struct drm_framebuffer *fb)
 }
 
 static int
-igen9_legacy_set_config(struct drm_mode_set *set)
+igen_legacy_set_config(struct drm_mode_set *set)
 {
 	struct drm_crtc *crtc;
-	struct igen9_softc *sc;
+	struct igen_softc *sc;
 
 	if (set == NULL || (crtc = set->crtc) == NULL)
 		return (EINVAL);
@@ -2094,39 +2102,39 @@ igen9_legacy_set_config(struct drm_mode_set *set)
 	crtc->x = set->x;
 	crtc->y = set->y;
 
-	igen9_program_scanout(sc, set->fb);
+	igen_program_scanout(sc, set->fb);
 	return (0);
 }
 
 static int
-igen9_legacy_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
+igen_legacy_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
     uint32_t flags __unused, uint64_t user_data __unused)
 {
-	struct igen9_softc *sc;
+	struct igen_softc *sc;
 
 	if (crtc == NULL)
 		return (EINVAL);
 	sc = crtc->dev->driver_priv;
 	crtc->primary_fb = fb;
-	igen9_program_scanout(sc, fb);
+	igen_program_scanout(sc, fb);
 	return (0);
 }
 
-static const struct drm_crtc_funcs igen9_crtc_funcs = {
-	.set_config = igen9_legacy_set_config,
-	.page_flip = igen9_legacy_page_flip,
+static const struct drm_crtc_funcs igen_crtc_funcs = {
+	.set_config = igen_legacy_set_config,
+	.page_flip = igen_legacy_page_flip,
 };
-static const struct drm_plane_funcs igen9_plane_funcs = { 0 };
-static const struct drm_encoder_funcs igen9_encoder_funcs = { 0 };
-static const struct drm_connector_funcs igen9_connector_funcs = { 0 };
+static const struct drm_plane_funcs igen_plane_funcs = { 0 };
+static const struct drm_encoder_funcs igen_encoder_funcs = { 0 };
+static const struct drm_connector_funcs igen_connector_funcs = { 0 };
 
-static void igen9_owned_fb_destroy(struct drm_framebuffer *fb) { (void)fb; }
+static void igen_owned_fb_destroy(struct drm_framebuffer *fb) { (void)fb; }
 
-static const struct drm_framebuffer_funcs igen9_owned_fb_funcs = {
-	.destroy = igen9_owned_fb_destroy,
+static const struct drm_framebuffer_funcs igen_owned_fb_funcs = {
+	.destroy = igen_owned_fb_destroy,
 };
 
-static const uint32_t igen9_plane_formats[] = {
+static const uint32_t igen_plane_formats[] = {
 	0x34325258,	/* 'XR24' = DRM_FORMAT_XRGB8888 */
 };
 
@@ -2136,7 +2144,7 @@ static const uint32_t igen9_plane_formats[] = {
  * once the display engine bring-up code is written.
  */
 static int
-igen9_atomic_check(struct drm_device *dev __unused,
+igen_atomic_check(struct drm_device *dev __unused,
     struct drm_atomic_state *state __unused)
 {
 	return (0);
@@ -2151,10 +2159,10 @@ igen9_atomic_check(struct drm_device *dev __unused,
  * and decline mismatches rather than half-program them.
  */
 static int
-igen9_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
+igen_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
     bool nonblock __unused)
 {
-	struct igen9_softc *sc = dev->driver_priv;
+	struct igen_softc *sc = dev->driver_priv;
 
 	for (uint32_t i = 0; i < state->num_crtc; i++) {
 		struct drm_crtc_state *cs = state->crtc_states[i];
@@ -2168,7 +2176,7 @@ igen9_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 			    "atomic_commit: pipe %u off-request (no-op)\n", i);
 			continue;
 		}
-		igen9_read_pipe_mode(sc, 0, &live);
+		igen_read_pipe_mode(sc, 0, &live);
 		if (cs->mode.hdisplay != live.hdisplay ||
 		    cs->mode.vdisplay != live.vdisplay ||
 		    cs->mode.htotal != live.htotal ||
@@ -2201,15 +2209,15 @@ igen9_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 		if (ps == NULL || ps->plane != &sc->primary)
 			continue;
 
-		if (ps->fb != NULL && ps->fb->funcs == &igen9_owned_fb_funcs) {
-			struct igen9_owned_fb *ofb = __containerof(
-			    ps->fb, struct igen9_owned_fb, base);
+		if (ps->fb != NULL && ps->fb->funcs == &igen_owned_fb_funcs) {
+			struct igen_owned_fb *ofb = __containerof(
+			    ps->fb, struct igen_owned_fb, base);
 			uint32_t new_surf = ofb->test_fb->gtt_first_idx *
 			    PAGE_SIZE;
 			if (!sc->scanout_held)
 				sc->scanout_prev_surf =
-				    igen9_r32(sc, PLANE_SURF(0));
-			igen9_w32(sc, PLANE_SURF(0), new_surf);
+				    igen_r32(sc, PLANE_SURF(0));
+			igen_w32(sc, PLANE_SURF(0), new_surf);
 			sc->scanout_held = true;
 			DPRINTF(sc, 1,
 			    "atomic_commit: plane FB_ID %u -> PLANE_SURF=0x%08x\n",
@@ -2224,7 +2232,7 @@ igen9_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 			 * latches the new SURF -- eliminates partial-frame
 			 * tearing on the page-flip path.
 			 */
-			uint32_t new_surf = igen9_gtt_bind_user_fb(sc,
+			uint32_t new_surf = igen_gtt_bind_user_fb(sc,
 			    ps->fb);
 			if (new_surf == 0) {
 				device_printf(sc->dev,
@@ -2234,12 +2242,12 @@ igen9_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 			}
 			if (!sc->scanout_held)
 				sc->scanout_prev_surf =
-				    igen9_r32(sc, PLANE_SURF(0));
-			igen9_wait_vblank(sc, 0);
-			igen9_w32(sc, PLANE_SURF(0), new_surf);
+				    igen_r32(sc, PLANE_SURF(0));
+			igen_wait_vblank(sc, 0);
+			igen_w32(sc, PLANE_SURF(0), new_surf);
 			sc->scanout_held = true;
 		} else if (ps->fb == NULL && sc->scanout_held) {
-			igen9_w32(sc, PLANE_SURF(0), sc->scanout_prev_surf);
+			igen_w32(sc, PLANE_SURF(0), sc->scanout_prev_surf);
 			sc->scanout_held = false;
 			DPRINTF(sc, 1,
 			    "atomic_commit: plane fb=NULL -> PLANE_SURF"
@@ -2249,13 +2257,13 @@ igen9_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 	return (0);
 }
 
-static const struct drm_mode_config_funcs igen9_mode_config_funcs = {
-	.atomic_check  = igen9_atomic_check,
-	.atomic_commit = igen9_atomic_commit,
+static const struct drm_mode_config_funcs igen_mode_config_funcs = {
+	.atomic_check  = igen_atomic_check,
+	.atomic_commit = igen_atomic_commit,
 };
 
 static int
-igen9_probe(device_t dev)
+igen_probe(device_t dev)
 {
 	uint16_t vid = pci_get_vendor(dev);
 	uint16_t did = pci_get_device(dev);
@@ -2263,9 +2271,9 @@ igen9_probe(device_t dev)
 
 	if (vid != INTEL_PCI_VENDOR)
 		return (ENXIO);
-	for (i = 0; i < nitems(igen9_ids); i++) {
-		if (igen9_ids[i].id == did) {
-			device_set_desc(dev, igen9_ids[i].desc);
+	for (i = 0; i < nitems(igen_ids); i++) {
+		if (igen_ids[i].id == did) {
+			device_set_desc(dev, igen_ids[i].desc);
 			return (BUS_PROBE_DEFAULT);
 		}
 	}
@@ -2273,13 +2281,19 @@ igen9_probe(device_t dev)
 }
 
 static int
-igen9_attach(device_t dev)
+igen_attach(device_t dev)
 {
-	struct igen9_softc *sc = device_get_softc(dev);
+	struct igen_softc *sc = device_get_softc(dev);
 	int error;
 
 	sc->dev = dev;
 	sc->pci_id = pci_get_device(dev);
+	for (size_t i = 0; i < nitems(igen_ids); i++) {
+		if (igen_ids[i].id == sc->pci_id) {
+			sc->gen = igen_ids[i].gen;
+			break;
+		}
+	}
 
 	/*
 	 * BAR0 (PCIR_BAR(0) = 0x10) is GTTMMADR — register MMIO + the
@@ -2314,7 +2328,7 @@ igen9_attach(device_t dev)
 	 * land can already do GET_VERSION / GET_UNIQUE / GET_CAP against
 	 * us — there's just nothing visible on the connectors yet.
 	 */
-	error = kms_dev_register(&igen9_driver, sc, &sc->drm_dev);
+	error = kms_dev_register(&igen_driver, sc, &sc->drm_dev);
 	if (error != 0) {
 		device_printf(dev, "kms_dev_register: %d\n", error);
 		bus_release_resource(dev, SYS_RES_MEMORY, sc->gmadr_rid,
@@ -2325,7 +2339,7 @@ igen9_attach(device_t dev)
 	}
 
 	/* Install atomic hooks before any object becomes reachable. */
-	sc->drm_dev->mode_config.funcs = &igen9_mode_config_funcs;
+	sc->drm_dev->mode_config.funcs = &igen_mode_config_funcs;
 
 	/*
 	 * RE scaffold: live MMIO snapshot/diff/poke/bit-scan via sysctl.
@@ -2334,8 +2348,8 @@ igen9_attach(device_t dev)
 	 * firmware / loader / previous driver left behind, then watch what
 	 * each write actually does.
 	 */
-	igen9_re_sysctls_init(sc);
-	igen9_snapshot_save(sc);
+	igen_re_sysctls_init(sc);
+	igen_snapshot_save(sc);
 
 	/*
 	 * Single stub of each KMS object so GETRESOURCES returns non-empty
@@ -2343,15 +2357,15 @@ igen9_attach(device_t dev)
 	 * topology (one CRTC per pipe, encoders per DDI, connectors per
 	 * physical port) lands once the display engine is decoded.
 	 */
-	error = kms_crtc_init(sc->drm_dev, &sc->crtc, &igen9_crtc_funcs);
+	error = kms_crtc_init(sc->drm_dev, &sc->crtc, &igen_crtc_funcs);
 	if (error == 0)
 		error = kms_plane_init(sc->drm_dev, &sc->primary,
-		    &igen9_plane_funcs, DRM_PLANE_TYPE_PRIMARY,
-		    1u, igen9_plane_formats,
-		    nitems(igen9_plane_formats));
+		    &igen_plane_funcs, DRM_PLANE_TYPE_PRIMARY,
+		    1u, igen_plane_formats,
+		    nitems(igen_plane_formats));
 	if (error == 0)
 		error = kms_encoder_init(sc->drm_dev, &sc->encoder,
-		    &igen9_encoder_funcs, DRM_MODE_ENCODER_TMDS);
+		    &igen_encoder_funcs, DRM_MODE_ENCODER_TMDS);
 	if (error == 0) {
 		/*
 		 * Encoder must declare which CRTCs it can drive (bitmask of
@@ -2364,7 +2378,7 @@ igen9_attach(device_t dev)
 	}
 	if (error == 0)
 		error = kms_connector_init(sc->drm_dev, &sc->connector,
-		    &igen9_connector_funcs,
+		    &igen_connector_funcs,
 		    DRM_MODE_CONNECTOR_HDMIA);
 	if (error == 0)
 		error = kms_connector_attach_encoder(&sc->connector,
@@ -2375,9 +2389,9 @@ igen9_attach(device_t dev)
 
 	/*
 	 * IRQ — MSI + Pipe A vblank.  Non-fatal; falling back to polled
-	 * vblank still works (igen9_wait_vblank reads PIPE_FRMCOUNT).
+	 * vblank still works (igen_wait_vblank reads PIPE_FRMCOUNT).
 	 */
-	(void)igen9_irq_setup(sc);
+	(void)igen_irq_setup(sc);
 
 	/*
 	 * Best-effort EDID-on-attach: try to fetch the DDI_B EDID via GMBus
@@ -2385,42 +2399,42 @@ igen9_attach(device_t dev)
 	 * connector in UNKNOWN with no modes — userspace GETCONNECTOR still
 	 * works, it just sees a connector with no detected sink.
 	 */
-	(void)igen9_attach_edid_modes(sc);
+	(void)igen_attach_edid_modes(sc);
 
-	device_printf(dev, "attached: PCI 8086:%04x as /dev/dri/card%d\n",
-	    sc->pci_id, sc->drm_dev->minor);
+	device_printf(dev, "attached: PCI 8086:%04x gen%d as /dev/dri/card%d\n",
+	    sc->pci_id, sc->gen, sc->drm_dev->minor);
 	return (0);
 }
 
 static int
-igen9_detach(device_t dev)
+igen_detach(device_t dev)
 {
-	struct igen9_softc *sc = device_get_softc(dev);
+	struct igen_softc *sc = device_get_softc(dev);
 
 	if (sc->scanout_held && sc->scanout_fb != NULL) {
-		igen9_anim_stop(sc);
-		igen9_w32(sc, PLANE_SURF(0), sc->scanout_prev_surf);
+		igen_anim_stop(sc);
+		igen_w32(sc, PLANE_SURF(0), sc->scanout_prev_surf);
 		pause("gen9rst", hz / 20);
-		igen9_test_fb_free(sc, sc->scanout_fb);
+		igen_test_fb_free(sc, sc->scanout_fb);
 		free(sc->scanout_fb, M_KMS);
 		sc->scanout_fb = NULL;
 		sc->scanout_held = false;
 	}
-	if (igen9_exposed_fb != NULL) {
+	if (igen_exposed_fb != NULL) {
 		if (sc->scanout_held) {
-			igen9_w32(sc, PLANE_SURF(0),
+			igen_w32(sc, PLANE_SURF(0),
 			    sc->scanout_prev_surf);
 			sc->scanout_held = false;
 		}
-		kms_framebuffer_cleanup(&igen9_exposed_fb->base);
-		igen9_test_fb_free(sc, igen9_exposed_fb->test_fb);
-		free(igen9_exposed_fb->test_fb, M_KMS);
-		free(igen9_exposed_fb, M_KMS);
-		igen9_exposed_fb = NULL;
+		kms_framebuffer_cleanup(&igen_exposed_fb->base);
+		igen_test_fb_free(sc, igen_exposed_fb->test_fb);
+		free(igen_exposed_fb->test_fb, M_KMS);
+		free(igen_exposed_fb, M_KMS);
+		igen_exposed_fb = NULL;
 	}
 	if (sc->drm_dev != NULL) {
-		igen9_irq_teardown(sc);
-		igen9_re_sysctls_fini(sc);
+		igen_irq_teardown(sc);
+		igen_re_sysctls_fini(sc);
 		kms_connector_cleanup(&sc->connector);
 		kms_encoder_cleanup(&sc->encoder);
 		kms_plane_cleanup(&sc->primary);
@@ -2437,20 +2451,20 @@ igen9_detach(device_t dev)
 	return (0);
 }
 
-static device_method_t igen9_methods[] = {
-	DEVMETHOD(device_probe,		igen9_probe),
-	DEVMETHOD(device_attach,	igen9_attach),
-	DEVMETHOD(device_detach,	igen9_detach),
+static device_method_t igen_methods[] = {
+	DEVMETHOD(device_probe,		igen_probe),
+	DEVMETHOD(device_attach,	igen_attach),
+	DEVMETHOD(device_detach,	igen_detach),
 	DEVMETHOD_END
 };
 
-static driver_t igen9_driver_t = {
-	"igen9",
-	igen9_methods,
-	sizeof(struct igen9_softc),
+static driver_t igen_driver_t = {
+	"igen",
+	igen_methods,
+	sizeof(struct igen_softc),
 };
 
-DRIVER_MODULE(igen9, pci, igen9_driver_t, 0, 0);
-MODULE_VERSION(igen9, 1);
-MODULE_DEPEND(igen9, kms, 1, 1, 1);
-MODULE_DEPEND(igen9, pci, 1, 1, 1);
+DRIVER_MODULE(igen, pci, igen_driver_t, 0, 0);
+MODULE_VERSION(igen, 1);
+MODULE_DEPEND(igen, kms, 1, 1, 1);
+MODULE_DEPEND(igen, pci, 1, 1, 1);

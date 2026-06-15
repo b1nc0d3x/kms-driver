@@ -3,7 +3,7 @@
  *
  * Copyright (c) 2026 Kyle Crenshaw <b1nc0d3x@gmail.com>
  *
- * igen9 DPLL / WRPLL / pipe-resume.  Split out of igen9.c for
+ * igen DPLL / WRPLL / pipe-resume.  Split out of igen.c for
  * size + topical cohesion: CDCLK + LCPLL/WRPLL + DPLL_CTRL[12] +
  * DDI_BUF_TRANS voltage swing + pipe + transcoder + plane writes
  * for trying to re-arm scanout from a cold pipe (try_pipe_resume),
@@ -11,20 +11,20 @@
  * PLANE_SURF write to a vblank edge.
  *
  * Sysctls registered here:
- *   dev.igen9.<n>.re.clock_state          CDCLK + LCPLL + DPLL state
- *   dev.igen9.<n>.re.wrpll_target_khz     RW solver target
- *   dev.igen9.<n>.re.wrpll_calc           solve target -> DCO/P0/P1/P2
- *   dev.igen9.<n>.re.wrpll_dpll_id        2 = DPLL2, 3 = DPLL3
- *   dev.igen9.<n>.re.wrpll_dump           print CFGCR1/CFGCR2
- *   dev.igen9.<n>.re.wrpll_program        program CFGCR1/CFGCR2
- *   dev.igen9.<n>.re.wrpll_route_port     RW (0=A..4=E)
- *   dev.igen9.<n>.re.wrpll_enable         CTRL1 + ENABLE + LOCK poll
- *   dev.igen9.<n>.re.wrpll_disable
- *   dev.igen9.<n>.re.wrpll_route          CTRL2 select + OVERRIDE
- *   dev.igen9.<n>.re.wrpll_unroute
- *   dev.igen9.<n>.re.wrpll_force_clear    emergency ENABLE clear
- *   dev.igen9.<n>.re.pw1_up               PW1 power-well request
- *   dev.igen9.<n>.re.try_pipe_resume      cold pipe re-arm experiment
+ *   dev.igen.<n>.re.clock_state          CDCLK + LCPLL + DPLL state
+ *   dev.igen.<n>.re.wrpll_target_khz     RW solver target
+ *   dev.igen.<n>.re.wrpll_calc           solve target -> DCO/P0/P1/P2
+ *   dev.igen.<n>.re.wrpll_dpll_id        2 = DPLL2, 3 = DPLL3
+ *   dev.igen.<n>.re.wrpll_dump           print CFGCR1/CFGCR2
+ *   dev.igen.<n>.re.wrpll_program        program CFGCR1/CFGCR2
+ *   dev.igen.<n>.re.wrpll_route_port     RW (0=A..4=E)
+ *   dev.igen.<n>.re.wrpll_enable         CTRL1 + ENABLE + LOCK poll
+ *   dev.igen.<n>.re.wrpll_disable
+ *   dev.igen.<n>.re.wrpll_route          CTRL2 select + OVERRIDE
+ *   dev.igen.<n>.re.wrpll_unroute
+ *   dev.igen.<n>.re.wrpll_force_clear    emergency ENABLE clear
+ *   dev.igen.<n>.re.pw1_up               PW1 power-well request
+ *   dev.igen.<n>.re.try_pipe_resume      cold pipe re-arm experiment
  */
 
 #include <sys/param.h>
@@ -47,7 +47,7 @@
 #include <kms/drm_modes.h>
 #include <kms/drm_plane.h>
 
-#include "igen9_internal.h"
+#include "igen_internal.h"
 
 /* --------------------------- CDCLK / DPLL readback ------------------------ */
 
@@ -67,7 +67,7 @@
 #define	CDCLK_CTL		0x00046000
 
 static const char *
-igen9_cdclk_decode(uint32_t cdclk_ctl)
+igen_cdclk_decode(uint32_t cdclk_ctl)
 {
 	/*
 	 * freq_decimal field encodes (2*MHz - 2) so:
@@ -97,24 +97,24 @@ igen9_cdclk_decode(uint32_t cdclk_ctl)
 #define	LCPLL2_CTL		0x00046014
 
 static int
-igen9_sysctl_clock_state(SYSCTL_HANDLER_ARGS)
+igen_sysctl_clock_state(SYSCTL_HANDLER_ARGS)
 {
-	struct igen9_softc *sc = arg1;
+	struct igen_softc *sc = arg1;
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
 
 	if (error || req->newptr == NULL || trigger == 0)
 		return (error);
 
-	uint32_t cdclk = igen9_r32(sc, CDCLK_CTL);
-	uint32_t lcpll1 = igen9_r32(sc, LCPLL1_CTL);
-	uint32_t lcpll2 = igen9_r32(sc, LCPLL2_CTL);
-	uint32_t dpll1 = igen9_r32(sc, DPLL_CTRL1);
-	uint32_t dpll2 = igen9_r32(sc, DPLL_CTRL2);
+	uint32_t cdclk = igen_r32(sc, CDCLK_CTL);
+	uint32_t lcpll1 = igen_r32(sc, LCPLL1_CTL);
+	uint32_t lcpll2 = igen_r32(sc, LCPLL2_CTL);
+	uint32_t dpll1 = igen_r32(sc, DPLL_CTRL1);
+	uint32_t dpll2 = igen_r32(sc, DPLL_CTRL2);
 
 	device_printf(sc->dev,
 	    "clock: CDCLK_CTL=0x%08x  (%s, cd2x_div=%u, freq_dec=0x%03x)\n",
-	    cdclk, igen9_cdclk_decode(cdclk),
+	    cdclk, igen_cdclk_decode(cdclk),
 	    (cdclk >> 22) & 0x7, cdclk & 0x7ff);
 	device_printf(sc->dev,
 	    "clock: LCPLL1_CTL=0x%08x  LCPLL2_CTL=0x%08x\n",
@@ -179,7 +179,7 @@ static const uint8_t wrpll_even_dividers[] = {
 static const uint8_t wrpll_odd_dividers[] = { 3, 5, 7, 9, 15, 21, 35 };
 
 static bool
-igen9_wrpll_decompose(uint32_t d, uint8_t *p0, uint8_t *p1, uint8_t *p2)
+igen_wrpll_decompose(uint32_t d, uint8_t *p0, uint8_t *p1, uint8_t *p2)
 {
 	if ((d % 2) == 0) {
 		uint32_t half = d / 2;
@@ -218,7 +218,7 @@ igen9_wrpll_decompose(uint32_t d, uint8_t *p0, uint8_t *p1, uint8_t *p2)
 }
 
 static bool
-igen9_wrpll_solve(uint32_t pixel_khz, uint8_t *out_p0, uint8_t *out_p1,
+igen_wrpll_solve(uint32_t pixel_khz, uint8_t *out_p0, uint8_t *out_p1,
     uint8_t *out_p2, uint16_t *out_dco_int, uint16_t *out_dco_frac,
     uint64_t *out_vco_khz)
 {
@@ -238,7 +238,7 @@ igen9_wrpll_solve(uint32_t pixel_khz, uint8_t *out_p0, uint8_t *out_p1,
 
 		if (vco < WRPLL_VCO_MIN_KHZ || vco > WRPLL_VCO_MAX_KHZ)
 			continue;
-		if (!igen9_wrpll_decompose(d, &a, &b, &c))
+		if (!igen_wrpll_decompose(d, &a, &b, &c))
 			continue;
 		dev = vco > center ? vco - center : center - vco;
 		if (dev < best_dev) {
@@ -258,7 +258,7 @@ igen9_wrpll_solve(uint32_t pixel_khz, uint8_t *out_p0, uint8_t *out_p1,
 
 		if (vco < WRPLL_VCO_MIN_KHZ || vco > WRPLL_VCO_MAX_KHZ)
 			continue;
-		if (!igen9_wrpll_decompose(d, &a, &b, &c))
+		if (!igen_wrpll_decompose(d, &a, &b, &c))
 			continue;
 		dev = vco > center ? vco - center : center - vco;
 		if (dev < best_dev) {
@@ -284,9 +284,9 @@ igen9_wrpll_solve(uint32_t pixel_khz, uint8_t *out_p0, uint8_t *out_p1,
 }
 
 static int
-igen9_sysctl_wrpll_calc(SYSCTL_HANDLER_ARGS)
+igen_sysctl_wrpll_calc(SYSCTL_HANDLER_ARGS)
 {
-	struct igen9_softc *sc = arg1;
+	struct igen_softc *sc = arg1;
 	uint8_t p0, p1, p2;
 	uint16_t dco_int, dco_frac;
 	uint64_t vco;
@@ -300,10 +300,10 @@ igen9_sysctl_wrpll_calc(SYSCTL_HANDLER_ARGS)
 	pixel_khz = sc->wrpll_target_khz;
 	if (pixel_khz == 0) {
 		device_printf(sc->dev,
-		    "wrpll: set dev.igen9.0.re.wrpll_target_khz first\n");
+		    "wrpll: set dev.igen.0.re.wrpll_target_khz first\n");
 		return (0);
 	}
-	if (!igen9_wrpll_solve(pixel_khz, &p0, &p1, &p2,
+	if (!igen_wrpll_solve(pixel_khz, &p0, &p1, &p2,
 	    &dco_int, &dco_frac, &vco)) {
 		device_printf(sc->dev,
 		    "wrpll: no solution for %u kHz (VCO out of range)\n",
@@ -371,7 +371,7 @@ igen9_sysctl_wrpll_calc(SYSCTL_HANDLER_ARGS)
 #define	CFGCR2_PDIV_SHIFT	2
 
 static uint32_t
-igen9_wrpll_encode_cfgcr1(uint16_t dco_int, uint16_t dco_frac)
+igen_wrpll_encode_cfgcr1(uint16_t dco_int, uint16_t dco_frac)
 {
 	return (CFGCR1_FREQ_ENABLE |
 	    ((uint32_t)(dco_frac & 0x7fffu) << 9) |
@@ -384,7 +384,7 @@ igen9_wrpll_encode_cfgcr1(uint16_t dco_int, uint16_t dco_frac)
  * uses 9.0 GHz for an 8910 MHz VCO, confirming this rule.
  */
 static uint32_t
-igen9_wrpll_central_freq_bits(uint64_t vco_khz)
+igen_wrpll_central_freq_bits(uint64_t vco_khz)
 {
 	uint64_t d96 = vco_khz > 9600000 ? vco_khz - 9600000 :
 	    9600000 - vco_khz;
@@ -401,7 +401,7 @@ igen9_wrpll_central_freq_bits(uint64_t vco_khz)
 }
 
 static bool
-igen9_wrpll_encode_cfgcr2(uint8_t p0, uint8_t p1, uint8_t p2,
+igen_wrpll_encode_cfgcr2(uint8_t p0, uint8_t p1, uint8_t p2,
     uint64_t vco_khz, uint32_t *out)
 {
 	uint32_t v = 0;
@@ -427,13 +427,13 @@ igen9_wrpll_encode_cfgcr2(uint8_t p0, uint8_t p1, uint8_t p2,
 		v |= CFGCR2_QDIV_MODE;
 	v |= (kdiv << CFGCR2_KDIV_SHIFT);
 	v |= (pdiv << CFGCR2_PDIV_SHIFT);
-	v |= igen9_wrpll_central_freq_bits(vco_khz);
+	v |= igen_wrpll_central_freq_bits(vco_khz);
 	*out = v;
 	return (true);
 }
 
 static void
-igen9_wrpll_decode_cfgcr(uint32_t cfgcr1, uint32_t cfgcr2,
+igen_wrpll_decode_cfgcr(uint32_t cfgcr1, uint32_t cfgcr2,
     device_t dev)
 {
 	static const uint8_t kdiv_to_p2[] = { 5, 2, 3, 1 };
@@ -482,9 +482,9 @@ igen9_wrpll_decode_cfgcr(uint32_t cfgcr1, uint32_t cfgcr2,
 }
 
 static int
-igen9_sysctl_wrpll_dump(SYSCTL_HANDLER_ARGS)
+igen_sysctl_wrpll_dump(SYSCTL_HANDLER_ARGS)
 {
-	struct igen9_softc *sc = arg1;
+	struct igen_softc *sc = arg1;
 	uint32_t id, cfgcr1, cfgcr2;
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
@@ -498,19 +498,19 @@ igen9_sysctl_wrpll_dump(SYSCTL_HANDLER_ARGS)
 		    "wrpll_dump: wrpll_dpll_id must be 2 or 3\n");
 		return (0);
 	}
-	cfgcr1 = igen9_r32(sc, WRPLL_CFGCR1(id));
-	cfgcr2 = igen9_r32(sc, WRPLL_CFGCR2(id));
+	cfgcr1 = igen_r32(sc, WRPLL_CFGCR1(id));
+	cfgcr2 = igen_r32(sc, WRPLL_CFGCR2(id));
 	device_printf(sc->dev,
 	    "wrpll DPLL%u: CFGCR1=0x%08x  CFGCR2=0x%08x\n",
 	    id, cfgcr1, cfgcr2);
-	igen9_wrpll_decode_cfgcr(cfgcr1, cfgcr2, sc->dev);
+	igen_wrpll_decode_cfgcr(cfgcr1, cfgcr2, sc->dev);
 	return (0);
 }
 
 static int
-igen9_sysctl_wrpll_program(SYSCTL_HANDLER_ARGS)
+igen_sysctl_wrpll_program(SYSCTL_HANDLER_ARGS)
 {
-	struct igen9_softc *sc = arg1;
+	struct igen_softc *sc = arg1;
 	uint8_t p0, p1, p2;
 	uint16_t dco_int, dco_frac;
 	uint64_t vco;
@@ -533,7 +533,7 @@ igen9_sysctl_wrpll_program(SYSCTL_HANDLER_ARGS)
 	 * by which PLL.  If any DDI's DPLL_SEL == this PLL and the DDI
 	 * is clocked on, the PLL is live -- never reprogram a live PLL.
 	 */
-	uint32_t ctrl2 = igen9_r32(sc, DPLL_CTRL2);
+	uint32_t ctrl2 = igen_r32(sc, DPLL_CTRL2);
 	for (int port = 0; port < 5; port++) {
 		uint32_t off = (ctrl2 >> (15 + port)) & 1;
 		uint32_t sel = (ctrl2 >> (1 + port * 3)) & 0x3;
@@ -552,22 +552,22 @@ igen9_sysctl_wrpll_program(SYSCTL_HANDLER_ARGS)
 		    "wrpll: set wrpll_target_khz first\n");
 		return (EINVAL);
 	}
-	if (!igen9_wrpll_solve(pixel_khz, &p0, &p1, &p2,
+	if (!igen_wrpll_solve(pixel_khz, &p0, &p1, &p2,
 	    &dco_int, &dco_frac, &vco)) {
 		device_printf(sc->dev,
 		    "wrpll: no solution for %u kHz\n", pixel_khz);
 		return (EINVAL);
 	}
 
-	cfgcr1 = igen9_wrpll_encode_cfgcr1(dco_int, dco_frac);
-	if (!igen9_wrpll_encode_cfgcr2(p0, p1, p2, vco, &cfgcr2)) {
+	cfgcr1 = igen_wrpll_encode_cfgcr1(dco_int, dco_frac);
+	if (!igen_wrpll_encode_cfgcr2(p0, p1, p2, vco, &cfgcr2)) {
 		device_printf(sc->dev,
 		    "wrpll: encode failed for P0=%u P1=%u P2=%u\n", p0, p1, p2);
 		return (EINVAL);
 	}
 
-	old1 = igen9_r32(sc, WRPLL_CFGCR1(id));
-	old2 = igen9_r32(sc, WRPLL_CFGCR2(id));
+	old1 = igen_r32(sc, WRPLL_CFGCR1(id));
+	old2 = igen_r32(sc, WRPLL_CFGCR2(id));
 	device_printf(sc->dev,
 	    "wrpll DPLL%u: pre  CFGCR1=0x%08x CFGCR2=0x%08x\n",
 	    id, old1, old2);
@@ -576,15 +576,15 @@ igen9_sysctl_wrpll_program(SYSCTL_HANDLER_ARGS)
 	    " (target=%u kHz)\n",
 	    id, cfgcr1, cfgcr2, pixel_khz);
 
-	igen9_w32(sc, WRPLL_CFGCR1(id), cfgcr1);
-	igen9_w32(sc, WRPLL_CFGCR2(id), cfgcr2);
+	igen_w32(sc, WRPLL_CFGCR1(id), cfgcr1);
+	igen_w32(sc, WRPLL_CFGCR2(id), cfgcr2);
 
-	back1 = igen9_r32(sc, WRPLL_CFGCR1(id));
-	back2 = igen9_r32(sc, WRPLL_CFGCR2(id));
+	back1 = igen_r32(sc, WRPLL_CFGCR1(id));
+	back2 = igen_r32(sc, WRPLL_CFGCR2(id));
 	device_printf(sc->dev,
 	    "wrpll DPLL%u: post CFGCR1=0x%08x CFGCR2=0x%08x\n",
 	    id, back1, back2);
-	igen9_wrpll_decode_cfgcr(back1, back2, sc->dev);
+	igen_wrpll_decode_cfgcr(back1, back2, sc->dev);
 
 	if (back1 != cfgcr1 || back2 != cfgcr2)
 		device_printf(sc->dev,
@@ -620,9 +620,9 @@ igen9_sysctl_wrpll_program(SYSCTL_HANDLER_ARGS)
 #define	CTRL2_DDI_OFF(p)		(1u << (15 + (p)))
 
 static int
-igen9_sysctl_wrpll_enable(SYSCTL_HANDLER_ARGS)
+igen_sysctl_wrpll_enable(SYSCTL_HANDLER_ARGS)
 {
-	struct igen9_softc *sc = arg1;
+	struct igen_softc *sc = arg1;
 	uint32_t id, cfgcr1, ctrl1, enreg, en;
 	int i;
 	int trigger = 0;
@@ -637,7 +637,7 @@ igen9_sysctl_wrpll_enable(SYSCTL_HANDLER_ARGS)
 		    "wrpll: wrpll_dpll_id must be 2 or 3\n");
 		return (EINVAL);
 	}
-	cfgcr1 = igen9_r32(sc, WRPLL_CFGCR1(id));
+	cfgcr1 = igen_r32(sc, WRPLL_CFGCR1(id));
 	if (!(cfgcr1 & CFGCR1_FREQ_ENABLE)) {
 		device_printf(sc->dev,
 		    "wrpll DPLL%u: CFGCR1 FREQ_ENABLE clear; program it"
@@ -652,7 +652,7 @@ igen9_sysctl_wrpll_enable(SYSCTL_HANDLER_ARGS)
 	 * We refuse rather than risk wedging the box.
 	 */
 	/* PW1 STATE = bit (idx*2) in HSW_PWR_WELL_CTL2 @ 0x45404; idx=1. */
-	uint32_t pwr = igen9_r32(sc, 0x45404);
+	uint32_t pwr = igen_r32(sc, 0x45404);
 	if (!(pwr & (1u << 2))) {
 		device_printf(sc->dev,
 		    "wrpll DPLL%u: REFUSE: PW1 not up (CTL2=0x%08x);"
@@ -669,7 +669,7 @@ igen9_sysctl_wrpll_enable(SYSCTL_HANDLER_ARGS)
 	 * (already populated by wrpll_program) so the registers are stuffed
 	 * AFTER CTRL1 mode select.
 	 */
-	ctrl1 = igen9_r32(sc, DPLL_CTRL1);
+	ctrl1 = igen_r32(sc, DPLL_CTRL1);
 	uint32_t per_dpll_mask = 0x3fu << (id * 6);
 	uint32_t new_ctrl1 = (ctrl1 & ~per_dpll_mask) |
 	    CTRL1_OVERRIDE(id) | CTRL1_HDMI_MODE(id);
@@ -678,15 +678,15 @@ igen9_sysctl_wrpll_enable(SYSCTL_HANDLER_ARGS)
 		device_printf(sc->dev,
 		    "wrpll DPLL%u: CTRL1 0x%08x -> 0x%08x\n",
 		    id, ctrl1, new_ctrl1);
-		igen9_w32(sc, DPLL_CTRL1, new_ctrl1);
+		igen_w32(sc, DPLL_CTRL1, new_ctrl1);
 	}
-	(void)igen9_r32(sc, DPLL_CTRL1);	/* posting read */
+	(void)igen_r32(sc, DPLL_CTRL1);	/* posting read */
 
 	/* Re-program CFGCR1/CFGCR2 now that CTRL1 selected HDMI_MODE. */
-	uint32_t cfgcr2 = igen9_r32(sc, WRPLL_CFGCR2(id));
-	igen9_w32(sc, WRPLL_CFGCR1(id), cfgcr1);
-	igen9_w32(sc, WRPLL_CFGCR2(id), cfgcr2);
-	(void)igen9_r32(sc, WRPLL_CFGCR2(id));
+	uint32_t cfgcr2 = igen_r32(sc, WRPLL_CFGCR2(id));
+	igen_w32(sc, WRPLL_CFGCR1(id), cfgcr1);
+	igen_w32(sc, WRPLL_CFGCR2(id), cfgcr2);
+	(void)igen_r32(sc, WRPLL_CFGCR2(id));
 	device_printf(sc->dev,
 	    "wrpll DPLL%u: re-stuffed CFGCR1=0x%08x CFGCR2=0x%08x\n",
 	    id, cfgcr1, cfgcr2);
@@ -697,7 +697,7 @@ igen9_sysctl_wrpll_enable(SYSCTL_HANDLER_ARGS)
 	 * and wait for bit 30 (LOCK).
 	 */
 	enreg = WRPLL_ENABLE_REG(id);
-	en = igen9_r32(sc, enreg);
+	en = igen_r32(sc, enreg);
 	device_printf(sc->dev,
 	    "wrpll DPLL%u: ENABLE_REG[0x%05x]=0x%08x (pre)\n", id, enreg, en);
 
@@ -710,8 +710,8 @@ igen9_sysctl_wrpll_enable(SYSCTL_HANDLER_ARGS)
 	 * layout, to see if clearing the lower bits unblocks lock.
 	 */
 	if (!(en & WRPLL_ENABLE_BIT))
-		igen9_w32(sc, enreg, en | WRPLL_ENABLE_BIT);
-	(void)igen9_r32(sc, enreg);	/* posting read */
+		igen_w32(sc, enreg, en | WRPLL_ENABLE_BIT);
+	(void)igen_r32(sc, enreg);	/* posting read */
 
 	/*
 	 * Poll LOCK in DPLL_STATUS (0x6c060), bit (id*8).  i915 v4.19
@@ -726,20 +726,20 @@ igen9_sysctl_wrpll_enable(SYSCTL_HANDLER_ARGS)
 		uint32_t lock_bit = DPLL_LOCK_AT(id);
 
 		for (i = 0; i < 500; i++) {
-			status = igen9_r32(sc, DPLL_STATUS);
+			status = igen_r32(sc, DPLL_STATUS);
 			if (status & lock_bit)
 				break;
 			DELAY(100);
 		}
-		uint32_t enpost = igen9_r32(sc, enreg);
+		uint32_t enpost = igen_r32(sc, enreg);
 		device_printf(sc->dev,
 		    "wrpll DPLL%u: ENABLE_REG=0x%08x  DPLL_STATUS=0x%08x"
 		    "  LOCK=%d  after %d us\n",
 		    id, enpost, status, !!(status & lock_bit), i * 100);
 
 		if (!(status & lock_bit)) {
-			uint32_t v = igen9_r32(sc, enreg);
-			igen9_w32(sc, enreg, v & ~WRPLL_ENABLE_BIT);
+			uint32_t v = igen_r32(sc, enreg);
+			igen_w32(sc, enreg, v & ~WRPLL_ENABLE_BIT);
 			device_printf(sc->dev,
 			    "wrpll DPLL%u: FAILED to lock; ENABLE cleared\n",
 			    id);
@@ -750,9 +750,9 @@ igen9_sysctl_wrpll_enable(SYSCTL_HANDLER_ARGS)
 }
 
 static int
-igen9_sysctl_wrpll_disable(SYSCTL_HANDLER_ARGS)
+igen_sysctl_wrpll_disable(SYSCTL_HANDLER_ARGS)
 {
-	struct igen9_softc *sc = arg1;
+	struct igen_softc *sc = arg1;
 	uint32_t id, ctrl2, enreg, en;
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
@@ -767,7 +767,7 @@ igen9_sysctl_wrpll_disable(SYSCTL_HANDLER_ARGS)
 		return (EINVAL);
 	}
 	/* Same liveness guard as wrpll_program. */
-	ctrl2 = igen9_r32(sc, DPLL_CTRL2);
+	ctrl2 = igen_r32(sc, DPLL_CTRL2);
 	for (int port = 0; port < 5; port++) {
 		uint32_t off = (ctrl2 >> (15 + port)) & 1;
 		uint32_t sel = (ctrl2 >> (1 + port * 3)) & 0x3;
@@ -780,7 +780,7 @@ igen9_sysctl_wrpll_disable(SYSCTL_HANDLER_ARGS)
 		}
 	}
 	enreg = WRPLL_ENABLE_REG(id);
-	en = igen9_r32(sc, enreg);
+	en = igen_r32(sc, enreg);
 	/*
 	 * Clear ENABLE first, brief wait, then clear POWER_ENABLE.  BSpec
 	 * disable order is the reverse of enable.
@@ -789,14 +789,14 @@ igen9_sysctl_wrpll_disable(SYSCTL_HANDLER_ARGS)
 	device_printf(sc->dev,
 	    "wrpll DPLL%u: disable, ENABLE_REG 0x%08x -> 0x%08x\n",
 	    id, en, after_en);
-	igen9_w32(sc, enreg, after_en);
+	igen_w32(sc, enreg, after_en);
 	return (0);
 }
 
 static int
-igen9_sysctl_wrpll_route(SYSCTL_HANDLER_ARGS)
+igen_sysctl_wrpll_route(SYSCTL_HANDLER_ARGS)
 {
-	struct igen9_softc *sc = arg1;
+	struct igen_softc *sc = arg1;
 	uint32_t id, port, ctrl2, new_ctrl2, enreg, en;
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
@@ -819,9 +819,9 @@ igen9_sysctl_wrpll_route(SYSCTL_HANDLER_ARGS)
 
 	/* Refuse if the PLL isn't locked.  LOCK lives in DPLL_STATUS. */
 	enreg = WRPLL_ENABLE_REG(id);
-	en = igen9_r32(sc, enreg);
+	en = igen_r32(sc, enreg);
 	{
-		uint32_t status = igen9_r32(sc, DPLL_STATUS);
+		uint32_t status = igen_r32(sc, DPLL_STATUS);
 
 		if (!(status & DPLL_LOCK_AT(id))) {
 			device_printf(sc->dev,
@@ -832,7 +832,7 @@ igen9_sysctl_wrpll_route(SYSCTL_HANDLER_ARGS)
 		}
 	}
 
-	ctrl2 = igen9_r32(sc, DPLL_CTRL2);
+	ctrl2 = igen_r32(sc, DPLL_CTRL2);
 	new_ctrl2 = ctrl2;
 	new_ctrl2 &= ~CTRL2_DDI_SEL_MASK(port);
 	new_ctrl2 |= CTRL2_DDI_SEL(id, port);
@@ -842,10 +842,10 @@ igen9_sysctl_wrpll_route(SYSCTL_HANDLER_ARGS)
 	device_printf(sc->dev,
 	    "wrpll_route: DDI_%c -> DPLL%u  CTRL2 0x%08x -> 0x%08x\n",
 	    'A' + port, id, ctrl2, new_ctrl2);
-	igen9_w32(sc, DPLL_CTRL2, new_ctrl2);
+	igen_w32(sc, DPLL_CTRL2, new_ctrl2);
 
 	/* Read-back. */
-	uint32_t back = igen9_r32(sc, DPLL_CTRL2);
+	uint32_t back = igen_r32(sc, DPLL_CTRL2);
 	uint32_t off  = (back >> (15 + port)) & 1;
 	uint32_t sel  = (back >> (1 + port * 3)) & 0x3;
 	uint32_t ovr  = (back >> (port * 3)) & 1;
@@ -857,9 +857,9 @@ igen9_sysctl_wrpll_route(SYSCTL_HANDLER_ARGS)
 }
 
 static int
-igen9_sysctl_wrpll_force_clear(SYSCTL_HANDLER_ARGS)
+igen_sysctl_wrpll_force_clear(SYSCTL_HANDLER_ARGS)
 {
-	struct igen9_softc *sc = arg1;
+	struct igen_softc *sc = arg1;
 	uint32_t id, enreg, en;
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
@@ -874,12 +874,12 @@ igen9_sysctl_wrpll_force_clear(SYSCTL_HANDLER_ARGS)
 		return (EINVAL);
 	}
 	enreg = WRPLL_ENABLE_REG(id);
-	en = igen9_r32(sc, enreg);
+	en = igen_r32(sc, enreg);
 	uint32_t cleared = en & ~WRPLL_ENABLE_BIT;
 	device_printf(sc->dev,
 	    "wrpll_force_clear DPLL%u: ENABLE_REG 0x%08x -> 0x%08x"
 	    " (ENABLE cleared)\n", id, en, cleared);
-	igen9_w32(sc, enreg, cleared);
+	igen_w32(sc, enreg, cleared);
 	return (0);
 }
 
@@ -892,7 +892,7 @@ igen9_sysctl_wrpll_force_clear(SYSCTL_HANDLER_ARGS)
  * to HBLANK/VBLANK on most CEA modes.  HSYNC/VSYNC fields encode the sync
  * pulse window inside the blanking region.
  */
-struct igen9_mode_preset {
+struct igen_mode_preset {
 	const char	*name;
 	uint32_t	pixel_khz;
 	uint32_t	htotal, hblank, hsync;
@@ -900,7 +900,7 @@ struct igen9_mode_preset {
 	uint16_t	h_active, v_active;
 };
 
-static const struct igen9_mode_preset igen9_mode_presets[] = {
+static const struct igen_mode_preset igen_mode_presets[] = {
 	{ "1080p60", 148500,
 	  0x0897077fu, 0x0897077fu, 0x080307d7u,
 	  0x04640437u, 0x04640437u, 0x043e0439u,
@@ -917,8 +917,8 @@ static const struct igen9_mode_preset igen9_mode_presets[] = {
 
 /*
  * Pipe / plane / DDI register subset needed for the mode change.  Duplicated
- * locally from igen9.c so the file is self-contained; if these ever drift,
- * factor them into igen9_internal.h.
+ * locally from igen.c so the file is self-contained; if these ever drift,
+ * factor them into igen_internal.h.
  */
 #define	IG9_TRANS_HTOTAL(t)	(0x60000u + (t) * 0x1000u)
 #define	IG9_TRANS_HBLANK(t)	(0x60004u + (t) * 0x1000u)
@@ -933,34 +933,34 @@ static const struct igen9_mode_preset igen9_mode_presets[] = {
 #define	IG9_PLANE_SIZE(p)	(0x70190u + (p) * 0x1000u)
 
 static int
-igen9_sysctl_mode_change(SYSCTL_HANDLER_ARGS)
+igen_sysctl_mode_change(SYSCTL_HANDLER_ARGS)
 {
-	struct igen9_softc *sc = arg1;
+	struct igen_softc *sc = arg1;
 	int idx = -1;
 	int error = sysctl_handle_int(oidp, &idx, 0, req);
-	const struct igen9_mode_preset *m;
+	const struct igen_mode_preset *m;
 	uint32_t pre_conf, post_conf;
 	int i;
 
 	if (error || req->newptr == NULL)
 		return (error);
-	if (idx < 0 || (size_t)idx >= nitems(igen9_mode_presets)) {
+	if (idx < 0 || (size_t)idx >= nitems(igen_mode_presets)) {
 		device_printf(sc->dev,
 		    "mode_change: index must be 0..%zu (0=1080p60, 1=720p60,"
-		    " 2=480p60)\n", nitems(igen9_mode_presets) - 1);
+		    " 2=480p60)\n", nitems(igen_mode_presets) - 1);
 		return (EINVAL);
 	}
-	m = &igen9_mode_presets[idx];
+	m = &igen_mode_presets[idx];
 
 	device_printf(sc->dev,
 	    "mode_change: switching to %s (%u kHz, %ux%u) on pipe A\n",
 	    m->name, m->pixel_khz, m->h_active, m->v_active);
 
 	/* 1) Disable pipe A; wait for scan-stop. */
-	pre_conf = igen9_r32(sc, IG9_PIPE_CONF(0));
-	igen9_w32(sc, IG9_PIPE_CONF(0), pre_conf & ~IG9_PIPE_CONF_ENABLE);
+	pre_conf = igen_r32(sc, IG9_PIPE_CONF(0));
+	igen_w32(sc, IG9_PIPE_CONF(0), pre_conf & ~IG9_PIPE_CONF_ENABLE);
 	for (i = 0; i < 200; i++) {
-		if ((igen9_r32(sc, IG9_PIPE_CONF(0)) &
+		if ((igen_r32(sc, IG9_PIPE_CONF(0)) &
 		    IG9_PIPE_CONF_STATE) == 0)
 			break;
 		DELAY(100);
@@ -984,38 +984,38 @@ igen9_sysctl_mode_change(SYSCTL_HANDLER_ARGS)
 		uint32_t enreg = WRPLL_ENABLE_REG(2);
 		uint32_t lock_bit = DPLL_LOCK_AT(2);
 
-		if (!igen9_wrpll_solve(m->pixel_khz, &p0, &p1, &p2,
+		if (!igen_wrpll_solve(m->pixel_khz, &p0, &p1, &p2,
 		    &dco_int, &dco_frac, &vco)) {
 			device_printf(sc->dev,
 			    "mode_change: no WRPLL solution for %u kHz\n",
 			    m->pixel_khz);
 			return (EINVAL);
 		}
-		cfgcr1_val = igen9_wrpll_encode_cfgcr1(dco_int, dco_frac);
-		if (!igen9_wrpll_encode_cfgcr2(p0, p1, p2, vco, &cfgcr2_val)) {
+		cfgcr1_val = igen_wrpll_encode_cfgcr1(dco_int, dco_frac);
+		if (!igen_wrpll_encode_cfgcr2(p0, p1, p2, vco, &cfgcr2_val)) {
 			device_printf(sc->dev,
 			    "mode_change: encode_cfgcr2 failed\n");
 			return (EINVAL);
 		}
 
-		en = igen9_r32(sc, enreg);
-		igen9_w32(sc, enreg, en & ~WRPLL_ENABLE_BIT);
+		en = igen_r32(sc, enreg);
+		igen_w32(sc, enreg, en & ~WRPLL_ENABLE_BIT);
 		DELAY(10);
-		igen9_w32(sc, WRPLL_CFGCR1(2), cfgcr1_val);
-		igen9_w32(sc, WRPLL_CFGCR2(2), cfgcr2_val);
-		(void)igen9_r32(sc, WRPLL_CFGCR2(2));
+		igen_w32(sc, WRPLL_CFGCR1(2), cfgcr1_val);
+		igen_w32(sc, WRPLL_CFGCR2(2), cfgcr2_val);
+		(void)igen_r32(sc, WRPLL_CFGCR2(2));
 
-		ctrl1 = igen9_r32(sc, DPLL_CTRL1);
+		ctrl1 = igen_r32(sc, DPLL_CTRL1);
 		ctrl1 = (ctrl1 & ~(0x3fu << (2 * 6))) |
 		    CTRL1_OVERRIDE(2) | CTRL1_HDMI_MODE(2);
-		igen9_w32(sc, DPLL_CTRL1, ctrl1);
-		(void)igen9_r32(sc, DPLL_CTRL1);
+		igen_w32(sc, DPLL_CTRL1, ctrl1);
+		(void)igen_r32(sc, DPLL_CTRL1);
 
-		igen9_w32(sc, enreg, WRPLL_ENABLE_BIT);
-		(void)igen9_r32(sc, enreg);
+		igen_w32(sc, enreg, WRPLL_ENABLE_BIT);
+		(void)igen_r32(sc, enreg);
 
 		for (i = 0; i < 500; i++) {
-			status = igen9_r32(sc, DPLL_STATUS);
+			status = igen_r32(sc, DPLL_STATUS);
 			if (status & lock_bit)
 				break;
 			DELAY(100);
@@ -1026,7 +1026,7 @@ igen9_sysctl_mode_change(SYSCTL_HANDLER_ARGS)
 		    cfgcr1_val, cfgcr2_val, status,
 		    !!(status & lock_bit), i * 100);
 		if (!(status & lock_bit)) {
-			igen9_w32(sc, enreg, 0);
+			igen_w32(sc, enreg, 0);
 			device_printf(sc->dev,
 			    "mode_change: DPLL2 failed to lock; aborting\n");
 			return (EIO);
@@ -1034,25 +1034,25 @@ igen9_sysctl_mode_change(SYSCTL_HANDLER_ARGS)
 	}
 
 	/* 3) Write new transcoder timing. */
-	igen9_w32(sc, IG9_TRANS_HTOTAL(0), m->htotal);
-	igen9_w32(sc, IG9_TRANS_HBLANK(0), m->hblank);
-	igen9_w32(sc, IG9_TRANS_HSYNC(0),  m->hsync);
-	igen9_w32(sc, IG9_TRANS_VTOTAL(0), m->vtotal);
-	igen9_w32(sc, IG9_TRANS_VBLANK(0), m->vblank);
-	igen9_w32(sc, IG9_TRANS_VSYNC(0),  m->vsync);
-	igen9_w32(sc, IG9_PIPE_SRCSZ(0),
+	igen_w32(sc, IG9_TRANS_HTOTAL(0), m->htotal);
+	igen_w32(sc, IG9_TRANS_HBLANK(0), m->hblank);
+	igen_w32(sc, IG9_TRANS_HSYNC(0),  m->hsync);
+	igen_w32(sc, IG9_TRANS_VTOTAL(0), m->vtotal);
+	igen_w32(sc, IG9_TRANS_VBLANK(0), m->vblank);
+	igen_w32(sc, IG9_TRANS_VSYNC(0),  m->vsync);
+	igen_w32(sc, IG9_PIPE_SRCSZ(0),
 	    ((uint32_t)(m->h_active - 1) << 16) | (m->v_active - 1));
-	igen9_w32(sc, IG9_PLANE_SIZE(0),
+	igen_w32(sc, IG9_PLANE_SIZE(0),
 	    ((uint32_t)(m->v_active - 1) << 16) | (m->h_active - 1));
 
 	/* 4) Re-enable pipe. */
-	igen9_w32(sc, IG9_PIPE_CONF(0), IG9_PIPE_CONF_ENABLE);
+	igen_w32(sc, IG9_PIPE_CONF(0), IG9_PIPE_CONF_ENABLE);
 	for (i = 0; i < 200; i++) {
-		if (igen9_r32(sc, IG9_PIPE_CONF(0)) & IG9_PIPE_CONF_STATE)
+		if (igen_r32(sc, IG9_PIPE_CONF(0)) & IG9_PIPE_CONF_STATE)
 			break;
 		DELAY(100);
 	}
-	post_conf = igen9_r32(sc, IG9_PIPE_CONF(0));
+	post_conf = igen_r32(sc, IG9_PIPE_CONF(0));
 	device_printf(sc->dev,
 	    "mode_change: pipe A re-enabled (PIPE_CONF=0x%08x; on after %d us)\n",
 	    post_conf, i * 100);
@@ -1070,9 +1070,9 @@ igen9_sysctl_mode_change(SYSCTL_HANDLER_ARGS)
  * PW1 STATE = bit 2, REQ = bit 3.  Poll STATE for up to 10 ms.
  */
 static int
-igen9_sysctl_pw1_up(SYSCTL_HANDLER_ARGS)
+igen_sysctl_pw1_up(SYSCTL_HANDLER_ARGS)
 {
-	struct igen9_softc *sc = arg1;
+	struct igen_softc *sc = arg1;
 	uint32_t v;
 	int i, trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
@@ -1080,7 +1080,7 @@ igen9_sysctl_pw1_up(SYSCTL_HANDLER_ARGS)
 	if (error || req->newptr == NULL || trigger == 0)
 		return (error);
 
-	v = igen9_r32(sc, 0x45404);
+	v = igen_r32(sc, 0x45404);
 	device_printf(sc->dev, "pw1_up: HSW_PWR_WELL_CTL2 pre=0x%08x"
 	    " (PW1 STATE=%d REQ=%d)\n",
 	    v, (v >> 2) & 1, (v >> 3) & 1);
@@ -1090,9 +1090,9 @@ igen9_sysctl_pw1_up(SYSCTL_HANDLER_ARGS)
 		return (0);
 	}
 
-	igen9_w32(sc, 0x45404, v | (1u << 3));	/* set REQ for PW1 */
+	igen_w32(sc, 0x45404, v | (1u << 3));	/* set REQ for PW1 */
 	for (i = 0; i < 100; i++) {
-		v = igen9_r32(sc, 0x45404);
+		v = igen_r32(sc, 0x45404);
 		if (v & (1u << 2))
 			break;
 		DELAY(100);
@@ -1104,9 +1104,9 @@ igen9_sysctl_pw1_up(SYSCTL_HANDLER_ARGS)
 }
 
 static int
-igen9_sysctl_wrpll_unroute(SYSCTL_HANDLER_ARGS)
+igen_sysctl_wrpll_unroute(SYSCTL_HANDLER_ARGS)
 {
-	struct igen9_softc *sc = arg1;
+	struct igen_softc *sc = arg1;
 	uint32_t port, ctrl2, new_ctrl2;
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
@@ -1127,12 +1127,12 @@ igen9_sysctl_wrpll_unroute(SYSCTL_HANDLER_ARGS)
 		    " firmware-driven mode\n");
 		return (EBUSY);
 	}
-	ctrl2 = igen9_r32(sc, DPLL_CTRL2);
+	ctrl2 = igen_r32(sc, DPLL_CTRL2);
 	new_ctrl2 = ctrl2 | CTRL2_DDI_OFF(port);
 	device_printf(sc->dev,
 	    "wrpll_unroute: DDI_%c  CTRL2 0x%08x -> 0x%08x\n",
 	    'A' + port, ctrl2, new_ctrl2);
-	igen9_w32(sc, DPLL_CTRL2, new_ctrl2);
+	igen_w32(sc, DPLL_CTRL2, new_ctrl2);
 	return (0);
 }
 
@@ -1208,9 +1208,9 @@ static const uint32_t skl_hdmi_ddi_trans[10][2] = {
 };
 
 static int
-igen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS)
+igen_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS)
 {
-	struct igen9_softc *sc = arg1;
+	struct igen_softc *sc = arg1;
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
 
@@ -1222,11 +1222,11 @@ igen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS)
 	 *    these the pipe/DDI register writes hit a powered-off domain and
 	 *    silently get dropped on retain.
 	 */
-	uint32_t pwr = igen9_r32(sc, HSW_PWR_WELL_CTL2);
+	uint32_t pwr = igen_r32(sc, HSW_PWR_WELL_CTL2);
 	uint32_t want = PWR_WELL_REQ(PW_IDX_PW2) | PWR_WELL_REQ(PW_IDX_DDI_B);
-	igen9_w32(sc, HSW_PWR_WELL_CTL2, pwr | want);
+	igen_w32(sc, HSW_PWR_WELL_CTL2, pwr | want);
 	for (int spin = 0; spin < 100; spin++) {
-		uint32_t s = igen9_r32(sc, HSW_PWR_WELL_CTL2);
+		uint32_t s = igen_r32(sc, HSW_PWR_WELL_CTL2);
 		uint32_t need = PWR_WELL_STATE(PW_IDX_PW2) |
 		    PWR_WELL_STATE(PW_IDX_DDI_B);
 		if ((s & need) == need) {
@@ -1251,7 +1251,7 @@ igen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS)
 	 *   5. Set ENABLE
 	 *   6. Poll LOCK (BSpec says <5 ms)
 	 */
-	uint32_t lcpll2 = igen9_r32(sc, SKL_DPLL1_ENABLE);
+	uint32_t lcpll2 = igen_r32(sc, SKL_DPLL1_ENABLE);
 	/*
 	 * Diagnostic: dump all 4 SKL DPLLs so we can see which one
 	 * firmware actually uses for the live HDMI scanout.  DPLL1
@@ -1266,14 +1266,14 @@ igen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS)
 		uint32_t off = (id == 0) ? 0x46010 :
 		    (id == 1) ? 0x46014 :
 		    (id == 2) ? 0x46040 : 0x46060;
-		uint32_t v = igen9_r32(sc, off);
+		uint32_t v = igen_r32(sc, off);
 		device_printf(sc->dev,
 		    "resume: DPLL%d @0x%05x = 0x%08x  (ENABLE=%d LOCK=%d)\n",
 		    id, off, v,
 		    (v & DPLL_ENABLE_BIT) ? 1 : 0,
 		    (v & DPLL_LOCK_BIT) ? 1 : 0);
 	}
-	uint32_t ctrl2 = igen9_r32(sc, DPLL_CTRL2);
+	uint32_t ctrl2 = igen_r32(sc, DPLL_CTRL2);
 	for (int port = 0; port < 5; port++) {
 		uint32_t sel = (ctrl2 >> (port * 3 + 1)) & 0x3;
 		bool off_bit = (ctrl2 >> (port + 15)) & 0x1;
@@ -1281,8 +1281,8 @@ igen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS)
 		    "resume: DDI_%c clk_sel=DPLL%u  clk_off=%d\n",
 		    'A' + port, sel, off_bit ? 1 : 0);
 	}
-	igen9_w32(sc, SKL_DPLL1_ENABLE, lcpll2 & ~DPLL_ENABLE_BIT);
-	(void)igen9_r32(sc, SKL_DPLL1_ENABLE);
+	igen_w32(sc, SKL_DPLL1_ENABLE, lcpll2 & ~DPLL_ENABLE_BIT);
+	(void)igen_r32(sc, SKL_DPLL1_ENABLE);
 
 	/*
 	 * DPLL_CTRL1 (0x6c058) is six bits per DPLL.  For DPLL_n the
@@ -1299,23 +1299,23 @@ igen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS)
 	 */
 #define	SKL_DPLL_CTRL1_OVERRIDE(id)	(1u << ((id) * 6))
 #define	SKL_DPLL_CTRL1_HDMI_MODE(id)	(1u << ((id) * 6 + 1))
-	uint32_t ctrl1 = igen9_r32(sc, DPLL_CTRL1);
-	igen9_w32(sc, DPLL_CTRL1,
+	uint32_t ctrl1 = igen_r32(sc, DPLL_CTRL1);
+	igen_w32(sc, DPLL_CTRL1,
 	    ctrl1 | SKL_DPLL_CTRL1_OVERRIDE(1) | SKL_DPLL_CTRL1_HDMI_MODE(1));
 	device_printf(sc->dev,
 	    "resume: DPLL_CTRL1 0x%08x -> 0x%08x (DPLL1 HDMI_MODE + OVERRIDE)\n",
-	    ctrl1, igen9_r32(sc, DPLL_CTRL1));
+	    ctrl1, igen_r32(sc, DPLL_CTRL1));
 
 	/* CFGCR1/2 — firmware-tuned for 148.5 MHz HDMI. */
-	igen9_w32(sc, 0x6c040, 0x80400173);
-	igen9_w32(sc, 0x6c044, 0x000003a5);
-	(void)igen9_r32(sc, 0x6c044);	/* posting */
+	igen_w32(sc, 0x6c040, 0x80400173);
+	igen_w32(sc, 0x6c044, 0x000003a5);
+	(void)igen_r32(sc, 0x6c044);	/* posting */
 
-	igen9_w32(sc, SKL_DPLL1_ENABLE,
-	    igen9_r32(sc, SKL_DPLL1_ENABLE) | DPLL_ENABLE_BIT);
+	igen_w32(sc, SKL_DPLL1_ENABLE,
+	    igen_r32(sc, SKL_DPLL1_ENABLE) | DPLL_ENABLE_BIT);
 	bool locked = false;
 	for (int spin = 0; spin < 50; spin++) {
-		uint32_t v = igen9_r32(sc, SKL_DPLL1_ENABLE);
+		uint32_t v = igen_r32(sc, SKL_DPLL1_ENABLE);
 		if (v & DPLL_LOCK_BIT) {
 			device_printf(sc->dev,
 			    "resume: DPLL1 LOCK after %d * 100us (LCPLL2=0x%08x)\n",
@@ -1328,39 +1328,39 @@ igen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS)
 	if (!locked)
 		device_printf(sc->dev,
 		    "resume: DPLL1 NOT LOCKED  (LCPLL2_CTL=0x%08x)\n",
-		    igen9_r32(sc, SKL_DPLL1_ENABLE));
+		    igen_r32(sc, SKL_DPLL1_ENABLE));
 
 	/* 1) Enable DDI_B port clock: clear CLOCK_OFF bit in DPLL_CTRL2. */
-	uint32_t dpll2 = igen9_r32(sc, DPLL_CTRL2);
-	igen9_w32(sc, DPLL_CTRL2, dpll2 & ~DPLL_CTRL2_DDI_B_OFF);
+	uint32_t dpll2 = igen_r32(sc, DPLL_CTRL2);
+	igen_w32(sc, DPLL_CTRL2, dpll2 & ~DPLL_CTRL2_DDI_B_OFF);
 	device_printf(sc->dev,
 	    "resume: DPLL_CTRL2 0x%08x -> 0x%08x (DDI_B clock on)\n",
 	    dpll2, dpll2 & ~DPLL_CTRL2_DDI_B_OFF);
 
 	/* 2) Transcoder A timing — BASELINE values for 1920x1080@60. */
-	igen9_w32(sc, TRANS_HTOTAL(0), 0x0897077f);
-	igen9_w32(sc, TRANS_HBLANK(0), 0x0897077f);
-	igen9_w32(sc, TRANS_HSYNC(0),  0x080307d7);
-	igen9_w32(sc, TRANS_VTOTAL(0), 0x04640437);
-	igen9_w32(sc, TRANS_VBLANK(0), 0x04640437);
-	igen9_w32(sc, TRANS_VSYNC(0),  0x043e0439);
-	igen9_w32(sc, PIPE_SRCSZ(0),   ((uint32_t)1919 << 16) | 1079);
+	igen_w32(sc, TRANS_HTOTAL(0), 0x0897077f);
+	igen_w32(sc, TRANS_HBLANK(0), 0x0897077f);
+	igen_w32(sc, TRANS_HSYNC(0),  0x080307d7);
+	igen_w32(sc, TRANS_VTOTAL(0), 0x04640437);
+	igen_w32(sc, TRANS_VBLANK(0), 0x04640437);
+	igen_w32(sc, TRANS_VSYNC(0),  0x043e0439);
+	igen_w32(sc, PIPE_SRCSZ(0),   ((uint32_t)1919 << 16) | 1079);
 
 	/* 3) Route transcoder A to DDI_B in HDMI mode (BASELINE value). */
-	igen9_w32(sc, TRANS_DDI_FUNC_CTL(0), 0x90030000);
+	igen_w32(sc, TRANS_DDI_FUNC_CTL(0), 0x90030000);
 
 	/* 4) Enable Pipe A. */
-	igen9_w32(sc, PIPE_CONF(0), PIPE_CONF_ENABLE);
+	igen_w32(sc, PIPE_CONF(0), PIPE_CONF_ENABLE);
 	DELAY(100);
-	uint32_t pconf = igen9_r32(sc, PIPE_CONF(0));
+	uint32_t pconf = igen_r32(sc, PIPE_CONF(0));
 	device_printf(sc->dev, "resume: PIPE_CONF=0x%08x\n", pconf);
 
 	/* 5) Primary plane: XRGB8888 linear, 1920x1080, stride 7680, surf=0. */
-	igen9_w32(sc, PLANE_STRIDE(0), 7680 / 64);
-	igen9_w32(sc, PLANE_SIZE(0),
+	igen_w32(sc, PLANE_STRIDE(0), 7680 / 64);
+	igen_w32(sc, PLANE_SIZE(0),
 	    ((uint32_t)1079 << 16) | 1919);
-	igen9_w32(sc, PLANE_SURF(0), 0);
-	igen9_w32(sc, PLANE_CTL(0),
+	igen_w32(sc, PLANE_SURF(0), 0);
+	igen_w32(sc, PLANE_CTL(0),
 	    PLANE_CTL_ENABLE | (0x4 << PLANE_CTL_FORMAT_SHIFT));
 
 	/*
@@ -1372,12 +1372,12 @@ igen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS)
 	 *    "display present" gate.  ENABLE goes last.
 	 */
 	for (int i = 0; i < 10; i++) {
-		igen9_w32(sc, DDI_BUF_TRANS_LO(1, i),
+		igen_w32(sc, DDI_BUF_TRANS_LO(1, i),
 		    skl_hdmi_ddi_trans[i][0]);
-		igen9_w32(sc, DDI_BUF_TRANS_HI(1, i),
+		igen_w32(sc, DDI_BUF_TRANS_HI(1, i),
 		    skl_hdmi_ddi_trans[i][1]);
 	}
-	igen9_w32(sc, DDI_BUF_CTL(1),
+	igen_w32(sc, DDI_BUF_CTL(1),
 	    DDI_BUF_CTL_ENABLE_BIT |
 	    (8u << DDI_BUF_CTL_TRANS_SELECT_SHIFT) |
 	    DDI_BUF_CTL_PORT_WIDTH_X4 |
@@ -1385,7 +1385,7 @@ igen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS)
 
 	/* Poll IDLE_STATUS to clear; BSpec says < 600 us. */
 	for (int spin = 0; spin < 200; spin++) {
-		uint32_t bc = igen9_r32(sc, DDI_BUF_CTL(1));
+		uint32_t bc = igen_r32(sc, DDI_BUF_CTL(1));
 		if ((bc & DDI_BUF_CTL_IDLE_STATUS) == 0) {
 			device_printf(sc->dev,
 			    "resume: DDI_B left IDLE after %d us\n",
@@ -1398,12 +1398,12 @@ igen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS)
 	DELAY(20000);	/* ~20 ms for HW to stabilise */
 	device_printf(sc->dev,
 	    "resume: PIPE_CONF=0x%08x  PLANE_CTL=0x%08x  DDI_BUF_B=0x%08x\n",
-	    igen9_r32(sc, PIPE_CONF(0)),
-	    igen9_r32(sc, PLANE_CTL(0)),
-	    igen9_r32(sc, DDI_BUF_CTL(1)));
-	uint32_t fc1 = igen9_r32(sc, PIPE_FRMCOUNT(0));
+	    igen_r32(sc, PIPE_CONF(0)),
+	    igen_r32(sc, PLANE_CTL(0)),
+	    igen_r32(sc, DDI_BUF_CTL(1)));
+	uint32_t fc1 = igen_r32(sc, PIPE_FRMCOUNT(0));
 	pause("gen9rsm", hz / 4);
-	uint32_t fc2 = igen9_r32(sc, PIPE_FRMCOUNT(0));
+	uint32_t fc2 = igen_r32(sc, PIPE_FRMCOUNT(0));
 	device_printf(sc->dev,
 	    "resume: FRMCOUNT delta over 250 ms = %u (expect ~15 if 60 Hz)\n",
 	    fc2 - fc1);
@@ -1419,11 +1419,11 @@ igen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS)
  * atomic_commit.
  */
 void
-igen9_wait_vblank(struct igen9_softc *sc, int pipe)
+igen_wait_vblank(struct igen_softc *sc, int pipe)
 {
-	uint32_t start = igen9_r32(sc, PIPE_FRMCOUNT(pipe));
+	uint32_t start = igen_r32(sc, PIPE_FRMCOUNT(pipe));
 	for (int spin = 0; spin < 50; spin++) {
-		if (igen9_r32(sc, PIPE_FRMCOUNT(pipe)) != start)
+		if (igen_r32(sc, PIPE_FRMCOUNT(pipe)) != start)
 			return;
 		pause("gen9vbl", hz / 1000);
 	}
@@ -1431,12 +1431,12 @@ igen9_wait_vblank(struct igen9_softc *sc, int pipe)
 
 /*
  * Register all DPLL/WRPLL/clock/pipe-resume sysctls under the device's
- * .re. subtree.  Called from igen9.c's igen9_re_sysctls_init right after
+ * .re. subtree.  Called from igen.c's igen_re_sysctls_init right after
  * the re_sysctl_tree node is built; the context list + tree pointer are
  * borrowed from the softc.
  */
 void
-igen9_dpll_register_sysctls(struct igen9_softc *sc)
+igen_dpll_register_sysctls(struct igen_softc *sc)
 {
 	struct sysctl_ctx_list *ctx = &sc->re_sysctl_ctx;
 	struct sysctl_oid_list *children =
@@ -1444,7 +1444,7 @@ igen9_dpll_register_sysctls(struct igen9_softc *sc)
 
 	SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "clock_state",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, igen9_sysctl_clock_state, "I",
+	    sc, 0, igen_sysctl_clock_state, "I",
 	    "write 1 to dump CDCLK / LCPLL / DPLL / DDI clock-on-off state");
 
 	SYSCTL_ADD_UINT(ctx, children, OID_AUTO,
@@ -1452,7 +1452,7 @@ igen9_dpll_register_sysctls(struct igen9_softc *sc)
 	    "WRPLL solver target pixel clock in kHz");
 	SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "wrpll_calc",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, igen9_sysctl_wrpll_calc, "I",
+	    sc, 0, igen_sysctl_wrpll_calc, "I",
 	    "write 1 to solve WRPLL (DCO_INT/DCO_FRAC/P0/P1/P2) for"
 	    " wrpll_target_khz");
 
@@ -1462,11 +1462,11 @@ igen9_dpll_register_sysctls(struct igen9_softc *sc)
 	    "WRPLL to program / dump: 2 = DPLL2, 3 = DPLL3");
 	SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "wrpll_dump",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, igen9_sysctl_wrpll_dump, "I",
+	    sc, 0, igen_sysctl_wrpll_dump, "I",
 	    "write 1 to print CFGCR1/CFGCR2 of wrpll_dpll_id (decoded)");
 	SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "wrpll_program",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, igen9_sysctl_wrpll_program, "I",
+	    sc, 0, igen_sysctl_wrpll_program, "I",
 	    "write 1 to solve wrpll_target_khz and program CFGCR1/CFGCR2"
 	    " of wrpll_dpll_id (does NOT enable PLL or re-mux DDIs)");
 
@@ -1476,42 +1476,42 @@ igen9_dpll_register_sysctls(struct igen9_softc *sc)
 	    "DDI to re-mux to wrpll_dpll_id: 0=A 1=B 2=C 3=D 4=E");
 	SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "wrpll_enable",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, igen9_sysctl_wrpll_enable, "I",
+	    sc, 0, igen_sysctl_wrpll_enable, "I",
 	    "write 1 to enable wrpll_dpll_id (CTRL1 HDMI_MODE + ENABLE +"
 	    " poll LOCK)");
 	SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "wrpll_disable",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, igen9_sysctl_wrpll_disable, "I",
+	    sc, 0, igen_sysctl_wrpll_disable, "I",
 	    "write 1 to disable wrpll_dpll_id");
 	SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "wrpll_route",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, igen9_sysctl_wrpll_route, "I",
+	    sc, 0, igen_sysctl_wrpll_route, "I",
 	    "write 1 to route DDI[wrpll_route_port] clock to wrpll_dpll_id"
 	    " (CTRL2 OFF=0 SEL=id OVERRIDE=1)");
 	SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "wrpll_unroute",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, igen9_sysctl_wrpll_unroute, "I",
+	    sc, 0, igen_sysctl_wrpll_unroute, "I",
 	    "write 1 to gate DDI[wrpll_route_port] clock off (CTRL2 OFF=1)");
 	SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "wrpll_force_clear",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, igen9_sysctl_wrpll_force_clear, "I",
+	    sc, 0, igen_sysctl_wrpll_force_clear, "I",
 	    "emergency: write 1 to unconditionally clear ENABLE of"
 	    " wrpll_dpll_id (no liveness check)");
 	SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "pw1_up",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, igen9_sysctl_pw1_up, "I",
+	    sc, 0, igen_sysctl_pw1_up, "I",
 	    "write 1 to request PW1 (display PLL power well); required"
 	    " for DPLL2/3 enable.  Firmware leaves it down because it"
 	    " drives the live link from DPLL0/LCPLL1.");
 	SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "mode_change",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, igen9_sysctl_mode_change, "I",
+	    sc, 0, igen_sysctl_mode_change, "I",
 	    "write preset idx (0=1080p60 1=720p60 2=480p60) to disable pipe,"
 	    " reprogram DPLL2, rewrite transcoder timing, re-enable pipe");
 
 	SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "try_pipe_resume",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, igen9_sysctl_try_pipe_resume, "I",
+	    sc, 0, igen_sysctl_try_pipe_resume, "I",
 	    "write 1 to write BASELINE timing/format and enable Pipe A ->"
 	    " DDI_B (HDMI 1920x1080@60); upstream clocks must be alive");
 }

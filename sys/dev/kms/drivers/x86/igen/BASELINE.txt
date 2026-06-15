@@ -1,5 +1,5 @@
 fbsdx86 (Intel HD 630, Kabylake-S GT2, PCI 8086:5912)
-Initial post-boot live MMIO state captured 2026-06-10 via dev.igen9.0.re scaffold.
+Initial post-boot live MMIO state captured 2026-06-10 via dev.igen.0.re scaffold.
 
 Firmware/loader has Pipe A scanning out 1920x1080@60 8bpc HDMI on DDI_B
 via Transcoder A.  No other pipe / transcoder / DDI is active.

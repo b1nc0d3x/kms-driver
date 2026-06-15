@@ -3,14 +3,14 @@
  *
  * Copyright (c) 2026 Kyle Crenshaw <b1nc0d3x@gmail.com>
  *
- * igen9 internal API — shared between igen9.c (driver glue, RE harness,
- * GMBus, VBT, GTT, plane atomic path) and igen9_dpll.c (CDCLK, DPLL /
+ * igen internal API — shared between igen.c (driver glue, RE harness,
+ * GMBus, VBT, GTT, plane atomic path) and igen_dpll.c (CDCLK, DPLL /
  * WRPLL, pipe resume from cold).  Not exported to consumers; only the
  * .c files in this driver include this header.
  */
 
-#ifndef _IGEN9_INTERNAL_H_
-#define _IGEN9_INTERNAL_H_
+#ifndef _IGEN_INTERNAL_H_
+#define _IGEN_INTERNAL_H_
 
 #include <sys/types.h>
 #include <sys/bus.h>
@@ -27,7 +27,7 @@
 #include <kms/drm_framebuffer.h>
 #include <kms/drm_plane.h>
 
-struct igen9_test_fb;
+struct igen_test_fb;
 
 /*
  * User-FB GTT slot cache sizes.  Each ADDFB2 dumb buffer gets one slot
@@ -41,15 +41,23 @@ struct igen9_test_fb;
  * Driver-owned drm_framebuffer wrapper.  expose_scanout_fb sysctl wires
  * the already-allocated test_fb into the framework's mode-object table.
  */
-struct igen9_owned_fb {
+struct igen_owned_fb {
 	struct drm_framebuffer	 base;
-	struct igen9_test_fb	*test_fb;
+	struct igen_test_fb	*test_fb;
 };
 
-struct igen9_softc {
+struct igen_softc {
 	device_t		 dev;
 	struct drm_device	*drm_dev;
 	uint16_t		 pci_id;
+
+	/*
+	 * Silicon generation: 9 = SKL / KBL / CFL, 11 = ICL, 12 = TGL+.
+	 * Populated at attach from the PCI ID table.  Gen-specific code
+	 * paths (DPLL programming, DDI_BUF_TRANS table, power-well topology)
+	 * branch on this rather than carrying separate driver names.
+	 */
+	int			 gen;
 
 	int			 mmio_rid;
 	struct resource		*mmio_res;
@@ -75,7 +83,7 @@ struct igen9_softc {
 	struct drm_connector	 connector;
 
 	/* Driver-owned scanout buffer (scanout_hold sysctl). */
-	struct igen9_test_fb	*scanout_fb;
+	struct igen_test_fb	*scanout_fb;
 	uint32_t		 scanout_prev_surf;
 	bool			 scanout_held;
 
@@ -108,7 +116,7 @@ struct igen9_softc {
 
 /*
  * 4-level debug print idiom.  Gated on sc->sc_debug; runtime knob
- * dev.igen9.<n>.debug (CTLFLAG_RWTUN).
+ * dev.igen.<n>.debug (CTLFLAG_RWTUN).
  */
 #define	DPRINTF(sc, level, ...)						\
 	do {								\
@@ -117,7 +125,7 @@ struct igen9_softc {
 	} while (0)
 
 /*
- * Cross-file register macros — used in both igen9.c and igen9_dpll.c.
+ * Cross-file register macros — used in both igen.c and igen_dpll.c.
  * Kept here so neither file needs the other's private contents.  See
  * BSpec SKL display chapter for full register layout.
  */
@@ -153,13 +161,13 @@ struct igen9_softc {
 
 /* Low-level MMIO accessors.  Inline so every TU gets its own copy. */
 static inline uint32_t
-igen9_r32(struct igen9_softc *sc, uint32_t off)
+igen_r32(struct igen_softc *sc, uint32_t off)
 {
 	return (bus_read_4(sc->mmio_res, off));
 }
 
 static inline void
-igen9_w32(struct igen9_softc *sc, uint32_t off, uint32_t val)
+igen_w32(struct igen_softc *sc, uint32_t off, uint32_t val)
 {
 	bus_write_4(sc->mmio_res, off, val);
 }
@@ -167,31 +175,31 @@ igen9_w32(struct igen9_softc *sc, uint32_t off, uint32_t val)
 /*
  * Cross-file entry points.
  *
- * igen9.c hosts: driver glue, attach/detach, atomic hooks, RE harness,
+ * igen.c hosts: driver glue, attach/detach, atomic hooks, RE harness,
  *                GMBus + EDID, VBT, GTT, scanout playground, IRQ.
  *
- * igen9_dpll.c hosts: CDCLK + DPLL + WRPLL state inspection + program /
+ * igen_dpll.c hosts: CDCLK + DPLL + WRPLL state inspection + program /
  *                     enable / route, plus the pipe-resume from-cold
  *                     experiment (try_pipe_resume) and the polled
  *                     wait_vblank helper used by atomic_commit.
  */
 
-/* Registered as children of dev.igen9.<n>.re by igen9.c at attach. */
-void	igen9_dpll_register_sysctls(struct igen9_softc *sc);
+/* Registered as children of dev.igen.<n>.re by igen.c at attach. */
+void	igen_dpll_register_sysctls(struct igen_softc *sc);
 
 /* Polled vblank wait — used by atomic_commit before PLANE_SURF write. */
-void	igen9_wait_vblank(struct igen9_softc *sc, int pipe);
+void	igen_wait_vblank(struct igen_softc *sc, int pipe);
 
 /*
- * igen9_gmbus.c — PCH GMBus driver and the edid_read_b sysctl.  EDID
+ * igen_gmbus.c — PCH GMBus driver and the edid_read_b sysctl.  EDID
  * acquisition happens here; the parse + drm_display_mode build lives
- * in igen9.c's connector attach path.
+ * in igen.c's connector attach path.
  */
 #define	GMBUS_PIN_DDI_B		5	/* SKL+ canonical pin map: DDI_B */
 #define	EDID_SLAVE		0x50
 
-int	igen9_gmbus_read_block(struct igen9_softc *sc, uint32_t pin,
+int	igen_gmbus_read_block(struct igen_softc *sc, uint32_t pin,
 	    uint8_t slave, uint8_t offset, uint8_t *buf, size_t len);
-void	igen9_gmbus_register_sysctls(struct igen9_softc *sc);
+void	igen_gmbus_register_sysctls(struct igen_softc *sc);
 
-#endif /* _IGEN9_INTERNAL_H_ */
+#endif /* _IGEN_INTERNAL_H_ */
