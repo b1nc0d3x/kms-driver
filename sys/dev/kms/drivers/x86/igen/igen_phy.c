@@ -148,6 +148,12 @@ igen_sysctl_phy_dump_bc(SYSCTL_HANDLER_ARGS)
  * companion to mmio_snapshot_save/diff — gives a single-shot view of every
  * programmed PHY_BC register, without needing to know the symbolic names.
  * Useful as a cold-boot baseline capture.
+ *
+ * SAFETY GATE: refuses to run if any pipe has PIPE_CONF ENABLE set.  Reading
+ * the 1024-dword PHY window in tight succession while the display is live
+ * scanout-of-DDI_B has been observed to stall the display-engine bus and
+ * wedge the iGPU until reboot.  Write 2 to override (use only when
+ * deliberately debugging on a hung pipe and a reset is acceptable).
  */
 static int
 igen_sysctl_phy_scan_bc(SYSCTL_HANDLER_ARGS)
@@ -160,8 +166,25 @@ igen_sysctl_phy_scan_bc(SYSCTL_HANDLER_ARGS)
 	if (error || req->newptr == NULL || trigger == 0)
 		return (error);
 
+	if (trigger != 2) {
+		for (int p = 0; p < 3; p++) {
+			uint32_t conf = igen_r32(sc, PIPE_CONF(p));
+
+			if (conf & PIPE_CONF_ENABLE) {
+				device_printf(sc->dev,
+				    "phy_scan_bc: REFUSE: pipe %c is active"
+				    " (PIPE_CONF=0x%08x).  PHY register reads"
+				    " during live scanout can wedge the iGPU."
+				    "  Write 2 to override.\n",
+				    'A' + p, conf);
+				return (EBUSY);
+			}
+		}
+	}
+
 	device_printf(sc->dev,
-	    "phy_scan_bc: walking 0x6c000..0x6cfff (4 KiB):\n");
+	    "phy_scan_bc: walking 0x6c000..0x6cfff (4 KiB)%s:\n",
+	    trigger == 2 ? " [FORCED, pipe may be active]" : "");
 	for (uint32_t a = 0x0006c000; a < 0x0006d000; a += 4) {
 		uint32_t v = igen_r32(sc, a);
 		if (v != 0) {
@@ -169,6 +192,12 @@ igen_sysctl_phy_scan_bc(SYSCTL_HANDLER_ARGS)
 			    "  0x%05x = 0x%08x\n", a, v);
 			nonzero++;
 		}
+		/*
+		 * Throttle slightly to keep the read storm from monopolising
+		 * the MMIO bus even in the idle-pipe path; cheap insurance.
+		 */
+		if ((a & 0xff) == 0)
+			DELAY(2);
 	}
 	device_printf(sc->dev,
 	    "phy_scan_bc: %u nonzero dwords of 1024\n", nonzero);
