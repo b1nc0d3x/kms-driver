@@ -490,6 +490,7 @@ static int	igen9_sysctl_wrpll_disable(SYSCTL_HANDLER_ARGS);
 static int	igen9_sysctl_wrpll_route(SYSCTL_HANDLER_ARGS);
 static int	igen9_sysctl_wrpll_unroute(SYSCTL_HANDLER_ARGS);
 static int	igen9_sysctl_wrpll_force_clear(SYSCTL_HANDLER_ARGS);
+static int	igen9_sysctl_pw1_up(SYSCTL_HANDLER_ARGS);
 static int	igen9_sysctl_current_mode(SYSCTL_HANDLER_ARGS);
 static int	igen9_sysctl_clock_state(SYSCTL_HANDLER_ARGS);
 static int	igen9_sysctl_try_pipe_resume(SYSCTL_HANDLER_ARGS);
@@ -638,6 +639,13 @@ igen9_re_sysctls_init(struct igen9_softc *sc)
 	    sc, 0, igen9_sysctl_wrpll_force_clear, "I",
 	    "emergency: write 1 to unconditionally clear ENABLE of"
 	    " wrpll_dpll_id (no liveness check)");
+	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "pw1_up",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, igen9_sysctl_pw1_up, "I",
+	    "write 1 to request PW1 (display PLL power well); required"
+	    " for DPLL2/3 enable.  Firmware leaves it down because it"
+	    " drives the live link from DPLL0/LCPLL1.");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "current_mode",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
@@ -2995,44 +3003,22 @@ igen9_sysctl_wrpll_enable(SYSCTL_HANDLER_ARGS)
 	}
 
 	/*
-	 * Step 3: POWER_ENABLE handshake.  SKL+ requires the PLL be powered
-	 * up (POWER_ENABLE request -> POWER_STATE ack from HW) before ENABLE
-	 * can take effect.  Skipping this is what wedged the box on the
-	 * 2026-06-14 first attempt: ENABLE set but POWER_STATE=0 leaves the
-	 * PLL drawing current but unable to lock; the rest of the display
-	 * engine then sees a broken clock path and printf-storms.
+	 * Step 3: ENABLE.  SKL/KBL has no separate POWER_ENABLE/POWER_STATE
+	 * handshake -- that was added in ICL and later.  On SKL we just set
+	 * bit 31 (PLL_ENABLE) and wait for bit 30 (PLL_LOCK).  PW1 must be
+	 * up first (checked above) -- without it the silicon goes into the
+	 * stuck "enabled-but-not-locked" state that wedged fbsdx86 in the
+	 * 2026-06-14 first attempt.
 	 */
 	enreg = WRPLL_ENABLE_REG(id);
 	en = igen9_r32(sc, enreg);
 	device_printf(sc->dev,
 	    "wrpll DPLL%u: ENABLE_REG[0x%05x]=0x%08x (pre)\n", id, enreg, en);
 
-	if (!(en & WRPLL_POWER_ENABLE_BIT))
-		igen9_w32(sc, enreg, en | WRPLL_POWER_ENABLE_BIT);
-
-	for (i = 0; i < 50; i++) {
-		uint32_t v = igen9_r32(sc, enreg);
-		if (v & WRPLL_POWER_STATE_BIT)
-			break;
-		DELAY(100);
-	}
-	uint32_t ps = igen9_r32(sc, enreg);
-	if (!(ps & WRPLL_POWER_STATE_BIT)) {
-		igen9_w32(sc, enreg, ps & ~WRPLL_POWER_ENABLE_BIT);
-		device_printf(sc->dev,
-		    "wrpll DPLL%u: POWER_STATE never asserted (REG=0x%08x);"
-		    " POWER_ENABLE cleared\n", id, ps);
-		return (EIO);
-	}
-	device_printf(sc->dev,
-	    "wrpll DPLL%u: POWER_STATE up after %d us\n", id, i * 100);
-
-	/* Step 4: ENABLE. */
-	en = igen9_r32(sc, enreg);
 	if (!(en & WRPLL_ENABLE_BIT))
 		igen9_w32(sc, enreg, en | WRPLL_ENABLE_BIT);
 
-	/* Step 5: poll LOCK.  BSpec says <= 600 us; allow 5 ms. */
+	/* Poll LOCK.  BSpec says <= 600 us; allow 5 ms. */
 	for (i = 0; i < 50; i++) {
 		lock = igen9_r32(sc, enreg);
 		if (lock & WRPLL_LOCK_BIT)
@@ -3045,18 +3031,13 @@ igen9_sysctl_wrpll_enable(SYSCTL_HANDLER_ARGS)
 
 	if (!(lock & WRPLL_LOCK_BIT)) {
 		/*
-		 * Critical: undo both ENABLE and POWER_ENABLE so the silicon
-		 * doesn't sit in a half-on state.  Order matters: clear
-		 * ENABLE first, then POWER_ENABLE.
+		 * Critical: undo our ENABLE write so the silicon doesn't
+		 * sit in "enabled but unlocked" forever.
 		 */
 		uint32_t v = igen9_r32(sc, enreg);
 		igen9_w32(sc, enreg, v & ~WRPLL_ENABLE_BIT);
-		DELAY(10);
-		v = igen9_r32(sc, enreg);
-		igen9_w32(sc, enreg, v & ~WRPLL_POWER_ENABLE_BIT);
 		device_printf(sc->dev,
-		    "wrpll DPLL%u: FAILED to lock; ENABLE+POWER_ENABLE"
-		    " cleared\n", id);
+		    "wrpll DPLL%u: FAILED to lock; ENABLE cleared\n", id);
 		return (EIO);
 	}
 	return (0);
@@ -3099,13 +3080,10 @@ igen9_sysctl_wrpll_disable(SYSCTL_HANDLER_ARGS)
 	 * disable order is the reverse of enable.
 	 */
 	uint32_t after_en = en & ~WRPLL_ENABLE_BIT;
-	uint32_t after_pe = after_en & ~WRPLL_POWER_ENABLE_BIT;
 	device_printf(sc->dev,
-	    "wrpll DPLL%u: disable, ENABLE_REG 0x%08x -> 0x%08x -> 0x%08x\n",
-	    id, en, after_en, after_pe);
+	    "wrpll DPLL%u: disable, ENABLE_REG 0x%08x -> 0x%08x\n",
+	    id, en, after_en);
 	igen9_w32(sc, enreg, after_en);
-	DELAY(10);
-	igen9_w32(sc, enreg, after_pe);
 	return (0);
 }
 
@@ -3186,12 +3164,55 @@ igen9_sysctl_wrpll_force_clear(SYSCTL_HANDLER_ARGS)
 	}
 	enreg = WRPLL_ENABLE_REG(id);
 	en = igen9_r32(sc, enreg);
-	uint32_t cleared = en & ~(WRPLL_ENABLE_BIT | WRPLL_POWER_ENABLE_BIT);
+	uint32_t cleared = en & ~WRPLL_ENABLE_BIT;
 	device_printf(sc->dev,
 	    "wrpll_force_clear DPLL%u: ENABLE_REG 0x%08x -> 0x%08x"
-	    " (ENABLE+POWER_ENABLE cleared)\n", id, en, cleared);
+	    " (ENABLE cleared)\n", id, en, cleared);
 	igen9_w32(sc, enreg, cleared);
 	return (0);
+}
+
+/*
+ * Request PW1 (display PLL power well, idx=1 in HSW_PWR_WELL_CTL2).
+ * PW1 powers the analog domain for DPLL2/DPLL3 (the WRPLLs).  Firmware
+ * leaves it down when it drives the live link from DPLL0/LCPLL1, so
+ * we have to opt in before we can lock a WRPLL.  Layout per port idx:
+ *   bit (idx*2)   = STATE  (RO; HW asserts when well is up)
+ *   bit (idx*2+1) = REQ    (RW; software sets to request)
+ * PW1 STATE = bit 2, REQ = bit 3.  Poll STATE for up to 10 ms.
+ */
+static int
+igen9_sysctl_pw1_up(SYSCTL_HANDLER_ARGS)
+{
+	struct igen9_softc *sc = arg1;
+	uint32_t v;
+	int i, trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+
+	if (error || req->newptr == NULL || trigger == 0)
+		return (error);
+
+	v = igen9_r32(sc, 0x45404);
+	device_printf(sc->dev, "pw1_up: HSW_PWR_WELL_CTL2 pre=0x%08x"
+	    " (PW1 STATE=%d REQ=%d)\n",
+	    v, (v >> 2) & 1, (v >> 3) & 1);
+
+	if ((v & (1u << 2)) != 0) {
+		device_printf(sc->dev, "pw1_up: already up\n");
+		return (0);
+	}
+
+	igen9_w32(sc, 0x45404, v | (1u << 3));	/* set REQ for PW1 */
+	for (i = 0; i < 100; i++) {
+		v = igen9_r32(sc, 0x45404);
+		if (v & (1u << 2))
+			break;
+		DELAY(100);
+	}
+	device_printf(sc->dev, "pw1_up: post=0x%08x  STATE=%d  after %d us\n",
+	    v, (v >> 2) & 1, i * 100);
+
+	return ((v & (1u << 2)) ? 0 : EIO);
 }
 
 static int
