@@ -464,6 +464,8 @@ igen_re_sysctls_init(struct igen_softc *sc)
 	igen_hpd_register_sysctls(sc);
 	/* phy_dump_bc / phy_scan_bc sysctls are owned by igen_phy.c. */
 	igen_phy_register_sysctls(sc);
+	/* gt_status sysctl is owned by igen_gt.c. */
+	igen_gt_register_sysctls(sc);
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "cap_dump",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,

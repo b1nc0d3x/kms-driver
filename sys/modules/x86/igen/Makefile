@@ -5,6 +5,7 @@ KMOD=	igen
 SRCS=	igen.c \
 	igen_dpll.c \
 	igen_gmbus.c \
+	igen_gt.c \
 	igen_gtt.c \
 	igen_hpd.c \
 	igen_phy.c \

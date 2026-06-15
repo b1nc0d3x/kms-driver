@@ -240,6 +240,14 @@ void	igen_hpd_register_sysctls(struct igen_softc *sc);
 void	igen_phy_register_sysctls(struct igen_softc *sc);
 
 /*
+ * igen_gt.c — iGPU render-engine ("GT") RE substrate.  Phase 1 only;
+ * gt_status sysctl takes forcewake on the render domain, dumps RCS +
+ * GuC state, and releases.  Phase 2+ adds execlist submission, GuC
+ * firmware load, first batch buffer.
+ */
+void	igen_gt_register_sysctls(struct igen_softc *sc);
+
+/*
  * igen_gtt.c — GTT introspection + RW helpers, 8 MiB scratch FB allocator,
  * per-FB GTT slot cache for ADDFB2 dumb buffers, persistent scanout
  * buffer (scanout_hold), animation kthread.  &igen_owned_fb_funcs is
