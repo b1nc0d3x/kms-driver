@@ -27,7 +27,12 @@ MALLOC_DEFINE(M_KMS, "kms", "DRM compatibility framework");
 static struct sx	kms_registry_lock;
 static TAILQ_HEAD(, drm_device) kms_devices =
     TAILQ_HEAD_INITIALIZER(kms_devices);
-static int		kms_next_minor = 0;
+/*
+ * kms_dev_register walks dri/cardN from 0 looking for the first free
+ * slot — no monotonic counter, so a kld unload/reload cycle that frees
+ * the prior minor will reuse it instead of skipping forward.  The
+ * registry lock serialises the search.
+ */
 
 int
 kms_dev_register(const struct drm_driver *driver, void *driver_priv,
@@ -68,13 +73,13 @@ kms_dev_register(const struct drm_driver *driver, void *driver_priv,
 	 * registrations don't both race on the same number.
 	 */
 	sx_xlock(&kms_registry_lock);
-	for (;;) {
-		if (kms_next_minor >= 256) {
+	for (int try = 0; ; try++) {
+		if (try >= 256) {
 			sx_xunlock(&kms_registry_lock);
 			kms_device_destroy(dev);
 			return (ENOSPC);
 		}
-		dev->minor = kms_next_minor++;
+		dev->minor = try;
 		error = make_dev_s(&args, &dev->cdev, "dri/card%d",
 		    dev->minor);
 		if (error == 0)
