@@ -60,6 +60,15 @@ struct drm_device {
 	char				 busid[32];
 	bool				 busid_set;
 	struct sysctl_ctx_list		 busid_sysctl_ctx;
+
+	/*
+	 * Monotonic magic-token counter for legacy DRM auth.  Bumped
+	 * by GET_MAGIC on first call for a drm_file; matched against
+	 * by AUTH_MAGIC across this device's open files.  No reuse —
+	 * cookies are 32 bits which is enough for the life of the
+	 * device and avoids the "two clients get the same magic" race.
+	 */
+	uint32_t			 next_magic;
 	u_int				 open_count;	/* live opens */
 	volatile u_int			 refs;		/* refcount(9) */
 	TAILQ_HEAD(, drm_file)		 files;

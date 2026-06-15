@@ -207,10 +207,47 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 	if (error != 0)
 		return (error);
 
-	if (kms_ioctl_trace > 0)
-		printf("kms: ioctl 0x%08lx file=%p pid=%d is_render=%d\n",
-		    cmd, file, curthread->td_proc->p_pid,
-		    file->is_render_node ? 1 : 0);
+	/*
+	 * Trace only the "rare and can-hang" ioctls.  Skipping high-frequency
+	 * read-side calls (GET_CAP, GETCRTC, GETPLANE, GETCONNECTOR,
+	 * OBJ_GETPROPERTIES, ...) keeps the dmesg trace per second in the
+	 * dozens instead of the thousands; the wedge-suspect ioctls are
+	 * one-per-frame at most.
+	 */
+	if (kms_ioctl_trace > 0) {
+		const char *name = NULL;
+
+		switch (cmd) {
+		case DRM_IOCTL_MODE_SETCRTC:
+			name = "MODE_SETCRTC"; break;
+		case DRM_IOCTL_MODE_PAGE_FLIP:
+			name = "MODE_PAGE_FLIP"; break;
+		case DRM_IOCTL_MODE_ATOMIC:
+			name = "MODE_ATOMIC"; break;
+		case DRM_IOCTL_WAIT_VBLANK:
+			name = "WAIT_VBLANK"; break;
+		case DRM_IOCTL_MODE_ADDFB2:
+			name = "MODE_ADDFB2"; break;
+		case DRM_IOCTL_MODE_RMFB:
+			name = "MODE_RMFB"; break;
+		case DRM_IOCTL_MODE_CREATE_DUMB:
+			name = "MODE_CREATE_DUMB"; break;
+		case DRM_IOCTL_MODE_DESTROY_DUMB:
+			name = "MODE_DESTROY_DUMB"; break;
+		case DRM_IOCTL_PRIME_HANDLE_TO_FD:
+			name = "PRIME_HANDLE_TO_FD"; break;
+		case DRM_IOCTL_PRIME_FD_TO_HANDLE:
+			name = "PRIME_FD_TO_HANDLE"; break;
+		case DRM_IOCTL_SET_MASTER:
+			name = "SET_MASTER"; break;
+		case DRM_IOCTL_DROP_MASTER:
+			name = "DROP_MASTER"; break;
+		}
+		if (name != NULL)
+			printf("kms: ioctl %s file=%p pid=%d is_render=%d\n",
+			    name, file, curthread->td_proc->p_pid,
+			    file->is_render_node ? 1 : 0);
+	}
 
 	/*
 	 * Render-node ioctl gate.  Per Linux DRM render-node ABI, opens of
@@ -266,6 +303,66 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 		 * port a second consumer.
 		 */
 		return (0);
+	case DRM_IOCTL_GET_MAGIC: {
+		/*
+		 * Legacy DRM auth.  A non-master client opens the cdev,
+		 * calls GET_MAGIC to receive a cookie, hands the cookie to
+		 * the master (Xorg, kwin_wayland) over a side channel.
+		 * The master then calls AUTH_MAGIC with that cookie which
+		 * marks the client's drm_file as authenticated, granting
+		 * access to ioctls gated on file->authenticated.
+		 *
+		 * Modern render-node clients bypass this entirely (the
+		 * render node is unauthenticated by design).  But kwin's
+		 * card-node path still issues GET/AUTH_MAGIC and logs
+		 * "Failed to authenticate the drm magic token" when we
+		 * return ENOTTY.  Stubbing out the pair makes that log
+		 * clean and unblocks any legacy DRI2 client that wanders
+		 * onto our card node.
+		 *
+		 * Magic 0 means "not yet assigned" — bump file->magic to
+		 * the device's next counter and hand it back.  Subsequent
+		 * GET_MAGIC calls on the same file return the same value
+		 * (idempotent per Linux behaviour).
+		 */
+		struct drm_auth *a = (struct drm_auth *)data;
+
+		if (file->magic == 0) {
+			sx_xlock(&file->dev->dev_lock);
+			file->magic = ++file->dev->next_magic;
+			sx_xunlock(&file->dev->dev_lock);
+		}
+		a->magic = file->magic;
+		return (0);
+	}
+	case DRM_IOCTL_AUTH_MAGIC: {
+		/*
+		 * Master-side: walk every drm_file open on this device
+		 * looking for one whose magic matches the cookie.  Mark
+		 * authenticated, return success.  Non-matching cookie =
+		 * EINVAL.  Master gate is loose — only the implicit
+		 * is_master opener is allowed to call this.
+		 */
+		struct drm_auth *a = (struct drm_auth *)data;
+		struct drm_file *peer;
+		int err = EINVAL;
+
+		if (!file->is_master)
+			return (EACCES);
+		if (a->magic == 0)
+			return (EINVAL);
+
+		sx_xlock(&file->dev->dev_lock);
+		TAILQ_FOREACH(peer, &file->dev->files, link) {
+			if (peer->magic == a->magic) {
+				peer->authenticated = true;
+				err = 0;
+				break;
+			}
+		}
+		sx_xunlock(&file->dev->dev_lock);
+		return (err);
+	}
 	case DRM_IOCTL_VERSION:
 		return (drm_ioctl_version(file, (struct drm_version *)data));
 	case DRM_IOCTL_GET_UNIQUE:
