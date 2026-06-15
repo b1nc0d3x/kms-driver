@@ -347,8 +347,22 @@ igen9_sysctl_wrpll_calc(SYSCTL_HANDLER_ARGS)
  * For HDMI WRPLL we always select 8.4 GHz central (CF=3): the VCO range
  * [8.4, 9.0] GHz brackets it and the solver targets the centre.
  */
-#define	WRPLL_CFGCR1(id)	(0x6c040u + ((id) - 2u) * 8u)
-#define	WRPLL_CFGCR2(id)	(0x6c044u + ((id) - 2u) * 8u)
+/*
+ * CFGCR addresses per i915 v4.19 i915_reg.h:
+ *   _DPLL1_CFGCR1 = 0x6C040    _DPLL1_CFGCR2 = 0x6C044   (DPLL1 / LCPLL2)
+ *   _DPLL2_CFGCR1 = 0x6C048    _DPLL2_CFGCR2 = 0x6C04C   (DPLL2 / WRPLL1)
+ *   _DPLL3_CFGCR1 = 0x6C050    _DPLL3_CFGCR2 = 0x6C054   (DPLL3 / WRPLL2)
+ *
+ * Note: these are NOT regularly spaced from the WRPLL ENABLE_REG at
+ * 0x46040 / 0x46060 -- they live in their own bank.  Earlier code had
+ * an off-by-one (using (id-2)*8 base 0x6c040) that pointed DPLL2 at
+ * DPLL1's CFGCR and vice versa, which is why "firmware-pre-programmed
+ * DPLL2" appeared to match -- those values were actually DPLL1's.
+ */
+#define	WRPLL_CFGCR1(id)	(0x6c040u + ((id) - 1u) * 8u)
+#define	WRPLL_CFGCR2(id)	(0x6c044u + ((id) - 1u) * 8u)
+#define	DPLL_STATUS		0x6c060u
+#define	DPLL_LOCK_AT(id)	(1u << ((id) * 8))
 
 #define	CFGCR1_FREQ_ENABLE	(1u << 31)
 #define	CFGCR2_QDIV_RATIO_SHIFT	8
@@ -609,7 +623,7 @@ static int
 igen9_sysctl_wrpll_enable(SYSCTL_HANDLER_ARGS)
 {
 	struct igen9_softc *sc = arg1;
-	uint32_t id, cfgcr1, ctrl1, enreg, en, lock;
+	uint32_t id, cfgcr1, ctrl1, enreg, en;
 	int i;
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
@@ -696,30 +710,41 @@ igen9_sysctl_wrpll_enable(SYSCTL_HANDLER_ARGS)
 	 * layout, to see if clearing the lower bits unblocks lock.
 	 */
 	if (!(en & WRPLL_ENABLE_BIT))
-		igen9_w32(sc, enreg, WRPLL_ENABLE_BIT);
+		igen9_w32(sc, enreg, en | WRPLL_ENABLE_BIT);
 	(void)igen9_r32(sc, enreg);	/* posting read */
 
-	/* Poll LOCK.  Generous 50 ms in case BSpec's 600 us is wrong. */
-	for (i = 0; i < 500; i++) {
-		lock = igen9_r32(sc, enreg);
-		if (lock & WRPLL_LOCK_BIT)
-			break;
-		DELAY(100);
-	}
-	device_printf(sc->dev,
-	    "wrpll DPLL%u: ENABLE_REG=0x%08x  LOCK=%d  after %d us\n",
-	    id, lock, !!(lock & WRPLL_LOCK_BIT), i * 100);
+	/*
+	 * Poll LOCK in DPLL_STATUS (0x6c060), bit (id*8).  i915 v4.19
+	 * skl_ddi_pll_enable uses intel_wait_for_register(DPLL_STATUS,
+	 * DPLL_LOCK(id), DPLL_LOCK(id), 5) -- 5 ms timeout.  Earlier code
+	 * was incorrectly polling bit 30 of the ENABLE_REG, which on SKL
+	 * is a reserved/RO bit for the WRPLLs; LOCK lives in a separate
+	 * status register.
+	 */
+	{
+		uint32_t status = 0;
+		uint32_t lock_bit = DPLL_LOCK_AT(id);
 
-	if (!(lock & WRPLL_LOCK_BIT)) {
-		/*
-		 * Critical: undo our ENABLE write so the silicon doesn't
-		 * sit in "enabled but unlocked" forever.
-		 */
-		uint32_t v = igen9_r32(sc, enreg);
-		igen9_w32(sc, enreg, v & ~WRPLL_ENABLE_BIT);
+		for (i = 0; i < 500; i++) {
+			status = igen9_r32(sc, DPLL_STATUS);
+			if (status & lock_bit)
+				break;
+			DELAY(100);
+		}
+		uint32_t enpost = igen9_r32(sc, enreg);
 		device_printf(sc->dev,
-		    "wrpll DPLL%u: FAILED to lock; ENABLE cleared\n", id);
-		return (EIO);
+		    "wrpll DPLL%u: ENABLE_REG=0x%08x  DPLL_STATUS=0x%08x"
+		    "  LOCK=%d  after %d us\n",
+		    id, enpost, status, !!(status & lock_bit), i * 100);
+
+		if (!(status & lock_bit)) {
+			uint32_t v = igen9_r32(sc, enreg);
+			igen9_w32(sc, enreg, v & ~WRPLL_ENABLE_BIT);
+			device_printf(sc->dev,
+			    "wrpll DPLL%u: FAILED to lock; ENABLE cleared\n",
+			    id);
+			return (EIO);
+		}
 	}
 	return (0);
 }
@@ -792,14 +817,19 @@ igen9_sysctl_wrpll_route(SYSCTL_HANDLER_ARGS)
 		return (EINVAL);
 	}
 
-	/* Refuse if the PLL isn't locked. */
+	/* Refuse if the PLL isn't locked.  LOCK lives in DPLL_STATUS. */
 	enreg = WRPLL_ENABLE_REG(id);
 	en = igen9_r32(sc, enreg);
-	if (!(en & WRPLL_LOCK_BIT)) {
-		device_printf(sc->dev,
-		    "wrpll_route: DPLL%u not locked (ENABLE_REG=0x%08x);"
-		    " run wrpll_enable first\n", id, en);
-		return (EAGAIN);
+	{
+		uint32_t status = igen9_r32(sc, DPLL_STATUS);
+
+		if (!(status & DPLL_LOCK_AT(id))) {
+			device_printf(sc->dev,
+			    "wrpll_route: DPLL%u not locked"
+			    " (ENABLE_REG=0x%08x DPLL_STATUS=0x%08x);"
+			    " run wrpll_enable first\n", id, en, status);
+			return (EAGAIN);
+		}
 	}
 
 	ctrl2 = igen9_r32(sc, DPLL_CTRL2);
