@@ -47,7 +47,9 @@ struct drm_device {
 	struct sx			 dev_lock;
 	const struct drm_driver		*driver;
 	struct cdev			*cdev;
+	struct cdev			*render_cdev;
 	int				 minor;
+	int				 render_minor;
 	u_int				 open_count;	/* live opens */
 	volatile u_int			 refs;		/* refcount(9) */
 	TAILQ_HEAD(, drm_file)		 files;

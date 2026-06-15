@@ -90,12 +90,58 @@ kms_dev_register(const struct drm_driver *driver, void *driver_priv,
 			return (error);
 		}
 	}
+	/*
+	 * Render node.  Linux numbers these as minor 128 + N so libdrm /
+	 * Mesa / GBM can find them at /dev/dri/renderD<128+N>.  Same cdevsw,
+	 * same si_drv1 (drm_device pointer), so kms_open ties opens of either
+	 * node to the same drm_device.  Without this, Mesa falls back to
+	 * opening /dev/dri/cardN multiple times for render allocation,
+	 * which produces multiple distinct drm_file structs whose event
+	 * queues don't share — page-flip events go to one fd, polls happen
+	 * on another, and Wayland compositors wedge on the first frame.
+	 *
+	 * Walk forward exactly the same way as cardN, but starting at 128.
+	 * No permission split yet: render node is 0660 / video group like
+	 * the card node.  Mesa's render-node-only ioctl restrictions
+	 * (no DRM_MASTER, no SET_VERSION) belong in a later commit when
+	 * we route ioctls per cdev.
+	 */
+	for (int try = 128; ; try++) {
+		if (try >= 256) {
+			TAILQ_INSERT_TAIL(&kms_devices, dev, link);
+			sx_xunlock(&kms_registry_lock);
+			printf("kms: registered /dev/dri/card%d driver=%s"
+			    " (no render node)\n", dev->minor, driver->name);
+			*out_dev = dev;
+			return (0);
+		}
+		dev->render_minor = try;
+		error = make_dev_s(&args, &dev->render_cdev,
+		    "dri/renderD%d", dev->render_minor);
+		if (error == 0)
+			break;
+		if (error != EEXIST) {
+			/*
+			 * Don't fail the whole registration — the card node
+			 * is already alive and KMS is usable, render node is
+			 * a Mesa convenience.  Continue without it.
+			 */
+			dev->render_cdev = NULL;
+			dev->render_minor = -1;
+			break;
+		}
+	}
+
 	TAILQ_INSERT_TAIL(&kms_devices, dev, link);
 	sx_xunlock(&kms_registry_lock);
 
 	*out_dev = dev;
-	printf("kms: registered /dev/dri/card%d driver=%s\n",
-	    dev->minor, driver->name);
+	if (dev->render_cdev != NULL)
+		printf("kms: registered /dev/dri/card%d + renderD%d driver=%s\n",
+		    dev->minor, dev->render_minor, driver->name);
+	else
+		printf("kms: registered /dev/dri/card%d driver=%s"
+		    " (render node unavailable)\n", dev->minor, driver->name);
 	return (0);
 }
 
@@ -149,6 +195,10 @@ kms_dev_unregister(struct drm_device *dev)
 	if (dev->cdev != NULL) {
 		destroy_dev(dev->cdev);
 		dev->cdev = NULL;
+	}
+	if (dev->render_cdev != NULL) {
+		destroy_dev(dev->render_cdev);
+		dev->render_cdev = NULL;
 	}
 	kms_device_release(dev);
 }
