@@ -8,6 +8,8 @@
 #include <sys/systm.h>
 #include <sys/conf.h>
 #include <sys/errno.h>
+#include <sys/proc.h>
+#include <sys/sysctl.h>
 
 #include <drm/drm.h>
 #include <kms/drm_device.h>
@@ -16,6 +18,22 @@
 #include <kms/drm_prime.h>
 
 #include "kms_internal.h"
+
+/*
+ * Per-ioctl trace knob.  When > 0, kms_ioctl prints "kms: ioctl 0xXXX
+ * file=PTR pid=N is_render=Y" at entry.  Single-line per call so it can
+ * be greppedmatched up with kdump output.  Default off to keep dmesg
+ * quiet on production paths.  Bump to debug compositor wedges:
+ *   sudo sysctl kern.kms.ioctl_trace=1
+ * Bumping it after a kwin hang lets the next interaction show the
+ * last ioctl before the freeze - the wedge sits right after the last
+ * traced line.
+ */
+static int kms_ioctl_trace = 0;
+SYSCTL_NODE(_kern, OID_AUTO, kms, CTLFLAG_RD, NULL, "KMS framework");
+SYSCTL_INT(_kern_kms, OID_AUTO, ioctl_trace, CTLFLAG_RWTUN,
+    &kms_ioctl_trace, 0,
+    "Print every DRM ioctl entry + return (0 off, 1 entry, 2 entry+exit)");
 
 /*
  * Copy a NUL-terminated kernel string out to a user buffer described
@@ -188,6 +206,11 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 	error = devfs_get_cdevpriv((void **)&file);
 	if (error != 0)
 		return (error);
+
+	if (kms_ioctl_trace > 0)
+		printf("kms: ioctl 0x%08lx file=%p pid=%d is_render=%d\n",
+		    cmd, file, curthread->td_proc->p_pid,
+		    file->is_render_node ? 1 : 0);
 
 	/*
 	 * Render-node ioctl gate.  Per Linux DRM render-node ABI, opens of
