@@ -19,6 +19,7 @@
 #include <sys/types.h>
 #include <sys/queue.h>
 #include <sys/sx.h>
+#include <sys/sysctl.h>
 
 #include <kms/drm_mode_config.h>
 
@@ -50,6 +51,15 @@ struct drm_device {
 	struct cdev			*render_cdev;
 	int				 minor;
 	int				 render_minor;
+
+	/*
+	 * libdrm-compatible bus-id storage, exposed via
+	 * hw.dri.<minor>.busid sysctl.  Populated by kms_set_busid_pci
+	 * from PCI drivers; NULL until then.  Owned by the framework.
+	 */
+	char				 busid[32];
+	bool				 busid_set;
+	struct sysctl_ctx_list		 busid_sysctl_ctx;
 	u_int				 open_count;	/* live opens */
 	volatile u_int			 refs;		/* refcount(9) */
 	TAILQ_HEAD(, drm_file)		 files;

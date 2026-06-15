@@ -44,4 +44,19 @@ int	kms_dev_register(const struct drm_driver *driver,
  */
 void	kms_dev_unregister(struct drm_device *dev);
 
+/*
+ * Register a PCI bus-id under hw.dri.<minor>.busid as a string
+ * "pci:DDDD:BB:SS.F".  libdrm's drmGetDeviceFromDevId path on
+ * FreeBSD reads this sysctl to map a dri/cardN device to a PCI
+ * vendor/device pair via drmParsePciDeviceInfo; without it,
+ * Wayland compositors (kwin, weston, plasma) cannot enumerate
+ * the GPU and wedge on their first frame.
+ *
+ * Call after kms_dev_register from a PCI-attached driver, before
+ * making the cdev visible to userspace.  String storage is owned
+ * by the framework and freed on kms_dev_unregister.
+ */
+void	kms_set_busid_pci(struct drm_device *dev, uint32_t domain,
+	    uint32_t bus, uint32_t slot, uint32_t func);
+
 #endif /* _KMS_DRM_DRV_H_ */

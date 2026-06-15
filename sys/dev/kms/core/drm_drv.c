@@ -13,12 +13,78 @@
 #include <sys/queue.h>
 #include <sys/refcount.h>
 #include <sys/sx.h>
+#include <sys/sysctl.h>
 
 #include <kms/drm_device.h>
 #include <kms/drm_drv.h>
 #include <kms/drm_mode_config.h>
 
 #include "kms_internal.h"
+
+/*
+ * Root hw.dri node.  Created on the first call to kms_set_busid_pci so
+ * we don't allocate sysctl state we never need.  Reference-counted —
+ * destroyed when the last drm_device with a busid is unregistered.
+ *
+ * libdrm's get_sysctl_pci_bus_info expects this exact layout:
+ *   hw.dri.<minor>.busid = "pci:DDDD:BB:SS.F"
+ */
+static struct sysctl_ctx_list	kms_hw_dri_ctx;
+static struct sysctl_oid	*kms_hw_dri_oid = NULL;
+static int			 kms_hw_dri_refs = 0;
+static struct sx		 kms_hw_dri_lock;
+
+static void
+kms_hw_dri_acquire(void)
+{
+	sx_xlock(&kms_hw_dri_lock);
+	if (kms_hw_dri_oid == NULL) {
+		sysctl_ctx_init(&kms_hw_dri_ctx);
+		kms_hw_dri_oid = SYSCTL_ADD_NODE(&kms_hw_dri_ctx,
+		    SYSCTL_STATIC_CHILDREN(_hw), OID_AUTO, "dri",
+		    CTLFLAG_RD, NULL, "DRI devices (libdrm compat)");
+	}
+	kms_hw_dri_refs++;
+	sx_xunlock(&kms_hw_dri_lock);
+}
+
+static void
+kms_hw_dri_release(void)
+{
+	sx_xlock(&kms_hw_dri_lock);
+	kms_hw_dri_refs--;
+	if (kms_hw_dri_refs == 0 && kms_hw_dri_oid != NULL) {
+		sysctl_ctx_free(&kms_hw_dri_ctx);
+		kms_hw_dri_oid = NULL;
+	}
+	sx_xunlock(&kms_hw_dri_lock);
+}
+
+void
+kms_set_busid_pci(struct drm_device *dev, uint32_t domain, uint32_t bus,
+    uint32_t slot, uint32_t func)
+{
+	struct sysctl_oid *card;
+	char card_name[8];
+
+	if (dev == NULL || dev->busid_set)
+		return;
+
+	snprintf(dev->busid, sizeof(dev->busid),
+	    "pci:%04x:%02x:%02x.%u", domain, bus, slot, func);
+
+	kms_hw_dri_acquire();
+
+	sysctl_ctx_init(&dev->busid_sysctl_ctx);
+	snprintf(card_name, sizeof(card_name), "%d", dev->minor);
+	card = SYSCTL_ADD_NODE(&dev->busid_sysctl_ctx,
+	    SYSCTL_CHILDREN(kms_hw_dri_oid), OID_AUTO, card_name,
+	    CTLFLAG_RD, NULL, "DRI card");
+	SYSCTL_ADD_STRING(&dev->busid_sysctl_ctx, SYSCTL_CHILDREN(card),
+	    OID_AUTO, "busid", CTLFLAG_RD, dev->busid, 0,
+	    "PCI bus-id for libdrm drmParsePciBusInfo()");
+	dev->busid_set = true;
+}
 
 static void	kms_device_destroy(struct drm_device *dev);
 
@@ -200,6 +266,11 @@ kms_dev_unregister(struct drm_device *dev)
 		destroy_dev(dev->render_cdev);
 		dev->render_cdev = NULL;
 	}
+	if (dev->busid_set) {
+		sysctl_ctx_free(&dev->busid_sysctl_ctx);
+		dev->busid_set = false;
+		kms_hw_dri_release();
+	}
 	kms_device_release(dev);
 }
 
@@ -209,6 +280,7 @@ kms_modevent(module_t mod __unused, int what, void *arg __unused)
 	switch (what) {
 	case MOD_LOAD:
 		sx_init(&kms_registry_lock, "kms_reg");
+		sx_init(&kms_hw_dri_lock, "kms_hwdri");
 		printf("kms: loaded\n");
 		return (0);
 	case MOD_UNLOAD:
@@ -219,6 +291,7 @@ kms_modevent(module_t mod __unused, int what, void *arg __unused)
 		}
 		sx_xunlock(&kms_registry_lock);
 		sx_destroy(&kms_registry_lock);
+		sx_destroy(&kms_hw_dri_lock);
 		printf("kms: unloaded\n");
 		return (0);
 	}

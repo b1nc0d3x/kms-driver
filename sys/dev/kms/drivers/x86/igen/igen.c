@@ -1603,6 +1603,16 @@ igen_attach(device_t dev)
 		return (error);
 	}
 
+	/*
+	 * Publish hw.dri.<minor>.busid so libdrm's drmGetDeviceFromDevId
+	 * can map our cdev back to a PCI domain/bus/slot/func.  Without
+	 * this, Wayland compositors fail "couldn't find dev node for drm
+	 * device" and wedge before issuing a single ioctl.
+	 */
+	kms_set_busid_pci(sc->drm_dev,
+	    pci_get_domain(dev), pci_get_bus(dev),
+	    pci_get_slot(dev), pci_get_function(dev));
+
 	/* Install atomic hooks before any object becomes reachable. */
 	sc->drm_dev->mode_config.funcs = &igen_mode_config_funcs;
 
