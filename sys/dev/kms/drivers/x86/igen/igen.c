@@ -1442,23 +1442,48 @@ igen_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 			continue;
 		}
 		igen_read_pipe_mode(sc, 0, &live);
+		/*
+		 * Loosened match: accept any mode whose visible size
+		 * (hdisplay x vdisplay) matches the live pipe's.  We
+		 * don't reprogram timing yet, but Wayland compositors
+		 * (kwin, weston) build their requested mode from EDID
+		 * detailed-timing blocks which routinely differ in
+		 * porch / sync widths from what firmware programmed.
+		 * Strict (htotal == htotal) match returns ENOTSUP →
+		 * kwin logs "Applying output configuration failed" →
+		 * the compositor never finishes setup, EGLImageKHR
+		 * allocations fail with BAD_ALLOC, the session collapses.
+		 *
+		 * Accepting size-only matches is safe because the pipe
+		 * is already scanning live timing that produces those
+		 * visible dimensions.  When DPLL1 + transcoder
+		 * reprogramming lands (Phase 3 of the cold-modeset work
+		 * tracked in BASELINE.txt), this check tightens back up.
+		 */
 		if (cs->mode.hdisplay != live.hdisplay ||
-		    cs->mode.vdisplay != live.vdisplay ||
-		    cs->mode.htotal != live.htotal ||
-		    cs->mode.vtotal != live.vtotal) {
+		    cs->mode.vdisplay != live.vdisplay) {
 			device_printf(sc->dev,
-			    "atomic_commit: requested %ux%u (htotal=%u vtotal=%u)"
-			    " != live %ux%u (htotal=%u vtotal=%u);"
+			    "atomic_commit: requested %ux%u != live %ux%u;"
 			    " full modeset not yet implemented\n",
 			    cs->mode.hdisplay, cs->mode.vdisplay,
-			    cs->mode.htotal, cs->mode.vtotal,
-			    live.hdisplay, live.vdisplay,
-			    live.htotal, live.vtotal);
+			    live.hdisplay, live.vdisplay);
 			return (ENOTSUP);
 		}
-		DPRINTF(sc, 1,
-		    "atomic_commit: pipe %u — requested matches live"
-		    " %ux%u  (no-op)\n", i, live.hdisplay, live.vdisplay);
+		if (cs->mode.htotal != live.htotal ||
+		    cs->mode.vtotal != live.vtotal) {
+			DPRINTF(sc, 1,
+			    "atomic_commit: pipe %u size %ux%u matches live;"
+			    " timing differs (req htotal=%u vtotal=%u,"
+			    " live htotal=%u vtotal=%u) — accepting no-op\n",
+			    i, cs->mode.hdisplay, cs->mode.vdisplay,
+			    cs->mode.htotal, cs->mode.vtotal,
+			    live.htotal, live.vtotal);
+		} else {
+			DPRINTF(sc, 1,
+			    "atomic_commit: pipe %u — requested matches live"
+			    " %ux%u  (no-op)\n", i,
+			    live.hdisplay, live.vdisplay);
+		}
 	}
 
 	/*
