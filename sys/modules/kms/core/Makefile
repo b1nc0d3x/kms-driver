@@ -24,7 +24,8 @@ SRCS=	drm_atomic.c \
 	drm_modes.c \
 	drm_modeset.c \
 	drm_plane.c \
-	drm_property.c
+	drm_property.c \
+	vnode_if.h
 
 CFLAGS+=	-I${SRCTOP}/sys/dev/kms/include
 CFLAGS+=	-I${SRCTOP}/sys/dev/kms/uapi

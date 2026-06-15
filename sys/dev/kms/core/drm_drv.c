@@ -7,19 +7,132 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/conf.h>
+#include <sys/fcntl.h>
 #include <sys/kernel.h>
 #include <sys/malloc.h>
 #include <sys/module.h>
+#include <sys/namei.h>
+#include <sys/proc.h>
 #include <sys/queue.h>
 #include <sys/refcount.h>
 #include <sys/sx.h>
 #include <sys/sysctl.h>
+#include <sys/vnode.h>
+
+SYSCTL_DECL(_kern_kms);
 
 #include <kms/drm_device.h>
 #include <kms/drm_drv.h>
 #include <kms/drm_mode_config.h>
 
 #include "kms_internal.h"
+
+/*
+ * Built-in seat-management - kms equivalent of seatd / consolekit2.
+ *
+ * Wayland compositors (kwin_wayland, weston, sway) need read access to
+ * the input event device nodes to see mouse, keyboard, touchpad events.
+ * Default FreeBSD perms on those nodes are 0600 root:wheel.  On Linux, logind
+ * / seatd hands them to the active session user; on FreeBSD without an
+ * external seat manager, every Wayland compositor wedges silently with
+ * no input - that exact pattern we just debugged on fbsdx86.
+ *
+ * Rather than require the user to install graphics/seatd from ports and
+ * keep a daemon running, we take a built-in approach: when the first
+ * drm_device is registered (signaling someone is doing graphics), walk
+ * the input event nodes and relax permissions to 0660 root:video.
+ * Admin users are typically in the video group already (they need it
+ * for the dri cdev anyway); this lets them read input.  When the last
+ * drm_device unregisters, restore to 0600 root:wheel.
+ *
+ * Gated by kern.kms.input_passthrough (default 1).  Set to 0 to opt
+ * out and use external seat management.
+ */
+static int kms_input_passthrough = 1;
+SYSCTL_INT(_kern_kms, OID_AUTO, input_passthrough, CTLFLAG_RWTUN,
+    &kms_input_passthrough, 0,
+    "Relax /dev/input/event* to 0660 root:video while a DRM device is"
+    " live (built-in seat replacement; default 1 = on)");
+
+#define	KMS_INPUT_MAX	32	/* event0 .. event31 */
+#define	KMS_GID_VIDEO	44	/* matches FreeBSD's wheel-44 video gid */
+
+static int kms_input_grants_active = 0;
+static struct sx kms_input_lock;
+
+/*
+ * Open one /dev/input/eventN node and chmod/chgrp it.  Returns 0 if
+ * the node didn't exist (silent skip) or on success; errno on failure.
+ * Caller holds kms_input_lock.
+ */
+static int
+kms_input_relax_one(int n, mode_t mode, gid_t gid)
+{
+	char path[32];
+	struct nameidata nd;
+	struct vattr va;
+	int error;
+
+	snprintf(path, sizeof(path), "/dev/input/event%d", n);
+	NDINIT(&nd, LOOKUP, FOLLOW | LOCKLEAF, UIO_SYSSPACE, path);
+	error = namei(&nd);
+	if (error != 0) {
+		/* Not present — totally fine; not every box has 32 inputs. */
+		return (0);
+	}
+
+	VATTR_NULL(&va);
+	va.va_mode = mode;
+	va.va_gid = gid;
+	error = VOP_SETATTR(nd.ni_vp, &va, curthread->td_ucred);
+	VOP_UNLOCK(nd.ni_vp);
+	NDFREE_PNBUF(&nd);
+	vrele(nd.ni_vp);
+	return (error);
+}
+
+static void
+kms_input_grant(void)
+{
+	int n, granted = 0;
+
+	if (!kms_input_passthrough)
+		return;
+
+	sx_xlock(&kms_input_lock);
+	if (kms_input_grants_active++ > 0) {
+		sx_xunlock(&kms_input_lock);
+		return;
+	}
+	for (n = 0; n < KMS_INPUT_MAX; n++) {
+		if (kms_input_relax_one(n, 0660, KMS_GID_VIDEO) == 0)
+			granted++;
+	}
+	sx_xunlock(&kms_input_lock);
+	printf("kms: input passthrough on - relaxed up to %d /dev/input/event*"
+	    " nodes to 0660 root:video\n", granted);
+}
+
+static void
+kms_input_revoke(void)
+{
+	int n;
+
+	if (!kms_input_passthrough)
+		return;
+
+	sx_xlock(&kms_input_lock);
+	if (--kms_input_grants_active > 0) {
+		sx_xunlock(&kms_input_lock);
+		return;
+	}
+	for (n = 0; n < KMS_INPUT_MAX; n++) {
+		(void)kms_input_relax_one(n, 0600, 0 /* wheel */);
+	}
+	sx_xunlock(&kms_input_lock);
+	printf("kms: input passthrough off - restored /dev/input/event* to"
+	    " 0600 root:wheel\n");
+}
 
 /*
  * Root hw.dri node.  Created on the first call to kms_set_busid_pci so
@@ -201,6 +314,13 @@ kms_dev_register(const struct drm_driver *driver, void *driver_priv,
 	TAILQ_INSERT_TAIL(&kms_devices, dev, link);
 	sx_xunlock(&kms_registry_lock);
 
+	/*
+	 * Relax /dev/input/event* perms so a userspace Wayland compositor
+	 * can read mouse/keyboard.  Idempotent + refcounted across multi-
+	 * card registrations.
+	 */
+	kms_input_grant();
+
 	*out_dev = dev;
 	if (dev->render_cdev != NULL)
 		printf("kms: registered /dev/dri/card%d + renderD%d driver=%s\n",
@@ -271,6 +391,7 @@ kms_dev_unregister(struct drm_device *dev)
 		dev->busid_set = false;
 		kms_hw_dri_release();
 	}
+	kms_input_revoke();
 	kms_device_release(dev);
 }
 
@@ -281,6 +402,7 @@ kms_modevent(module_t mod __unused, int what, void *arg __unused)
 	case MOD_LOAD:
 		sx_init(&kms_registry_lock, "kms_reg");
 		sx_init(&kms_hw_dri_lock, "kms_hwdri");
+		sx_init(&kms_input_lock, "kms_input");
 		printf("kms: loaded\n");
 		return (0);
 	case MOD_UNLOAD:
@@ -292,6 +414,7 @@ kms_modevent(module_t mod __unused, int what, void *arg __unused)
 		sx_xunlock(&kms_registry_lock);
 		sx_destroy(&kms_registry_lock);
 		sx_destroy(&kms_hw_dri_lock);
+		sx_destroy(&kms_input_lock);
 		printf("kms: unloaded\n");
 		return (0);
 	}
