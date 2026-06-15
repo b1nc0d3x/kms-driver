@@ -2036,13 +2036,49 @@ static const struct drm_driver igen9_driver = {
  * userspace-allocated dumb buffers requires GTT mapping of the BO pages,
  * which is the next mile.
  */
+/*
+ * Map the user-allocated dumb buffer into the GTT and arm PLANE_SURF /
+ * PLANE_STRIDE to scan from it.  Called from both set_config and
+ * page_flip.  The GTT slot allocator (igen9_gtt_bind_user_fb) caches
+ * per-fb mappings so repeated arming of the same fb is cheap.
+ */
+static void
+igen9_arm_scanout(struct igen9_softc *sc, struct drm_framebuffer *fb)
+{
+	uint32_t surf;
+	uint32_t stride;
+
+	if (fb == NULL)
+		return;
+
+	surf = igen9_gtt_bind_user_fb(sc, fb);
+	if (surf == 0) {
+		device_printf(sc->dev,
+		    "arm_scanout: gtt_bind failed for fb %u (%ux%u, pitch=%u)\n",
+		    fb->base.id, fb->width, fb->height, fb->pitches[0]);
+		return;
+	}
+
+	/* PLANE_STRIDE encodes bytes-per-row / 64. */
+	stride = fb->pitches[0] / 64;
+	igen9_w32(sc, PLANE_STRIDE(0), stride);
+	igen9_w32(sc, PLANE_SURF(0), surf);
+	DPRINTF(sc, 1,
+	    "arm_scanout: fb %u (%ux%u pitch=%u) -> PLANE_SURF=0x%08x"
+	    " STRIDE=%u\n",
+	    fb->base.id, fb->width, fb->height, fb->pitches[0],
+	    surf, stride);
+}
+
 static int
 igen9_legacy_set_config(struct drm_mode_set *set)
 {
 	struct drm_crtc *crtc;
+	struct igen9_softc *sc;
 
 	if (set == NULL || (crtc = set->crtc) == NULL)
 		return (EINVAL);
+	sc = crtc->dev->driver_priv;
 
 	if (set->mode == NULL) {
 		crtc->mode_valid = 0;
@@ -2057,6 +2093,8 @@ igen9_legacy_set_config(struct drm_mode_set *set)
 	crtc->primary_fb = set->fb;
 	crtc->x = set->x;
 	crtc->y = set->y;
+
+	igen9_arm_scanout(sc, set->fb);
 	return (0);
 }
 
@@ -2064,9 +2102,13 @@ static int
 igen9_legacy_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
     uint32_t flags __unused, uint64_t user_data __unused)
 {
+	struct igen9_softc *sc;
+
 	if (crtc == NULL)
 		return (EINVAL);
+	sc = crtc->dev->driver_priv;
 	crtc->primary_fb = fb;
+	igen9_arm_scanout(sc, fb);
 	return (0);
 }
 
