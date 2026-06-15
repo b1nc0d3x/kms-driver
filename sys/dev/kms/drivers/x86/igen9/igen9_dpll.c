@@ -883,6 +883,183 @@ igen9_sysctl_wrpll_force_clear(SYSCTL_HANDLER_ARGS)
 	return (0);
 }
 
+/* --------------------------- mode_change preset --------------------------- */
+
+/*
+ * Three CEA-VIC preset modes encoded as direct transcoder timing values.
+ * The encoding for each register is (end-1) << 16 | (start-1) per BSpec
+ * "Display Timings".  HTOTAL/VTOTAL describe blanking boundaries identical
+ * to HBLANK/VBLANK on most CEA modes.  HSYNC/VSYNC fields encode the sync
+ * pulse window inside the blanking region.
+ */
+struct igen9_mode_preset {
+	const char	*name;
+	uint32_t	pixel_khz;
+	uint32_t	htotal, hblank, hsync;
+	uint32_t	vtotal, vblank, vsync;
+	uint16_t	h_active, v_active;
+};
+
+static const struct igen9_mode_preset igen9_mode_presets[] = {
+	{ "1080p60", 148500,
+	  0x0897077fu, 0x0897077fu, 0x080307d7u,
+	  0x04640437u, 0x04640437u, 0x043e0439u,
+	  1920, 1080 },
+	{ "720p60",   74250,
+	  0x067104ffu, 0x067104ffu, 0x0596056du,
+	  0x02ed02cfu, 0x02ed02cfu, 0x02d902d4u,
+	  1280,  720 },
+	{ "480p60",   25175,
+	  0x031f027fu, 0x031f027fu, 0x02ef028fu,
+	  0x020c01dfu, 0x020c01dfu, 0x01eb01e9u,
+	   640,  480 },
+};
+
+/*
+ * Pipe / plane / DDI register subset needed for the mode change.  Duplicated
+ * locally from igen9.c so the file is self-contained; if these ever drift,
+ * factor them into igen9_internal.h.
+ */
+#define	IG9_TRANS_HTOTAL(t)	(0x60000u + (t) * 0x1000u)
+#define	IG9_TRANS_HBLANK(t)	(0x60004u + (t) * 0x1000u)
+#define	IG9_TRANS_HSYNC(t)	(0x60008u + (t) * 0x1000u)
+#define	IG9_TRANS_VTOTAL(t)	(0x6000cu + (t) * 0x1000u)
+#define	IG9_TRANS_VBLANK(t)	(0x60010u + (t) * 0x1000u)
+#define	IG9_TRANS_VSYNC(t)	(0x60014u + (t) * 0x1000u)
+#define	IG9_PIPE_SRCSZ(p)	(0x7001cu + (p) * 0x1000u)
+#define	IG9_PIPE_CONF(p)	(0x70008u + (p) * 0x1000u)
+#define	IG9_PIPE_CONF_ENABLE	(1u << 31)
+#define	IG9_PIPE_CONF_STATE	(1u << 30)	/* RO; 1 = scanning */
+#define	IG9_PLANE_SIZE(p)	(0x70190u + (p) * 0x1000u)
+
+static int
+igen9_sysctl_mode_change(SYSCTL_HANDLER_ARGS)
+{
+	struct igen9_softc *sc = arg1;
+	int idx = -1;
+	int error = sysctl_handle_int(oidp, &idx, 0, req);
+	const struct igen9_mode_preset *m;
+	uint32_t pre_conf, post_conf;
+	int i;
+
+	if (error || req->newptr == NULL)
+		return (error);
+	if (idx < 0 || (size_t)idx >= nitems(igen9_mode_presets)) {
+		device_printf(sc->dev,
+		    "mode_change: index must be 0..%zu (0=1080p60, 1=720p60,"
+		    " 2=480p60)\n", nitems(igen9_mode_presets) - 1);
+		return (EINVAL);
+	}
+	m = &igen9_mode_presets[idx];
+
+	device_printf(sc->dev,
+	    "mode_change: switching to %s (%u kHz, %ux%u) on pipe A\n",
+	    m->name, m->pixel_khz, m->h_active, m->v_active);
+
+	/* 1) Disable pipe A; wait for scan-stop. */
+	pre_conf = igen9_r32(sc, IG9_PIPE_CONF(0));
+	igen9_w32(sc, IG9_PIPE_CONF(0), pre_conf & ~IG9_PIPE_CONF_ENABLE);
+	for (i = 0; i < 200; i++) {
+		if ((igen9_r32(sc, IG9_PIPE_CONF(0)) &
+		    IG9_PIPE_CONF_STATE) == 0)
+			break;
+		DELAY(100);
+	}
+	device_printf(sc->dev,
+	    "mode_change: pipe A disabled (PIPE_CONF was 0x%08x; off after %d us)\n",
+	    pre_conf, i * 100);
+
+	/*
+	 * 2) Reprogram DPLL2 for the new pixel clock.  Disable + program +
+	 *    enable + lock.  This is the same sequence wrpll_program /
+	 *    wrpll_enable run, but inlined so we don't have to detour
+	 *    through the sysctl handlers (which require the dpll_id +
+	 *    target_khz softc fields).
+	 */
+	{
+		uint8_t p0, p1, p2;
+		uint16_t dco_int, dco_frac;
+		uint64_t vco;
+		uint32_t cfgcr1_val, cfgcr2_val, en, ctrl1, status;
+		uint32_t enreg = WRPLL_ENABLE_REG(2);
+		uint32_t lock_bit = DPLL_LOCK_AT(2);
+
+		if (!igen9_wrpll_solve(m->pixel_khz, &p0, &p1, &p2,
+		    &dco_int, &dco_frac, &vco)) {
+			device_printf(sc->dev,
+			    "mode_change: no WRPLL solution for %u kHz\n",
+			    m->pixel_khz);
+			return (EINVAL);
+		}
+		cfgcr1_val = igen9_wrpll_encode_cfgcr1(dco_int, dco_frac);
+		if (!igen9_wrpll_encode_cfgcr2(p0, p1, p2, vco, &cfgcr2_val)) {
+			device_printf(sc->dev,
+			    "mode_change: encode_cfgcr2 failed\n");
+			return (EINVAL);
+		}
+
+		en = igen9_r32(sc, enreg);
+		igen9_w32(sc, enreg, en & ~WRPLL_ENABLE_BIT);
+		DELAY(10);
+		igen9_w32(sc, WRPLL_CFGCR1(2), cfgcr1_val);
+		igen9_w32(sc, WRPLL_CFGCR2(2), cfgcr2_val);
+		(void)igen9_r32(sc, WRPLL_CFGCR2(2));
+
+		ctrl1 = igen9_r32(sc, DPLL_CTRL1);
+		ctrl1 = (ctrl1 & ~(0x3fu << (2 * 6))) |
+		    CTRL1_OVERRIDE(2) | CTRL1_HDMI_MODE(2);
+		igen9_w32(sc, DPLL_CTRL1, ctrl1);
+		(void)igen9_r32(sc, DPLL_CTRL1);
+
+		igen9_w32(sc, enreg, WRPLL_ENABLE_BIT);
+		(void)igen9_r32(sc, enreg);
+
+		for (i = 0; i < 500; i++) {
+			status = igen9_r32(sc, DPLL_STATUS);
+			if (status & lock_bit)
+				break;
+			DELAY(100);
+		}
+		device_printf(sc->dev,
+		    "mode_change: DPLL2 CFGCR1=0x%08x CFGCR2=0x%08x"
+		    "  STATUS=0x%08x  LOCK=%d after %d us\n",
+		    cfgcr1_val, cfgcr2_val, status,
+		    !!(status & lock_bit), i * 100);
+		if (!(status & lock_bit)) {
+			igen9_w32(sc, enreg, 0);
+			device_printf(sc->dev,
+			    "mode_change: DPLL2 failed to lock; aborting\n");
+			return (EIO);
+		}
+	}
+
+	/* 3) Write new transcoder timing. */
+	igen9_w32(sc, IG9_TRANS_HTOTAL(0), m->htotal);
+	igen9_w32(sc, IG9_TRANS_HBLANK(0), m->hblank);
+	igen9_w32(sc, IG9_TRANS_HSYNC(0),  m->hsync);
+	igen9_w32(sc, IG9_TRANS_VTOTAL(0), m->vtotal);
+	igen9_w32(sc, IG9_TRANS_VBLANK(0), m->vblank);
+	igen9_w32(sc, IG9_TRANS_VSYNC(0),  m->vsync);
+	igen9_w32(sc, IG9_PIPE_SRCSZ(0),
+	    ((uint32_t)(m->h_active - 1) << 16) | (m->v_active - 1));
+	igen9_w32(sc, IG9_PLANE_SIZE(0),
+	    ((uint32_t)(m->v_active - 1) << 16) | (m->h_active - 1));
+
+	/* 4) Re-enable pipe. */
+	igen9_w32(sc, IG9_PIPE_CONF(0), IG9_PIPE_CONF_ENABLE);
+	for (i = 0; i < 200; i++) {
+		if (igen9_r32(sc, IG9_PIPE_CONF(0)) & IG9_PIPE_CONF_STATE)
+			break;
+		DELAY(100);
+	}
+	post_conf = igen9_r32(sc, IG9_PIPE_CONF(0));
+	device_printf(sc->dev,
+	    "mode_change: pipe A re-enabled (PIPE_CONF=0x%08x; on after %d us)\n",
+	    post_conf, i * 100);
+
+	return (0);
+}
+
 /*
  * Request PW1 (display PLL power well, idx=1 in HSW_PWR_WELL_CTL2).
  * PW1 powers the analog domain for DPLL2/DPLL3 (the WRPLLs).  Firmware
@@ -1326,6 +1503,11 @@ igen9_dpll_register_sysctls(struct igen9_softc *sc)
 	    "write 1 to request PW1 (display PLL power well); required"
 	    " for DPLL2/3 enable.  Firmware leaves it down because it"
 	    " drives the live link from DPLL0/LCPLL1.");
+	SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "mode_change",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, igen9_sysctl_mode_change, "I",
+	    "write preset idx (0=1080p60 1=720p60 2=480p60) to disable pipe,"
+	    " reprogram DPLL2, rewrite transcoder timing, re-enable pipe");
 
 	SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "try_pipe_resume",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
