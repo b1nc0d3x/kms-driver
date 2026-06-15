@@ -3,6 +3,7 @@
 KMOD=	igen9
 
 SRCS=	igen9.c \
+	igen9_dpll.c \
 	bus_if.h device_if.h pci_if.h \
 	opt_platform.h
 
