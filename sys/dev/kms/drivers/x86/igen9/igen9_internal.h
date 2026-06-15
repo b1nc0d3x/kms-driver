@@ -182,4 +182,16 @@ void	igen9_dpll_register_sysctls(struct igen9_softc *sc);
 /* Polled vblank wait — used by atomic_commit before PLANE_SURF write. */
 void	igen9_wait_vblank(struct igen9_softc *sc, int pipe);
 
+/*
+ * igen9_gmbus.c — PCH GMBus driver and the edid_read_b sysctl.  EDID
+ * acquisition happens here; the parse + drm_display_mode build lives
+ * in igen9.c's connector attach path.
+ */
+#define	GMBUS_PIN_DDI_B		5	/* SKL+ canonical pin map: DDI_B */
+#define	EDID_SLAVE		0x50
+
+int	igen9_gmbus_read_block(struct igen9_softc *sc, uint32_t pin,
+	    uint8_t slave, uint8_t offset, uint8_t *buf, size_t len);
+void	igen9_gmbus_register_sysctls(struct igen9_softc *sc);
+
 #endif /* _IGEN9_INTERNAL_H_ */
