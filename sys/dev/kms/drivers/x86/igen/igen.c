@@ -151,7 +151,16 @@ static const struct igen_range igen_ranges[] = {
 	{ 0x00044000, 0x00044100, "INT/HOTPLUG" },
 	{ 0x00045000, 0x000455ff, "PWR/DC_STATE" },
 	{ 0x00046000, 0x000460ff, "CDCLK/DPLL_CTRL" },
-	{ 0x0006c000, 0x0006cfff, "PHY_BC + DPLL_CFGCR/STATUS" },
+	/*
+	 * Only the low 256 bytes here.  The PHY_BC analog channel at
+	 * 0x6c100..0x6cfff cannot be read while pipe A is doing live HDMI
+	 * scanout-to-DDI_B without stalling the display-engine bus and
+	 * wedging the iGPU.  snapshot_save fires from attach() at boot
+	 * while firmware's pipe A is still live, so we keep this range
+	 * narrow.  The deeper PHY scan is exposed via phy_scan_bc (gated
+	 * on PIPE_CONF ENABLE) for one-shot RE captures.
+	 */
+	{ 0x0006c000, 0x0006c0ff, "DPLL_CFGCR/STATUS/CTRL" },
 	{ 0x00060000, 0x000613ff, "TRANS_A/B/C/EDP" },
 	{ 0x00064000, 0x000643ff, "DDI_BUF_A/B/C/D/E" },
 	{ 0x00068000, 0x000683ff, "TRANS_DDI_FUNC_CTL" },
