@@ -59,10 +59,10 @@ MALLOC_DECLARE(M_KMS);
  * without trampling each other.
  */
 #define	FORCEWAKE_RENDER_GEN9		0x0000a188
-#define	FORCEWAKE_RENDER_GEN9_ACK	0x0013d84
+#define	FORCEWAKE_RENDER_GEN9_ACK	0x00000d84
 #define	FORCEWAKE_MEDIA_GEN9		0x0000a270
-#define	FORCEWAKE_MEDIA_GEN9_ACK	0x0000d88
-#define	FORCEWAKE_BLITTER_GEN9		0x0000a188
+#define	FORCEWAKE_MEDIA_GEN9_ACK	0x00000d88
+#define	FORCEWAKE_BLITTER_GEN9		0x0000a188	/* shared with render */
 #define	  FW_REQ_SET(bit)		(((1u << (bit)) << 16) | (1u << (bit)))
 #define	  FW_REQ_CLR(bit)		((1u << (bit)) << 16)
 
@@ -259,7 +259,7 @@ igen_sysctl_gt_status(SYSCTL_HANDLER_ARGS)
 #define	IGT_RCS_RING_PAGES		2
 #define	IGT_GTT_FIRST_RCS_LRC		(IGT_GTT_FIRST_RCS_RING + \
 					    IGT_RCS_RING_PAGES)
-#define	IGT_RCS_LRC_PAGES		1
+#define	IGT_RCS_LRC_PAGES		IGT_LRC_TOTAL_PAGES
 
 /*
  * Context descriptor field layout for gen 9 (i915 v4.19 intel_lrc.h):
@@ -291,56 +291,141 @@ igen_gt_context_desc(uint64_t lrca_ggtt)
 #define	MI_NOOP				0x00000000u
 #define	MI_BATCH_BUFFER_END		0x05000000u
 #define	MI_LOAD_REGISTER_IMM(n)		(0x11000000u | (2u * (n) - 1))
+#define	MI_LRI_FORCE_POSTED		(1u << 12)
 
 /*
- * Compose the minimum-viable LRC for RCS on gen 9.  The "default LRC"
- * i915 ships is ~1 KiB of register save image starting at offset 0x150
- * (after a fixed header), but for our first execution we can get away
- * with a much shorter image that only sets RING_CTL / RING_HEAD /
- * RING_TAIL / RING_START / BB_HEAD / BB_TAIL.  The engine reads from
- * RING_START + RING_HEAD and executes until HEAD == TAIL, so as long
- * as those four registers carry sane values the rest defaults to zero
- * and the engine completes the no-op batch.
+ * Engine-local register offsets used inside the LRC LRI sequence.
+ * The engine adds RING_BASE_RCS (0x2000) to each on restore.
+ * Sourced from i915 v4.19 intel_lrc.c populate_lr_context.
+ */
+#define	RCS_CONTEXT_CONTROL		0x244
+#define	RCS_RING_TAIL_LOC		0x30
+#define	RCS_RING_HEAD_LOC		0x34
+#define	RCS_RING_START_LOC		0x38
+#define	RCS_RING_CTL_LOC		0x3c
+#define	RCS_BB_HEAD_U			0x168
+#define	RCS_BB_HEAD_L			0x140
+#define	RCS_BB_STATE			0x110
+#define	RCS_SBB_HEAD_U			0x16c
+#define	RCS_SBB_HEAD_L			0x144
+#define	RCS_SBB_STATE			0x114
+#define	RCS_INDIRECT_CTX		0x1bc
+#define	RCS_INDIRECT_CTX_OFFSET		0x1c8
+#define	RCS_BB_PER_CTX_PTR		0x1c0
+#define	RCS_CTX_TIMESTAMP		0x3a8
+#define	RCS_PDP_LDW(n)			(0x270 + (n) * 8)
+#define	RCS_PDP_UDW(n)			(0x270 + (n) * 8 + 4)
+#define	RCS_R_PWR_CLK_STATE		0x0c8
+
+/*
+ * CONTEXT_CONTROL value per i915 v4.19:
+ *   _MASKED_BIT_DISABLE(CTX_CTRL_ENGINE_CTX_RESTORE_INHIBIT |
+ *                      CTX_CTRL_ENGINE_CTX_SAVE_INHIBIT) |
+ *   _MASKED_BIT_ENABLE (CTX_CTRL_INHIBIT_SYN_CTX_SWITCH |
+ *                      CTX_CTRL_RS_CTX_ENABLE)
+ * Resolves to 0x401800C8.
+ */
+#define	RCS_CONTEXT_CONTROL_VALUE	0x401800c8u
+#define	RING_BB_PPGTT			(1u << 5)	/* RCS_BB_STATE bit */
+#define	RING_VALID			0x1u
+
+/* LRC layout — page 0 is reserved header, page 1+ is register state. */
+#define	IGT_LRC_HEADER_PAGES		1
+#define	IGT_LRC_STATE_PAGES		1
+#define	IGT_LRC_TOTAL_PAGES		(IGT_LRC_HEADER_PAGES + \
+					    IGT_LRC_STATE_PAGES + 2)
+#define	IGT_LRC_STATE_OFFSET		(IGT_LRC_HEADER_PAGES * PAGE_SIZE)
+
+/*
+ * Compose the canonical SKL/KBL RCS Logical Ring Context image.
  *
- * `ring_tail` is the byte offset into the ring that the engine should
- * stop at — set to the length of the batch we wrote at ring[0].  With
- * HEAD=0 and TAIL=ring_tail the engine reads exactly that many bytes.
- * `ring_len_bytes` is the total ring size (must be a multiple of
- * PAGE_SIZE and >= 2*PAGE_SIZE per BSpec — single-page rings are
- * technically allowed but i915 refuses them in practice because the
- * LENGTH field in RING_CTL encodes (pages - 1) so a 1-page ring
- * collides with the "ring disabled" encoding).
+ * The LRC is laid out as:
+ *   page 0 (offset 0x0000)        : engine header (DMA scratch — zero)
+ *   page 1 (offset 0x1000)        : register state image (this routine)
+ *   page 2+                       : URB / scratch / per-process state
+ *                                   (zero is fine for a pure-MI no-op)
  *
- * Returns the byte length written.  Caller owns the buffer.
+ * Three back-to-back MI_LOAD_REGISTER_IMM blocks make up the state
+ * image.  Offsets in the LRI are engine-local — engine adds
+ * RING_BASE_RCS at restore time.
+ *
+ * See docs/skl_kbl_rcs_lrc_layout.md for the BSpec-derived reference.
+ *
+ * `lrc_base` is the start of the LRC buffer (offset 0).  The register
+ * image starts at lrc_base + IGT_LRC_STATE_OFFSET = 0x1000.
+ *
+ * Returns the byte length of the register image (i.e. the number of
+ * bytes after IGT_LRC_STATE_OFFSET that this routine populated).
  */
 static size_t
-igen_gt_compose_lrc(uint32_t *lrc, uint32_t ring_ggtt, uint32_t ring_len_bytes,
-    uint32_t ring_tail)
+igen_gt_compose_lrc(uint8_t *lrc_base, uint32_t ring_ggtt,
+    uint32_t ring_len_bytes, uint32_t ring_tail)
 {
-	uint32_t *p = lrc;
+	uint32_t *p = (uint32_t *)(lrc_base + IGT_LRC_STATE_OFFSET);
+	uint32_t *start = p;
+
+	/* LRI Header 0: 14 register pairs. */
+	*p++ = MI_LOAD_REGISTER_IMM(14) | MI_LRI_FORCE_POSTED;
+	*p++ = RCS_CONTEXT_CONTROL;
+	*p++ = RCS_CONTEXT_CONTROL_VALUE;
+	*p++ = RCS_RING_HEAD_LOC;
+	*p++ = 0;
+	*p++ = RCS_RING_TAIL_LOC;
+	*p++ = ring_tail;
+	*p++ = RCS_RING_START_LOC;
+	*p++ = ring_ggtt;
+	*p++ = RCS_RING_CTL_LOC;
+	*p++ = (((ring_len_bytes / PAGE_SIZE) - 1u) << 12) | RING_VALID;
+	*p++ = RCS_BB_HEAD_U;
+	*p++ = 0;
+	*p++ = RCS_BB_HEAD_L;
+	*p++ = 0;
+	*p++ = RCS_BB_STATE;
+	*p++ = RING_BB_PPGTT;
+	*p++ = RCS_SBB_HEAD_U;
+	*p++ = 0;
+	*p++ = RCS_SBB_HEAD_L;
+	*p++ = 0;
+	*p++ = RCS_SBB_STATE;
+	*p++ = 0;
+	*p++ = RCS_INDIRECT_CTX;
+	*p++ = 0;
+	*p++ = RCS_INDIRECT_CTX_OFFSET;
+	*p++ = 0;
+	*p++ = RCS_BB_PER_CTX_PTR;
+	*p++ = 0;
+
+	/* LRI Header 1: CTX_TIMESTAMP + 4 PDP pairs (lo/hi each) = 9. */
+	*p++ = MI_LOAD_REGISTER_IMM(9) | MI_LRI_FORCE_POSTED;
+	*p++ = RCS_CTX_TIMESTAMP;
+	*p++ = 0;
+	*p++ = RCS_PDP_UDW(3);
+	*p++ = 0;
+	*p++ = RCS_PDP_LDW(3);
+	*p++ = 0;
+	*p++ = RCS_PDP_UDW(2);
+	*p++ = 0;
+	*p++ = RCS_PDP_LDW(2);
+	*p++ = 0;
+	*p++ = RCS_PDP_UDW(1);
+	*p++ = 0;
+	*p++ = RCS_PDP_LDW(1);
+	*p++ = 0;
+	*p++ = RCS_PDP_UDW(0);
+	*p++ = 0;
+	*p++ = RCS_PDP_LDW(0);
+	*p++ = 0;
 
 	/*
-	 * MI_LOAD_REGISTER_IMM with count=6 — six (offset, value) pairs.
-	 * The offsets are RCS-relative (added to RING_BASE_RCS = 0x2000
-	 * by the engine; we encode the engine-local offset).
+	 * LRI Header 2: R_PWR_CLK_STATE (RPCS).  Leave 0 — engine uses
+	 * its boot-time slice/subslice/EU defaults.  Real Mesa workloads
+	 * will need make_rpcs() but a no-op MI batch doesn't care.
 	 */
-	*p++ = MI_LOAD_REGISTER_IMM(6);
-	*p++ = 0x244;	/* CONTEXT_CONTROL: inhibit_syn=1, save=1 */
-	*p++ = (1u << 0) | (1u << 18);
-	*p++ = 0x34;	/* RING_BUFFER_HEAD */
+	*p++ = MI_LOAD_REGISTER_IMM(1) | MI_LRI_FORCE_POSTED;
+	*p++ = RCS_R_PWR_CLK_STATE;
 	*p++ = 0;
-	*p++ = 0x30;	/* RING_BUFFER_TAIL — engine stops here */
-	*p++ = ring_tail;
-	*p++ = 0x38;	/* RING_BUFFER_START */
-	*p++ = ring_ggtt;
-	*p++ = 0x3c;	/* RING_BUFFER_CTL — LENGTH field is bits 20:12,
-			 * encoded as (pages - 1); VALID is bit 0 */
-	*p++ = (((ring_len_bytes / PAGE_SIZE) - 1u) << 12) | 1u;
-	*p++ = 0x2c;	/* BB_HEAD_U (zero high bits of batch start) */
-	*p++ = 0;
-	*p++ = MI_NOOP;
 
-	return ((p - lrc) * sizeof(uint32_t));
+	return ((p - start) * sizeof(uint32_t));
 }
 
 static size_t
@@ -431,7 +516,7 @@ igen_sysctl_gt_first_batch_dry(SYSCTL_HANDLER_ARGS)
 	}
 
 	batch_len = igen_gt_compose_batch_noop(ring_va);
-	lrc_len   = igen_gt_compose_lrc(lrc_va, ring_ggtt,
+	lrc_len   = igen_gt_compose_lrc((uint8_t *)lrc_va, ring_ggtt,
 	    IGT_RCS_RING_PAGES * PAGE_SIZE, batch_len);
 	ctx_desc  = igen_gt_context_desc(lrc_ggtt);
 
@@ -442,16 +527,26 @@ igen_sysctl_gt_first_batch_dry(SYSCTL_HANDLER_ARGS)
 	    "gt: ring[0..1] = 0x%08x 0x%08x\n",
 	    ((uint32_t *)ring_va)[0], ((uint32_t *)ring_va)[1]);
 	device_printf(sc->dev,
-	    "gt: lrc   GGTT=0x%08x  PA=0x%llx  VA=%p  image_len=%zu\n",
-	    lrc_ggtt, (unsigned long long)lrc_pa, lrc_va, lrc_len);
-	for (size_t i = 0; i < lrc_len / sizeof(uint32_t); i += 4) {
-		device_printf(sc->dev,
-		    "gt: lrc[%2zu] 0x%08x 0x%08x 0x%08x 0x%08x\n",
-		    i,
-		    ((uint32_t *)lrc_va)[i + 0],
-		    ((uint32_t *)lrc_va)[i + 1],
-		    ((uint32_t *)lrc_va)[i + 2],
-		    ((uint32_t *)lrc_va)[i + 3]);
+	    "gt: lrc   GGTT=0x%08x  PA=0x%llx  VA=%p  total=%u pages"
+	    "  state_image_len=%zu\n",
+	    lrc_ggtt, (unsigned long long)lrc_pa, lrc_va,
+	    IGT_RCS_LRC_PAGES, lrc_len);
+	/*
+	 * Register state image lives at lrc + IGT_LRC_STATE_OFFSET (0x1000).
+	 * Dump only the state image; the header page (offset 0..0xfff) is
+	 * uniformly zero.
+	 */
+	{
+		uint32_t *state = (uint32_t *)((uint8_t *)lrc_va +
+		    IGT_LRC_STATE_OFFSET);
+
+		for (size_t i = 0; i < lrc_len / sizeof(uint32_t); i += 4) {
+			device_printf(sc->dev,
+			    "gt: lrc+0x%04zx %08x %08x %08x %08x\n",
+			    IGT_LRC_STATE_OFFSET + i * 4,
+			    state[i + 0], state[i + 1],
+			    state[i + 2], state[i + 3]);
+		}
 	}
 	device_printf(sc->dev,
 	    "gt: ctx_desc = 0x%016llx (LRCA=0x%08x | VALID | PRIVILEGE"
@@ -517,7 +612,7 @@ igen_sysctl_gt_first_batch_submit(SYSCTL_HANDLER_ARGS)
 
 	{
 		size_t blen = igen_gt_compose_batch_noop(ring_va);
-		(void)igen_gt_compose_lrc(lrc_va, ring_ggtt,
+		(void)igen_gt_compose_lrc((uint8_t *)lrc_va, ring_ggtt,
 		    IGT_RCS_RING_PAGES * PAGE_SIZE, blen);
 	}
 	ctx_desc = igen_gt_context_desc(lrc_ggtt);
