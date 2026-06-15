@@ -687,8 +687,16 @@ igen9_sysctl_wrpll_enable(SYSCTL_HANDLER_ARGS)
 	device_printf(sc->dev,
 	    "wrpll DPLL%u: ENABLE_REG[0x%05x]=0x%08x (pre)\n", id, enreg, en);
 
+	/*
+	 * Firmware's working LCPLL1_CTL reads back 0xc0000000 when locked
+	 * (bit31 ENABLE + bit30 LOCK, nothing else).  My OR-write was
+	 * preserving the mystery lower bits (3/4/10/13/21) from the
+	 * 0x00202418 pre-state -- those may be RW config that's wrong by
+	 * default.  Try writing just bit 31, matching firmware's LCPLL1
+	 * layout, to see if clearing the lower bits unblocks lock.
+	 */
 	if (!(en & WRPLL_ENABLE_BIT))
-		igen9_w32(sc, enreg, en | WRPLL_ENABLE_BIT);
+		igen9_w32(sc, enreg, WRPLL_ENABLE_BIT);
 	(void)igen9_r32(sc, enreg);	/* posting read */
 
 	/* Poll LOCK.  Generous 50 ms in case BSpec's 600 us is wrong. */
