@@ -151,7 +151,7 @@ static const struct igen_range igen_ranges[] = {
 	{ 0x00044000, 0x00044100, "INT/HOTPLUG" },
 	{ 0x00045000, 0x000455ff, "PWR/DC_STATE" },
 	{ 0x00046000, 0x000460ff, "CDCLK/DPLL_CTRL" },
-	{ 0x0006c000, 0x0006c0ff, "AUDIO_PIN" },
+	{ 0x0006c000, 0x0006cfff, "PHY_BC + DPLL_CFGCR/STATUS" },
 	{ 0x00060000, 0x000613ff, "TRANS_A/B/C/EDP" },
 	{ 0x00064000, 0x000643ff, "DDI_BUF_A/B/C/D/E" },
 	{ 0x00068000, 0x000683ff, "TRANS_DDI_FUNC_CTL" },
@@ -453,6 +453,8 @@ igen_re_sysctls_init(struct igen_softc *sc)
 	    "write 1 to map OpRegion via ASLS and walk VBT child devices");
 	/* hpd_dump sysctl is owned by igen_hpd.c. */
 	igen_hpd_register_sysctls(sc);
+	/* phy_dump_bc / phy_scan_bc sysctls are owned by igen_phy.c. */
+	igen_phy_register_sysctls(sc);
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "cap_dump",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,

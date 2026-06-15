@@ -234,6 +234,12 @@ void	igen_gmbus_register_sysctls(struct igen_softc *sc);
 void	igen_hpd_register_sysctls(struct igen_softc *sc);
 
 /*
+ * igen_phy.c — SKL display PHY / PCS / Common Lane RE substrate.
+ * Sysctl-only; reads (no writes) the analog layer below DDI_BUF_CTL.
+ */
+void	igen_phy_register_sysctls(struct igen_softc *sc);
+
+/*
  * igen_gtt.c — GTT introspection + RW helpers, 8 MiB scratch FB allocator,
  * per-FB GTT slot cache for ADDFB2 dumb buffers, persistent scanout
  * buffer (scanout_hold), animation kthread.  &igen_owned_fb_funcs is
