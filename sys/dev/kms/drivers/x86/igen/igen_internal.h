@@ -175,6 +175,14 @@ struct igen_softc {
 
 #define	DPLL_CTRL2_DDI_B_OFF	(1u << 4)
 
+/*
+ * HPD / fuse / live-sink registers.  Used by igen_hpd.c's HPD decoder and
+ * by igen.c's silicon capability table — both want the same three oracles.
+ */
+#define	SFUSE_STRAP		0x000c2014
+#define	SHOTPLUG_CTL_DDI	0x000c4030
+#define	SDEISR			0x000c4000
+
 /* Low-level MMIO accessors.  Inline so every TU gets its own copy. */
 static inline uint32_t
 igen_r32(struct igen_softc *sc, uint32_t off)
@@ -217,6 +225,13 @@ void	igen_wait_vblank(struct igen_softc *sc, int pipe);
 int	igen_gmbus_read_block(struct igen_softc *sc, uint32_t pin,
 	    uint8_t slave, uint8_t offset, uint8_t *buf, size_t len);
 void	igen_gmbus_register_sysctls(struct igen_softc *sc);
+
+/*
+ * igen_hpd.c — live hot-plug detect decoder.  Pulls SFUSE_STRAP +
+ * SHOTPLUG_CTL_DDI + SDEISR and prints per-DDI fuse / enable / pulse /
+ * live-HPD state.  Sysctl-only; no IRQ wiring yet.
+ */
+void	igen_hpd_register_sysctls(struct igen_softc *sc);
 
 /*
  * igen_gtt.c — GTT introspection + RW helpers, 8 MiB scratch FB allocator,

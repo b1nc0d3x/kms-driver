@@ -375,7 +375,7 @@ igen_sysctl_bit_scan(SYSCTL_HANDLER_ARGS)
 
 /* igen_sysctl_edid_read_b lives in igen_gmbus.c. */
 static int	igen_sysctl_vbt_dump(SYSCTL_HANDLER_ARGS);
-static int	igen_sysctl_hpd_dump(SYSCTL_HANDLER_ARGS);
+/* igen_sysctl_hpd_dump lives in igen_hpd.c. */
 static int	igen_sysctl_cap_dump(SYSCTL_HANDLER_ARGS);
 /* DPLL/WRPLL/pw1 sysctl handlers live in igen_dpll.c. */
 static int	igen_sysctl_current_mode(SYSCTL_HANDLER_ARGS);
@@ -451,11 +451,8 @@ igen_re_sysctls_init(struct igen_softc *sc)
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
 	    sc, 0, igen_sysctl_vbt_dump, "I",
 	    "write 1 to map OpRegion via ASLS and walk VBT child devices");
-	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
-	    "hpd_dump",
-	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
-	    sc, 0, igen_sysctl_hpd_dump, "I",
-	    "write 1 to dump SFUSE_STRAP / SHOTPLUG_CTL_DDI / SDEISR live HPD");
+	/* hpd_dump sysctl is owned by igen_hpd.c. */
+	igen_hpd_register_sysctls(sc);
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "cap_dump",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
@@ -972,66 +969,7 @@ igen_attach_edid_modes(struct igen_softc *sc)
 	return (0);
 }
 
-/* ------------------------------- HPD -------------------------------------- */
-
-/*
- * Live hot-plug detect status.  SKL+ has two register paths:
- *   - SFUSE_STRAP (0xc2014): bits[2:0] set per DDI present on package
- *     (fuse-set at boot; not real-time, just "this PORT exists")
- *   - SHOTPLUG_CTL_DDI (0xc4030): 4 bits per port [A,B,C,D,E]:
- *       bit hpd_pin*4+0: short-pulse seen
- *       bit hpd_pin*4+1: long-pulse seen (plug/unplug edge)
- *       bit hpd_pin*4+4: HPD irq enable
- *   - SDEISR (0xc4000): PCH interrupt status; DDI HPD live bits here too
- */
-
-#define	SFUSE_STRAP		0x000c2014
-#define	SHOTPLUG_CTL_DDI	0x000c4030
-#define	SDEISR			0x000c4000
-
-static int
-igen_sysctl_hpd_dump(SYSCTL_HANDLER_ARGS)
-{
-	struct igen_softc *sc = arg1;
-	uint32_t sfuse, hot, sde;
-	int trigger = 0;
-	int error = sysctl_handle_int(oidp, &trigger, 0, req);
-
-	if (error || req->newptr == NULL || trigger == 0)
-		return (error);
-
-	sfuse = igen_r32(sc, SFUSE_STRAP);
-	hot   = igen_r32(sc, SHOTPLUG_CTL_DDI);
-	sde   = igen_r32(sc, SDEISR);
-
-	device_printf(sc->dev,
-	    "hpd: SFUSE_STRAP=0x%08x  SHOTPLUG_CTL_DDI=0x%08x  SDEISR=0x%08x\n",
-	    sfuse, hot, sde);
-
-	device_printf(sc->dev,
-	    "  SFUSE_STRAP DDI present: B=%d C=%d D=%d\n",
-	    (sfuse >> 2) & 1, (sfuse >> 1) & 1, (sfuse >> 0) & 1);
-
-	/* SHOTPLUG_CTL_DDI: 4 bits per port; bit0..3=port A, 4..7=B, ... */
-	for (int p = 0; p < 5; p++) {
-		uint32_t f = (hot >> (p * 4)) & 0xf;
-		device_printf(sc->dev,
-		    "  SHOTPLUG_CTL DDI_%c: en=%d  short_pulse=%d  long_pulse=%d  raw=0x%x\n",
-		    'A' + p, (f >> 4) & 1, f & 1, (f >> 1) & 1, f);
-	}
-
-	/* SDEISR HPD live bits (SKL+ desktop):
-	 * bit 21 = DDI_B HPD live
-	 * bit 22 = DDI_C
-	 * bit 23 = DDI_D
-	 * bit 24 = DDI_E
-	 */
-	device_printf(sc->dev,
-	    "  SDEISR HPD live: B=%d C=%d D=%d E=%d\n",
-	    (sde >> 21) & 1, (sde >> 22) & 1,
-	    (sde >> 23) & 1, (sde >> 24) & 1);
-	return (0);
-}
+/* HPD live decoder lives in igen_hpd.c. */
 
 /* --------------------------- silicon capability table --------------------- */
 
