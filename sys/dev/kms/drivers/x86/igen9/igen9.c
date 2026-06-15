@@ -2027,7 +2027,53 @@ static const struct drm_driver igen9_driver = {
 	.patchlevel	= 0,
 };
 
-static const struct drm_crtc_funcs igen9_crtc_funcs = { 0 };
+/*
+ * Legacy KMS CRTC ops.  Xorg's modesetting driver uses these (not the
+ * atomic state machine) for SETCRTC + PAGE_FLIP.  We accept the request
+ * and record the new state; the actual transcoder timing rewrite + plane
+ * surface update are no-ops for now -- this unblocks Xorg's "no usable
+ * configuration" gate so the X server actually starts.  Real scanout of
+ * userspace-allocated dumb buffers requires GTT mapping of the BO pages,
+ * which is the next mile.
+ */
+static int
+igen9_legacy_set_config(struct drm_mode_set *set)
+{
+	struct drm_crtc *crtc;
+
+	if (set == NULL || (crtc = set->crtc) == NULL)
+		return (EINVAL);
+
+	if (set->mode == NULL) {
+		crtc->mode_valid = 0;
+		crtc->enabled = false;
+		crtc->primary_fb = NULL;
+		return (0);
+	}
+
+	crtc->mode = *set->mode;
+	crtc->mode_valid = 1;
+	crtc->enabled = true;
+	crtc->primary_fb = set->fb;
+	crtc->x = set->x;
+	crtc->y = set->y;
+	return (0);
+}
+
+static int
+igen9_legacy_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
+    uint32_t flags __unused, uint64_t user_data __unused)
+{
+	if (crtc == NULL)
+		return (EINVAL);
+	crtc->primary_fb = fb;
+	return (0);
+}
+
+static const struct drm_crtc_funcs igen9_crtc_funcs = {
+	.set_config = igen9_legacy_set_config,
+	.page_flip = igen9_legacy_page_flip,
+};
 static const struct drm_plane_funcs igen9_plane_funcs = { 0 };
 static const struct drm_encoder_funcs igen9_encoder_funcs = { 0 };
 static const struct drm_connector_funcs igen9_connector_funcs = { 0 };
@@ -2263,11 +2309,24 @@ igen9_attach(device_t dev)
 		    nitems(igen9_plane_formats));
 	if (error == 0)
 		error = kms_encoder_init(sc->drm_dev, &sc->encoder,
-		    &igen9_encoder_funcs, DRM_MODE_ENCODER_DAC);
+		    &igen9_encoder_funcs, DRM_MODE_ENCODER_TMDS);
+	if (error == 0) {
+		/*
+		 * Encoder must declare which CRTCs it can drive (bitmask of
+		 * CRTC indices) and the connector must be linked to it.
+		 * Without these two writes Xorg modesetting cannot find a
+		 * usable encoder/CRTC path from the connector and fails the
+		 * initial config with "No modes".
+		 */
+		sc->encoder.possible_crtcs = 1u;
+	}
 	if (error == 0)
 		error = kms_connector_init(sc->drm_dev, &sc->connector,
 		    &igen9_connector_funcs,
 		    DRM_MODE_CONNECTOR_HDMIA);
+	if (error == 0)
+		error = kms_connector_attach_encoder(&sc->connector,
+		    &sc->encoder);
 	if (error != 0)
 		device_printf(dev, "topology init: %d (will appear with"
 		    " empty/partial resources)\n", error);
