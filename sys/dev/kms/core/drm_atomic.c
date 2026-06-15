@@ -855,6 +855,33 @@ kms_ioctl_mode_atomic(struct drm_file *file, struct drm_mode_atomic *r)
 		}
 
 		/*
+		 * If PAGE_FLIP_EVENT was set, arm pending_flip_file on every
+		 * active CRTC the batch touched.  The framework owns the file
+		 * + user_data handoff so drivers don't have to: the next
+		 * vblank IRQ runs kms_vblank_handler which dispatches
+		 * DRM_EVENT_FLIP_COMPLETE on the stashed file.  Without this,
+		 * Wayland compositors (kwin_wayland, weston) wedge on the
+		 * first frame waiting for an event that never arrives —
+		 * atomic_commit succeeds but the event side is silent.
+		 */
+		if (error == 0 && !test_only &&
+		    (r->flags & DRM_MODE_PAGE_FLIP_EVENT) != 0) {
+			sx_xlock(&mc->mutex);
+			for (uint32_t k = 0; k < astate->num_crtc; k++) {
+				struct drm_crtc_state *cs =
+				    astate->crtc_states[k];
+
+				if (cs == NULL || cs->crtc == NULL ||
+				    !cs->active)
+					continue;
+				cs->crtc->pending_flip_file = file;
+				cs->crtc->pending_flip_user_data =
+				    r->user_data;
+			}
+			sx_xunlock(&mc->mutex);
+		}
+
+		/*
 		 * The driver may queue the state for deferred completion
 		 * by stashing the pointer and returning -EAGAIN today; that
 		 * lands with the state-swap work in Phase 8b.  For now the
