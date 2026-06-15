@@ -5,6 +5,7 @@ KMOD=	igen
 SRCS=	igen.c \
 	igen_dpll.c \
 	igen_gmbus.c \
+	igen_gtt.c \
 	bus_if.h device_if.h pci_if.h \
 	opt_platform.h
 

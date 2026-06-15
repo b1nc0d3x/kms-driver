@@ -27,7 +27,23 @@
 #include <kms/drm_framebuffer.h>
 #include <kms/drm_plane.h>
 
-struct igen_test_fb;
+/*
+ * 8 MiB scratch framebuffer used by the scanout playground.  Owned by
+ * igen_gtt.c; igen.c needs its definition because atomic_commit reads
+ * gtt_first_idx to compute PLANE_SURF when an owned_fb is bound, and
+ * the softc holds a pointer to one.
+ */
+struct igen_test_fb {
+	void		*va;
+	vm_paddr_t	 pa;
+	size_t		 size;
+	uint32_t	 gtt_first_idx;
+	uint32_t	 gtt_count;
+	uint32_t	 width;
+	uint32_t	 height;
+	uint32_t	 stride;	/* bytes */
+	bool		 mapped;
+};
 
 /*
  * User-FB GTT slot cache sizes.  Each ADDFB2 dumb buffer gets one slot
@@ -201,5 +217,23 @@ void	igen_wait_vblank(struct igen_softc *sc, int pipe);
 int	igen_gmbus_read_block(struct igen_softc *sc, uint32_t pin,
 	    uint8_t slave, uint8_t offset, uint8_t *buf, size_t len);
 void	igen_gmbus_register_sysctls(struct igen_softc *sc);
+
+/*
+ * igen_gtt.c — GTT introspection + RW helpers, 8 MiB scratch FB allocator,
+ * per-FB GTT slot cache for ADDFB2 dumb buffers, persistent scanout
+ * buffer (scanout_hold), animation kthread.  &igen_owned_fb_funcs is
+ * defined in igen.c and shared via extern; igen_gtt.c installs it as
+ * the funcs table for expose_scanout_fb's drm_framebuffer.
+ */
+extern const struct drm_framebuffer_funcs igen_owned_fb_funcs;
+
+uint32_t igen_gtt_bind_user_fb(struct igen_softc *sc,
+	    struct drm_framebuffer *fb);
+void	igen_test_fb_free(struct igen_softc *sc, struct igen_test_fb *fb);
+void	igen_anim_stop(struct igen_softc *sc);
+void	igen_gtt_register_sysctls(struct igen_softc *sc);
+
+/* Unwind held scanout + exposed FB on detach. */
+void	igen_gtt_detach(struct igen_softc *sc);
 
 #endif /* _IGEN_INTERNAL_H_ */
