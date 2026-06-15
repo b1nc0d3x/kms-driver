@@ -94,7 +94,7 @@ MALLOC_DECLARE(M_KMS);
 #define	PLANE_SURFLIVE(p)	(0x701ac + (p) * 0x1000)
 #define	PIPE_FRMCOUNT(p)	(0x70040 + (p) * 0x1000)
 
-static uint64_t
+uint64_t
 igen_gtt_read(struct igen_softc *sc, uint32_t entry_idx)
 {
 	uint32_t off = GTT_BASE + entry_idx * GTT_PTE_SIZE;
@@ -103,7 +103,7 @@ igen_gtt_read(struct igen_softc *sc, uint32_t entry_idx)
 	return ((uint64_t)hi << 32) | lo;
 }
 
-static void
+void
 igen_gtt_write(struct igen_softc *sc, uint32_t entry_idx,
     uint64_t pte)
 {

@@ -258,6 +258,9 @@ extern const struct drm_framebuffer_funcs igen_owned_fb_funcs;
 
 uint32_t igen_gtt_bind_user_fb(struct igen_softc *sc,
 	    struct drm_framebuffer *fb);
+uint64_t igen_gtt_read(struct igen_softc *sc, uint32_t entry_idx);
+void	igen_gtt_write(struct igen_softc *sc, uint32_t entry_idx,
+	    uint64_t pte);
 void	igen_test_fb_free(struct igen_softc *sc, struct igen_test_fb *fb);
 void	igen_anim_stop(struct igen_softc *sc);
 void	igen_gtt_register_sysctls(struct igen_softc *sc);
