@@ -2988,7 +2988,11 @@ igen9_sysctl_wrpll_enable(SYSCTL_HANDLER_ARGS)
 	/*
 	 * Step 2: CTRL1 OVERRIDE + HDMI_MODE for this DPLL.  Clear the
 	 * 6-bit per-DPLL field first to wipe any stale link-rate / SSC bits
-	 * so the new write is authoritative.
+	 * so the new write is authoritative.  Per BSpec, CTRL1 must be
+	 * latched before CFGCR1/CFGCR2 so the PLL knows which fields to
+	 * read.  Write CTRL1, posting-read, then re-program CFGCR1/CFGCR2
+	 * (already populated by wrpll_program) so the registers are stuffed
+	 * AFTER CTRL1 mode select.
 	 */
 	ctrl1 = igen9_r32(sc, DPLL_CTRL1);
 	uint32_t per_dpll_mask = 0x3fu << (id * 6);
@@ -3001,14 +3005,21 @@ igen9_sysctl_wrpll_enable(SYSCTL_HANDLER_ARGS)
 		    id, ctrl1, new_ctrl1);
 		igen9_w32(sc, DPLL_CTRL1, new_ctrl1);
 	}
+	(void)igen9_r32(sc, DPLL_CTRL1);	/* posting read */
+
+	/* Re-program CFGCR1/CFGCR2 now that CTRL1 selected HDMI_MODE. */
+	uint32_t cfgcr2 = igen9_r32(sc, WRPLL_CFGCR2(id));
+	igen9_w32(sc, WRPLL_CFGCR1(id), cfgcr1);
+	igen9_w32(sc, WRPLL_CFGCR2(id), cfgcr2);
+	(void)igen9_r32(sc, WRPLL_CFGCR2(id));
+	device_printf(sc->dev,
+	    "wrpll DPLL%u: re-stuffed CFGCR1=0x%08x CFGCR2=0x%08x\n",
+	    id, cfgcr1, cfgcr2);
 
 	/*
 	 * Step 3: ENABLE.  SKL/KBL has no separate POWER_ENABLE/POWER_STATE
-	 * handshake -- that was added in ICL and later.  On SKL we just set
-	 * bit 31 (PLL_ENABLE) and wait for bit 30 (PLL_LOCK).  PW1 must be
-	 * up first (checked above) -- without it the silicon goes into the
-	 * stuck "enabled-but-not-locked" state that wedged fbsdx86 in the
-	 * 2026-06-14 first attempt.
+	 * handshake -- that was added in ICL and later.  Just set bit 31
+	 * and wait for bit 30 (LOCK).
 	 */
 	enreg = WRPLL_ENABLE_REG(id);
 	en = igen9_r32(sc, enreg);
@@ -3017,9 +3028,10 @@ igen9_sysctl_wrpll_enable(SYSCTL_HANDLER_ARGS)
 
 	if (!(en & WRPLL_ENABLE_BIT))
 		igen9_w32(sc, enreg, en | WRPLL_ENABLE_BIT);
+	(void)igen9_r32(sc, enreg);	/* posting read */
 
-	/* Poll LOCK.  BSpec says <= 600 us; allow 5 ms. */
-	for (i = 0; i < 50; i++) {
+	/* Poll LOCK.  Generous 50 ms in case BSpec's 600 us is wrong. */
+	for (i = 0; i < 500; i++) {
 		lock = igen9_r32(sc, enreg);
 		if (lock & WRPLL_LOCK_BIT)
 			break;
