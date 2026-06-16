@@ -871,8 +871,19 @@ kms_ioctl_mode_atomic(struct drm_file *file, struct drm_mode_atomic *r)
 				struct drm_crtc_state *cs =
 				    astate->crtc_states[k];
 
-				if (cs == NULL || cs->crtc == NULL ||
-				    !cs->active)
+				/*
+				 * Arm any CRTC whose state was touched in the
+				 * batch — either an enable/disable transition
+				 * (cs->active reflects the request) or a
+				 * flip-only commit whose plane writes pulled
+				 * the CRTC state in (cs->plane_mask != 0).
+				 * Gating on cs->active alone misses the common
+				 * Wayland flip-only batch and the compositor
+				 * times out waiting for an event we never sent.
+				 */
+				if (cs == NULL || cs->crtc == NULL)
+					continue;
+				if (!cs->active && cs->plane_mask == 0)
 					continue;
 				cs->crtc->pending_flip_file = file;
 				cs->crtc->pending_flip_user_data =
