@@ -217,6 +217,7 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 	 */
 	if (kms_ioctl_trace > 0) {
 		const char *name = NULL;
+		char buf[24];
 
 		switch (cmd) {
 		case DRM_IOCTL_MODE_SETCRTC:
@@ -245,6 +246,16 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 			name = "SET_MASTER"; break;
 		case DRM_IOCTL_DROP_MASTER:
 			name = "DROP_MASTER"; break;
+		}
+		/*
+		 * Level 2: anything not in the curated list above gets printed
+		 * by hex command number — needed to surface property-write /
+		 * GETPLANE / GETCRTC traffic that the curated list skips when
+		 * debugging a compositor wedge.
+		 */
+		if (name == NULL && kms_ioctl_trace >= 2) {
+			snprintf(buf, sizeof(buf), "0x%lx", cmd);
+			name = buf;
 		}
 		if (name != NULL)
 			printf("kms: ioctl %s file=%p pid=%d is_render=%d\n",
