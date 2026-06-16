@@ -291,17 +291,30 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 		r->pad = 0;
 		return (0);
 	}
-	case DRM_IOCTL_SET_MASTER:
-	case DRM_IOCTL_DROP_MASTER:
+	case DRM_IOCTL_SET_MASTER: {
 		/*
-		 * Phase 12: minimal master semantics — first opener is
-		 * already implicit master (kms_open sets is_master on
-		 * open_count==1), and we don't yet enforce single-master
-		 * exclusivity.  Xorg + modesetting just need both ioctls to
-		 * succeed so its ScreenInit path can proceed.  Multi-X
-		 * coexistence isn't a use case anyone will hit before we
-		 * port a second consumer.
+		 * Become master on this device.  Demote any other current
+		 * master on the same drm_device so file->is_master reflects
+		 * the one-master invariant Linux DRM enforces.  Without this
+		 * a second opener (Xwayland forked from kwin, a screencast
+		 * helper, ...) calling SET_MASTER would remain non-master
+		 * and any subsequent AUTH_MAGIC returns EACCES.
 		 */
+		struct drm_file *peer;
+
+		sx_xlock(&file->dev->dev_lock);
+		TAILQ_FOREACH(peer, &file->dev->files, link) {
+			if (peer != file)
+				peer->is_master = false;
+		}
+		file->is_master = true;
+		sx_xunlock(&file->dev->dev_lock);
+		return (0);
+	}
+	case DRM_IOCTL_DROP_MASTER:
+		sx_xlock(&file->dev->dev_lock);
+		file->is_master = false;
+		sx_xunlock(&file->dev->dev_lock);
 		return (0);
 	case DRM_IOCTL_GET_MAGIC: {
 		/*
