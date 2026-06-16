@@ -1402,6 +1402,10 @@ const struct drm_framebuffer_funcs igen_owned_fb_funcs = {
 
 static const uint32_t igen_plane_formats[] = {
 	0x34325258,	/* 'XR24' = DRM_FORMAT_XRGB8888 */
+	0x34325241,	/* 'AR24' = DRM_FORMAT_ARGB8888 */
+	0x34324258,	/* 'XB24' = DRM_FORMAT_XBGR8888 */
+	0x34324241,	/* 'AB24' = DRM_FORMAT_ABGR8888 */
+	0x36314752,	/* 'RG16' = DRM_FORMAT_RGB565    */
 };
 
 /*
