@@ -321,6 +321,8 @@ kms_ioctl_mode_page_flip(struct drm_file *file,
 		if (r->flags & DRM_MODE_PAGE_FLIP_EVENT) {
 			crtc->pending_flip_file = file;
 			crtc->pending_flip_user_data = r->user_data;
+			printf("kms: page_flip EVENT armed crtc=%u file=%p\n",
+			    crtc->base.id, file);
 		}
 		sx_xunlock(&file->dev->mode_config.mutex);
 	}
@@ -328,4 +330,53 @@ kms_ioctl_mode_page_flip(struct drm_file *file,
 	kms_mode_object_put(fb_obj);
 	kms_mode_object_put(crtc_obj);
 	return (error);
+}
+
+static int
+kms_ioctl_mode_cursor_common(struct drm_file *file, uint32_t crtc_id,
+    uint32_t flags, int32_t x, int32_t y, uint32_t width, uint32_t height,
+    uint32_t handle, int32_t hot_x, int32_t hot_y)
+{
+	struct drm_mode_object *crtc_obj;
+	struct drm_crtc *crtc;
+	int error = 0;
+
+	crtc_obj = kms_mode_object_find(file->dev, crtc_id,
+	    DRM_MODE_OBJECT_CRTC);
+	if (crtc_obj == NULL)
+		return (ENOENT);
+	crtc = __containerof(crtc_obj, struct drm_crtc, base);
+
+	if (crtc->funcs == NULL || (crtc->funcs->cursor_set == NULL &&
+	    crtc->funcs->cursor_move == NULL)) {
+		kms_mode_object_put(crtc_obj);
+		return (ENOTTY);
+	}
+
+	if ((flags & DRM_MODE_CURSOR_BO) != 0 &&
+	    crtc->funcs->cursor_set != NULL) {
+		error = crtc->funcs->cursor_set(crtc, file, handle, width,
+		    height, hot_x, hot_y);
+	}
+	if (error == 0 && (flags & DRM_MODE_CURSOR_MOVE) != 0 &&
+	    crtc->funcs->cursor_move != NULL) {
+		error = crtc->funcs->cursor_move(crtc, x, y);
+	}
+
+	kms_mode_object_put(crtc_obj);
+	return (error);
+}
+
+int
+kms_ioctl_mode_cursor(struct drm_file *file, struct drm_mode_cursor *r)
+{
+	return (kms_ioctl_mode_cursor_common(file, r->crtc_id, r->flags,
+	    r->x, r->y, r->width, r->height, r->handle, 0, 0));
+}
+
+int
+kms_ioctl_mode_cursor2(struct drm_file *file, struct drm_mode_cursor2 *r)
+{
+	return (kms_ioctl_mode_cursor_common(file, r->crtc_id, r->flags,
+	    r->x, r->y, r->width, r->height, r->handle, r->hot_x, r->hot_y));
 }

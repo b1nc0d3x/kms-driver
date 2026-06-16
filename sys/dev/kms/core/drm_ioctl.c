@@ -477,6 +477,12 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 	case DRM_IOCTL_WAIT_VBLANK:
 		return (kms_ioctl_wait_vblank(file,
 		    (union drm_wait_vblank *)data));
+	case DRM_IOCTL_MODE_CURSOR:
+		return (kms_ioctl_mode_cursor(file,
+		    (struct drm_mode_cursor *)data));
+	case DRM_IOCTL_MODE_CURSOR2:
+		return (kms_ioctl_mode_cursor2(file,
+		    (struct drm_mode_cursor2 *)data));
 	}
 	return (ENOTTY);
 }

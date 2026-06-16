@@ -30,6 +30,8 @@ struct drm_mode_destroy_dumb;
 struct drm_mode_fb_cmd2;
 struct drm_mode_fb_cmd;
 struct drm_mode_crtc_page_flip;
+struct drm_mode_cursor;
+struct drm_mode_cursor2;
 struct drm_set_client_cap;
 struct drm_mode_get_property;
 struct drm_mode_obj_get_properties;
@@ -85,6 +87,10 @@ int	kms_ioctl_mode_setcrtc(struct drm_file *file,
 	    struct drm_mode_crtc *r);
 int	kms_ioctl_mode_page_flip(struct drm_file *file,
 	    struct drm_mode_crtc_page_flip *r);
+int	kms_ioctl_mode_cursor(struct drm_file *file,
+	    struct drm_mode_cursor *r);
+int	kms_ioctl_mode_cursor2(struct drm_file *file,
+	    struct drm_mode_cursor2 *r);
 int	kms_ioctl_set_client_cap(struct drm_file *file,
 	    struct drm_set_client_cap *cap);
 int	kms_ioctl_mode_getproperty(struct drm_file *file,

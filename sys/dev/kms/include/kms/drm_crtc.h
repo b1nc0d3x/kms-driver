@@ -45,11 +45,28 @@ struct drm_mode_set {
  * drm_crtc unconditionally so userspace GETCRTC sees the result even
  * without a driver-side implementation.  Phase 8 wires atomic_*.
  */
+struct drm_file;
+
 struct drm_crtc_funcs {
 	void	(*destroy)(struct drm_crtc *crtc);
 	int	(*set_config)(struct drm_mode_set *set);
 	int	(*page_flip)(struct drm_crtc *crtc, struct drm_framebuffer *fb,
 		    uint32_t flags, uint64_t user_data);
+	/*
+	 * MODE_CURSOR / MODE_CURSOR2 backing.  cursor_set switches the
+	 * cursor BO; cursor_move repositions it.  handle == 0 (or
+	 * width/height == 0) disables the cursor.  hot_x/hot_y describe
+	 * the cursor bitmap's reference point so the driver can convert
+	 * the userspace-coordinate (x, y) into a top-left position on
+	 * subsequent moves.  Hooks may be NULL — the framework then
+	 * returns ENOTTY to userspace which falls back to a software
+	 * cursor composited into the primary plane (with the visible
+	 * flicker that implies).
+	 */
+	int	(*cursor_set)(struct drm_crtc *crtc, struct drm_file *file,
+		    uint32_t handle, uint32_t width, uint32_t height,
+		    int32_t hot_x, int32_t hot_y);
+	int	(*cursor_move)(struct drm_crtc *crtc, int32_t x, int32_t y);
 };
 
 struct drm_crtc {
