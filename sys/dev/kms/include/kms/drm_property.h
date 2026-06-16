@@ -41,8 +41,8 @@ struct drm_mode_object;
 #define	KMS_PROP_ENUM		(1u << 3)
 #define	KMS_PROP_BLOB		(1u << 4)
 #define	KMS_PROP_BITMASK		(1u << 5)
-#define	KMS_PROP_OBJECT		(1u << 24)
-#define	KMS_PROP_SIGNED_RANGE	(1u << 25)
+#define	KMS_PROP_OBJECT		0x40u	/* DRM_MODE_PROP_TYPE(1) */
+#define	KMS_PROP_SIGNED_RANGE	0x80u	/* DRM_MODE_PROP_TYPE(2) */
 #define	KMS_PROP_ATOMIC		(1u << 31)
 
 /*

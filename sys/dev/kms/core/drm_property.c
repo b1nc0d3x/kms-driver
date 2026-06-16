@@ -56,7 +56,17 @@ kms_property_create_range(struct drm_device *dev, uint32_t flags,
 	struct drm_property *prop;
 	int error;
 
-	prop = drm_property_alloc(dev, flags | KMS_PROP_RANGE, name);
+	/*
+	 * SIGNED_RANGE is an extended-type id that occupies bits 6-15 of
+	 * the flags field; it is mutually exclusive with the legacy RANGE
+	 * bit (bit 1).  Linux DRM checks RANGE first and treats the value
+	 * pair as uint64 when set, so setting both at once silently
+	 * downgrades a signed range to unsigned and any int32_min-style
+	 * lower bound looks like a huge positive number to userspace.
+	 */
+	if ((flags & KMS_PROP_SIGNED_RANGE) == 0)
+		flags |= KMS_PROP_RANGE;
+	prop = drm_property_alloc(dev, flags, name);
 	prop->values[0] = min;
 	prop->values[1] = max;
 	prop->num_values = 2;
