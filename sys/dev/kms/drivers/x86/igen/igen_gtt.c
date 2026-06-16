@@ -177,6 +177,22 @@ igen_gtt_bind_user_fb(struct igen_softc *sc,
 	return (surf);
 }
 
+uint32_t
+igen_gtt_bind_cursor(struct igen_softc *sc, struct drm_gem_object *obj)
+{
+	if (obj == NULL || obj->pages == NULL || obj->npages == 0)
+		return (0);
+	if (obj->npages > CURSOR_GTT_PAGES)
+		return (0);
+	for (size_t i = 0; i < obj->npages; i++) {
+		vm_paddr_t pa = VM_PAGE_TO_PHYS(obj->pages[i]);
+		uint64_t pte = (pa & ~0xfffULL) | GTT_PTE_VALID |
+		    GTT_PTE_WRITEABLE;
+		igen_gtt_write(sc, CURSOR_GTT_FIRST + i, pte);
+	}
+	return ((uint32_t)CURSOR_GTT_FIRST * PAGE_SIZE);
+}
+
 static int
 igen_test_fb_alloc(struct igen_softc *sc,
     struct igen_test_fb *fb, uint32_t w, uint32_t h)

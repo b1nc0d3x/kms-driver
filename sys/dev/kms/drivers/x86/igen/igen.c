@@ -1386,9 +1386,117 @@ igen_legacy_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
 	return (0);
 }
 
+/*
+ * Skylake / KBL / CFL hardware cursor on CUR_*_A.  The cursor BO is a
+ * 64/128/256-wide ARGB8888 bitmap from userspace, lives in a dedicated
+ * GTT slot at CURSOR_GTT_FIRST.  CUR_POS_A encodes the top-left in a
+ * signed-magnitude form: bit 15 = X-negative, bits 14:0 = |X|; bit 31 =
+ * Y-negative, bits 30:16 = |Y|.  Userspace coordinates address the
+ * cursor's reference point (hotspot); we subtract it from each MOVE to
+ * derive top-left.
+ */
+#define	CUR_CTL_A		0x70080
+#define	CUR_BASE_A		0x70084
+#define	CUR_POS_A		0x70088
+#define	CUR_MODE_DISABLE	0x00u
+#define	CUR_MODE_64_ARGB	0x07u
+#define	CUR_MODE_128_ARGB	0x22u
+#define	CUR_MODE_256_ARGB	0x27u
+
+static int
+igen_cursor_set(struct drm_crtc *crtc, struct drm_file *file,
+    uint32_t handle, uint32_t width, uint32_t height,
+    int32_t hot_x, int32_t hot_y)
+{
+	struct igen_softc *sc;
+	struct drm_gem_object *obj, *prev;
+	uint32_t mode, surf;
+
+	if (crtc == NULL)
+		return (EINVAL);
+	sc = crtc->dev->driver_priv;
+
+	sc->cursor_hot_x = hot_x;
+	sc->cursor_hot_y = hot_y;
+	sc->cursor_w = width;
+	sc->cursor_h = height;
+
+	if (handle == 0 || width == 0 || height == 0) {
+		igen_w32(sc, CUR_CTL_A, CUR_MODE_DISABLE);
+		igen_w32(sc, CUR_BASE_A, 0);
+		prev = sc->cursor_obj;
+		sc->cursor_obj = NULL;
+		if (prev != NULL)
+			kms_gem_object_put(prev);
+		return (0);
+	}
+
+	if (width != height ||
+	    (width != 64 && width != 128 && width != 256))
+		return (EINVAL);
+
+	obj = kms_gem_handle_lookup(file, handle);
+	if (obj == NULL)
+		return (ENOENT);
+
+	surf = igen_gtt_bind_cursor(sc, obj);
+	if (surf == 0) {
+		kms_gem_object_put(obj);
+		return (ENOMEM);
+	}
+
+	switch (width) {
+	case 64:
+		mode = CUR_MODE_64_ARGB;
+		break;
+	case 128:
+		mode = CUR_MODE_128_ARGB;
+		break;
+	default:
+		mode = CUR_MODE_256_ARGB;
+		break;
+	}
+
+	prev = sc->cursor_obj;
+	sc->cursor_obj = obj;
+	igen_w32(sc, CUR_BASE_A, surf);
+	igen_w32(sc, CUR_CTL_A, mode);
+	if (prev != NULL)
+		kms_gem_object_put(prev);
+	return (0);
+}
+
+static int
+igen_cursor_move(struct drm_crtc *crtc, int32_t x, int32_t y)
+{
+	struct igen_softc *sc;
+	int32_t tlx, tly;
+	uint32_t pos = 0;
+
+	if (crtc == NULL)
+		return (EINVAL);
+	sc = crtc->dev->driver_priv;
+
+	tlx = x - sc->cursor_hot_x;
+	tly = y - sc->cursor_hot_y;
+
+	if (tlx < 0)
+		pos |= (1u << 15) | ((uint32_t)(-tlx) & 0x7fffu);
+	else
+		pos |= ((uint32_t)tlx & 0x7fffu);
+	if (tly < 0)
+		pos |= (1u << 31) | (((uint32_t)(-tly) & 0x7fffu) << 16);
+	else
+		pos |= (((uint32_t)tly & 0x7fffu) << 16);
+	igen_w32(sc, CUR_POS_A, pos);
+	return (0);
+}
+
 static const struct drm_crtc_funcs igen_crtc_funcs = {
 	.set_config = igen_legacy_set_config,
 	.page_flip = igen_legacy_page_flip,
+	.cursor_set = igen_cursor_set,
+	.cursor_move = igen_cursor_move,
 };
 static const struct drm_plane_funcs igen_plane_funcs = { 0 };
 static const struct drm_encoder_funcs igen_encoder_funcs = { 0 };

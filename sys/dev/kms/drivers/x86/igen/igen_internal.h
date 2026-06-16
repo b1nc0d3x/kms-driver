@@ -54,6 +54,15 @@ struct igen_test_fb {
 #define	USER_FB_GTT_NSLOTS	8
 
 /*
+ * HW cursor GTT slot.  Sits just above the user-FB slot range so it
+ * never collides; 64 pages is exactly enough for the largest cursor
+ * mode the silicon advertises (256x256 ARGB8888 = 256 KiB).
+ */
+#define	CURSOR_GTT_FIRST	(USER_FB_GTT_FIRST + \
+				    USER_FB_GTT_NSLOTS * USER_FB_GTT_SLOT_PAGES)
+#define	CURSOR_GTT_PAGES	64
+
+/*
  * Driver-owned drm_framebuffer wrapper.  expose_scanout_fb sysctl wires
  * the already-allocated test_fb into the framework's mode-object table.
  */
@@ -114,6 +123,18 @@ struct igen_softc {
 		uint32_t		 surf;
 	}			 user_fb_slots[USER_FB_GTT_NSLOTS];
 	uint32_t		 user_fb_next_slot;
+
+	/*
+	 * HW cursor state — the GEM bitmap currently bound to the cursor
+	 * GTT slot and the hotspot offset cached from the last MODE_CURSOR2
+	 * BO write so subsequent MOVE-only commands can convert the
+	 * userspace coordinate to a top-left position for CUR_POS_A.
+	 */
+	struct drm_gem_object	*cursor_obj;
+	int32_t			 cursor_hot_x;
+	int32_t			 cursor_hot_y;
+	uint32_t		 cursor_w;
+	uint32_t		 cursor_h;
 
 	/* MMIO RE scaffold. */
 	struct sx		 re_lock;
@@ -258,6 +279,8 @@ extern const struct drm_framebuffer_funcs igen_owned_fb_funcs;
 
 uint32_t igen_gtt_bind_user_fb(struct igen_softc *sc,
 	    struct drm_framebuffer *fb);
+uint32_t igen_gtt_bind_cursor(struct igen_softc *sc,
+	    struct drm_gem_object *obj);
 uint64_t igen_gtt_read(struct igen_softc *sc, uint32_t entry_idx);
 void	igen_gtt_write(struct igen_softc *sc, uint32_t entry_idx,
 	    uint64_t pte);
