@@ -92,6 +92,57 @@ kms_connector_init(struct drm_device *dev, struct drm_connector *connector,
 	if (dev->mode_config.prop_connector_crtc_id != NULL)
 		kms_object_attach_property(&connector->base,
 		    dev->mode_config.prop_connector_crtc_id, 0);
+	if (dev->mode_config.prop_connector_edid != NULL)
+		kms_object_attach_property(&connector->base,
+		    dev->mode_config.prop_connector_edid, 0);
+	if (dev->mode_config.prop_connector_dpms != NULL)
+		kms_object_attach_property(&connector->base,
+		    dev->mode_config.prop_connector_dpms, 0);
+	return (0);
+}
+
+int
+kms_connector_update_edid(struct drm_connector *connector, const void *data,
+    size_t length)
+{
+	struct drm_device *dev;
+	struct drm_property *prop;
+	struct drm_property_blob *blob, *old;
+	uint64_t old_id;
+	int error;
+
+	if (connector == NULL || connector->dev == NULL)
+		return (EINVAL);
+	dev = connector->dev;
+	prop = dev->mode_config.prop_connector_edid;
+	if (prop == NULL)
+		return (ENOTSUP);
+
+	if (data == NULL || length == 0) {
+		blob = NULL;
+	} else {
+		blob = kms_property_blob_create(dev, data, length);
+		if (blob == NULL)
+			return (ENOMEM);
+	}
+
+	sx_xlock(&dev->mode_config.mutex);
+	old_id = 0;
+	(void)kms_object_property_get_value(&connector->base, prop, &old_id);
+	error = kms_object_property_set_value(&connector->base, prop,
+	    blob != NULL ? blob->base.id : 0);
+	sx_xunlock(&dev->mode_config.mutex);
+	if (error != 0) {
+		if (blob != NULL)
+			kms_property_blob_destroy(blob);
+		return (error);
+	}
+
+	if (old_id != 0) {
+		old = kms_property_blob_find(dev, (uint32_t)old_id);
+		if (old != NULL)
+			kms_property_blob_destroy(old);
+	}
 	return (0);
 }
 

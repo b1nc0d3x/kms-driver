@@ -978,6 +978,7 @@ igen_attach_edid_modes(struct igen_softc *sc)
 		    "edid: added mode %s @%u kHz  %u Hz  flags=0x%x\n",
 		    m->name, m->clock, m->vrefresh, m->flags);
 	}
+	(void)kms_connector_update_edid(&sc->connector, edid, sizeof(edid));
 	sc->connector.status = connector_status_connected;
 	return (0);
 }

@@ -74,6 +74,23 @@ kms_mode_config_standard_properties_init(struct drm_device *dev)
 
 	mc->prop_connector_crtc_id = kms_property_create_object(dev,
 	    PROP_ATOMIC, "CRTC_ID", DRM_MODE_OBJECT_CRTC);
+
+	/*
+	 * Connector EDID blob is immutable to userspace — drivers update it
+	 * via kms_connector_update_edid when a new sink is detected, which
+	 * allocates a new blob and rewrites the property value.  DPMS is the
+	 * legacy power-state enum kept for non-atomic clients; atomic clients
+	 * drive power via CRTC.ACTIVE.
+	 */
+	mc->prop_connector_edid = kms_property_create_blob_prop(dev,
+	    KMS_PROP_IMMUTABLE, "EDID");
+	mc->prop_connector_dpms = kms_property_create_enum(dev, 0, "DPMS");
+	if (mc->prop_connector_dpms != NULL) {
+		kms_property_add_enum(mc->prop_connector_dpms, 0, "On");
+		kms_property_add_enum(mc->prop_connector_dpms, 1, "Standby");
+		kms_property_add_enum(mc->prop_connector_dpms, 2, "Suspend");
+		kms_property_add_enum(mc->prop_connector_dpms, 3, "Off");
+	}
 }
 
 #undef PROP_ATOMIC

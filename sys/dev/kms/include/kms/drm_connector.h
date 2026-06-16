@@ -120,4 +120,14 @@ void	kms_connector_add_mode(struct drm_connector *connector,
  */
 void	kms_connector_modes_clear(struct drm_connector *connector);
 
+/*
+ * Publish a new EDID byte string on the connector.  Allocates a new
+ * property blob, points the connector's EDID property at it, and
+ * destroys the previously-published blob (if any).  Pass (NULL, 0) to
+ * clear the property on hotplug-disconnect.  Caller may discard the
+ * source buffer after return; the framework copies it.
+ */
+int	kms_connector_update_edid(struct drm_connector *connector,
+	    const void *data, size_t length);
+
 #endif /* _KMS_DRM_CONNECTOR_H_ */

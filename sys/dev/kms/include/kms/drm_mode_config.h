@@ -103,6 +103,8 @@ struct drm_mode_config {
 	struct drm_property		*prop_plane_src_w;
 	struct drm_property		*prop_plane_src_h;
 	struct drm_property		*prop_connector_crtc_id;
+	struct drm_property		*prop_connector_edid;
+	struct drm_property		*prop_connector_dpms;
 
 	/*
 	 * Driver atomic hooks.  See struct drm_mode_config_funcs above.
