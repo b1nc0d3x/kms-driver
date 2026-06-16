@@ -15,6 +15,7 @@
 #include <kms/drm_device.h>
 #include <kms/drm_drv.h>
 #include <kms/drm_file.h>
+#include <kms/drm_gem.h>
 #include <kms/drm_prime.h>
 
 #include "kms_internal.h"
@@ -234,6 +235,8 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 			name = "MODE_CREATE_DUMB"; break;
 		case DRM_IOCTL_MODE_DESTROY_DUMB:
 			name = "MODE_DESTROY_DUMB"; break;
+		case DRM_IOCTL_GEM_CLOSE:
+			name = "GEM_CLOSE"; break;
 		case DRM_IOCTL_PRIME_HANDLE_TO_FD:
 			name = "PRIME_HANDLE_TO_FD"; break;
 		case DRM_IOCTL_PRIME_FD_TO_HANDLE:
@@ -413,6 +416,9 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 	case DRM_IOCTL_MODE_DESTROY_DUMB:
 		return (kms_ioctl_mode_destroy_dumb(file,
 		    (struct drm_mode_destroy_dumb *)data));
+	case DRM_IOCTL_GEM_CLOSE:
+		return (kms_gem_handle_delete(file,
+		    ((struct drm_gem_close *)data)->handle));
 	case DRM_IOCTL_PRIME_HANDLE_TO_FD:
 		return (kms_ioctl_prime_handle_to_fd(file,
 		    (struct drm_prime_handle *)data));
