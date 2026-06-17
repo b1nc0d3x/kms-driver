@@ -281,6 +281,7 @@ uint32_t igen_gtt_bind_user_fb(struct igen_softc *sc,
 	    struct drm_framebuffer *fb);
 uint32_t igen_gtt_bind_cursor(struct igen_softc *sc,
 	    struct drm_gem_object *obj);
+int	igen_i915_ioctl(struct drm_file *file, u_long cmd, void *data);
 uint64_t igen_gtt_read(struct igen_softc *sc, uint32_t entry_idx);
 void	igen_gtt_write(struct igen_softc *sc, uint32_t entry_idx,
 	    uint64_t pte);

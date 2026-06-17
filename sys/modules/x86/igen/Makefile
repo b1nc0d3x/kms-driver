@@ -8,6 +8,7 @@ SRCS=	igen.c \
 	igen_gt.c \
 	igen_gtt.c \
 	igen_hpd.c \
+	igen_i915_uapi.c \
 	igen_phy.c \
 	bus_if.h device_if.h pci_if.h \
 	opt_platform.h

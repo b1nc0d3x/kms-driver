@@ -1293,12 +1293,22 @@ igen_irq_teardown(struct igen_softc *sc)
 /* ----------------------------- driver glue -------------------------------- */
 
 static const struct drm_driver igen_driver = {
-	.name		= "igen",
-	.desc		= "Intel Gen9 iGPU (kms framework)",
+	/*
+	 * Report Linux i915's identity so libdrm name-based matching and
+	 * Mesa's PCI-ID-then-name driver lookup land iris_dri.so.  Without
+	 * a name match Mesa falls back to (null) and EGL fails to import
+	 * dma-bufs because kms_swrast doesn't implement
+	 * EGL_EXT_image_dma_buf_import.  The version below mirrors the
+	 * Linux 5.x i915 driver header so iris's verify_kernel_version
+	 * is satisfied.
+	 */
+	.name		= "i915",
+	.desc		= "Intel Gen9 iGPU (i915 uAPI compatible)",
 	.date		= "20260613",
-	.major		= 0,
-	.minor		= 1,
+	.major		= 1,
+	.minor		= 6,
 	.patchlevel	= 0,
+	.ioctl		= igen_i915_ioctl,
 };
 
 /*
