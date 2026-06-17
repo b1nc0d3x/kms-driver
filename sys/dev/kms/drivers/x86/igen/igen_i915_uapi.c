@@ -44,6 +44,18 @@
 #define	I915_QUERY_NR				0x39
 #define	I915_GEM_CREATE_EXT_NR			0x3c
 #define	I915_GEM_MMAP_OFFSET_NR			0x40
+#define	I915_REG_READ_NR			0x31
+#define	I915_GET_RESET_STATS_NR			0x32
+#define	I915_GEM_USERPTR_NR			0x33
+#define	I915_GEM_VM_CREATE_NR			0x3a
+#define	I915_GEM_VM_DESTROY_NR			0x3b
+#define	I915_GEM_CONTEXT_CREATE_EXT_NR		0x3c
+#define	I915_GEM_THROTTLE_NR			0x18
+#define	I915_GEM_WAIT_NR			0x2c
+#define	I915_GEM_BUSY_NR			0x17
+#define	I915_GEM_MADVISE_NR			0x26
+#define	I915_GEM_SET_DOMAIN_NR			0x1f
+#define	I915_GEM_SW_FINISH_NR			0x20
 
 #define	DRM_I915_QUERY_TOPOLOGY_INFO		1
 #define	DRM_I915_QUERY_ENGINE_INFO		2
@@ -163,6 +175,56 @@ struct drm_i915_gem_mmap_offset {
 	uint32_t	pad;
 	uint64_t	offset;
 	uint64_t	flags;
+};
+
+struct drm_i915_gem_userptr {
+	uint64_t	user_ptr;
+	uint64_t	user_size;
+	uint32_t	flags;
+	uint32_t	handle;
+};
+
+struct drm_i915_gem_busy {
+	uint32_t	handle;
+	uint32_t	busy;
+};
+
+struct drm_i915_gem_wait {
+	uint32_t	bo_handle;
+	uint32_t	flags;
+	int64_t		timeout_ns;
+};
+
+struct drm_i915_gem_madvise {
+	uint32_t	handle;
+	uint32_t	madv;
+	uint32_t	retained;
+};
+
+struct drm_i915_gem_set_domain {
+	uint32_t	handle;
+	uint32_t	read_domains;
+	uint32_t	write_domain;
+};
+
+struct drm_i915_gem_vm_control {
+	uint32_t	extensions;
+	uint32_t	flags;
+	uint32_t	vm_id;
+};
+
+struct drm_i915_reset_stats {
+	uint32_t	ctx_id;
+	uint32_t	flags;
+	uint32_t	reset_count;
+	uint32_t	batch_active;
+	uint32_t	batch_pending;
+	uint32_t	pad;
+};
+
+struct drm_i915_reg_read {
+	uint64_t	offset;
+	uint64_t	val;
 };
 
 struct i915_engine_class_instance {
@@ -660,6 +722,102 @@ igen_i915_gem_mmap_offset(struct drm_file *file,
 }
 
 /*
+ * USERPTR: wrap a userspace memory region in a kernel BO so the GPU
+ * can DMA from it.  We don't have GPU command submission yet, but
+ * libdrm_intel's bufmgr probes USERPTR at init by allocating a page,
+ * binding it, then immediately closing it; returning ENODEV here
+ * makes it disable that bufmgr feature and continue rather than
+ * declare "i915 kernel driver may not be sane!" and abort.
+ */
+static int
+igen_i915_gem_userptr(struct drm_file *file __unused,
+    struct drm_i915_gem_userptr *up __unused)
+{
+	return (ENODEV);
+}
+
+static int
+igen_i915_gem_busy(struct drm_file *file __unused,
+    struct drm_i915_gem_busy *b)
+{
+	b->busy = 0;
+	return (0);
+}
+
+static int
+igen_i915_gem_wait(struct drm_file *file __unused,
+    struct drm_i915_gem_wait *w __unused)
+{
+	return (0);
+}
+
+static int
+igen_i915_gem_madvise(struct drm_file *file __unused,
+    struct drm_i915_gem_madvise *m)
+{
+	m->retained = 1;
+	return (0);
+}
+
+static int
+igen_i915_gem_set_domain(struct drm_file *file __unused,
+    struct drm_i915_gem_set_domain *sd __unused)
+{
+	return (0);
+}
+
+static int
+igen_i915_gem_sw_finish(struct drm_file *file __unused, void *data __unused)
+{
+	return (0);
+}
+
+static int
+igen_i915_gem_throttle(struct drm_file *file __unused, void *data __unused)
+{
+	return (0);
+}
+
+/*
+ * VM_CREATE: full-PPGTT VM allocation for an isolated address space.
+ * Newer Mesa attaches a VM to each context for proper isolation; if
+ * the ioctl returns ENOTTY iris falls back to the legacy aliasing
+ * PPGTT path which is what we model today.
+ */
+static int
+igen_i915_gem_vm_create(struct drm_file *file __unused,
+    struct drm_i915_gem_vm_control *vc)
+{
+	vc->vm_id = 1;
+	return (0);
+}
+
+static int
+igen_i915_gem_vm_destroy(struct drm_file *file __unused,
+    struct drm_i915_gem_vm_control *vc __unused)
+{
+	return (0);
+}
+
+static int
+igen_i915_get_reset_stats(struct drm_file *file __unused,
+    struct drm_i915_reset_stats *rs)
+{
+	rs->reset_count = 0;
+	rs->batch_active = 0;
+	rs->batch_pending = 0;
+	return (0);
+}
+
+static int
+igen_i915_reg_read(struct drm_file *file __unused,
+    struct drm_i915_reg_read *rr)
+{
+	rr->val = 0;
+	return (0);
+}
+
+/*
  * Driver-level ioctl fallback registered as drm_driver.ioctl.  The
  * core kms_ioctl forwards anything its main switch doesn't recognise
  * here so the i915 namespace (cmd nr >= 0x40) lands in one place.
@@ -707,6 +865,40 @@ igen_i915_ioctl(struct drm_file *file, u_long cmd, void *data)
 	case I915_GEM_MMAP_OFFSET_NR:
 		return (igen_i915_gem_mmap_offset(file,
 		    (struct drm_i915_gem_mmap_offset *)data));
+	case I915_GEM_USERPTR_NR:
+		return (igen_i915_gem_userptr(file,
+		    (struct drm_i915_gem_userptr *)data));
+	case I915_GEM_BUSY_NR:
+		return (igen_i915_gem_busy(file,
+		    (struct drm_i915_gem_busy *)data));
+	case I915_GEM_WAIT_NR:
+		return (igen_i915_gem_wait(file,
+		    (struct drm_i915_gem_wait *)data));
+	case I915_GEM_MADVISE_NR:
+		return (igen_i915_gem_madvise(file,
+		    (struct drm_i915_gem_madvise *)data));
+	case I915_GEM_SET_DOMAIN_NR:
+		return (igen_i915_gem_set_domain(file,
+		    (struct drm_i915_gem_set_domain *)data));
+	case I915_GEM_SW_FINISH_NR:
+		return (igen_i915_gem_sw_finish(file, data));
+	case I915_GEM_THROTTLE_NR:
+		return (igen_i915_gem_throttle(file, data));
+	case I915_GEM_VM_CREATE_NR:
+		return (igen_i915_gem_vm_create(file,
+		    (struct drm_i915_gem_vm_control *)data));
+	case I915_GEM_VM_DESTROY_NR:
+		return (igen_i915_gem_vm_destroy(file,
+		    (struct drm_i915_gem_vm_control *)data));
+	case I915_GEM_CONTEXT_CREATE_EXT_NR:
+		return (igen_i915_gem_context_create(file,
+		    (struct drm_i915_gem_context_create *)data));
+	case I915_GET_RESET_STATS_NR:
+		return (igen_i915_get_reset_stats(file,
+		    (struct drm_i915_reset_stats *)data));
+	case I915_REG_READ_NR:
+		return (igen_i915_reg_read(file,
+		    (struct drm_i915_reg_read *)data));
 	}
 	return (ENOTTY);
 }
