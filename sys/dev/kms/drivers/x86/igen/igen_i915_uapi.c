@@ -43,6 +43,18 @@
 #define	I915_GEM_CONTEXT_SETPARAM_NR		0x35
 #define	I915_QUERY_NR				0x39
 #define	I915_GEM_CREATE_EXT_NR			0x3c
+#define	I915_GEM_MMAP_OFFSET_NR			0x40
+
+#define	DRM_I915_QUERY_TOPOLOGY_INFO		1
+#define	DRM_I915_QUERY_ENGINE_INFO		2
+#define	DRM_I915_QUERY_MEMORY_REGIONS		4
+
+#define	I915_ENGINE_CLASS_RENDER		0
+#define	I915_ENGINE_CLASS_COPY			1
+#define	I915_ENGINE_CLASS_VIDEO			2
+#define	I915_ENGINE_CLASS_VIDEO_ENHANCE		3
+
+#define	I915_MEMORY_CLASS_SYSTEM		0
 
 /* --- I915_PARAM_* values (Linux i915_drm.h) --- */
 #define	I915_PARAM_CHIPSET_ID			4
@@ -84,6 +96,7 @@
 #define	I915_PARAM_CS_TIMESTAMP_FREQUENCY	51
 #define	I915_PARAM_MMAP_GTT_COHERENT		52
 #define	I915_PARAM_PERF_REVISION		54
+#define	I915_PARAM_OA_TIMESTAMP_FREQUENCY	56
 
 /* I915 scheduler capability bits.  Reported via HAS_SCHEDULER. */
 #define	I915_SCHEDULER_CAP_ENABLED		(1 << 0)
@@ -143,6 +156,65 @@ struct drm_i915_query {
 	uint32_t	num_items;
 	uint32_t	flags;
 	uint64_t	items_ptr;
+};
+
+struct drm_i915_gem_mmap_offset {
+	uint32_t	handle;
+	uint32_t	pad;
+	uint64_t	offset;
+	uint64_t	flags;
+};
+
+struct i915_engine_class_instance {
+	uint16_t	engine_class;
+	uint16_t	engine_instance;
+};
+
+struct drm_i915_engine_info {
+	struct i915_engine_class_instance engine;
+	uint32_t	rsvd0;
+	uint64_t	flags;
+	uint64_t	capabilities;
+	uint64_t	logical_instance;
+	uint64_t	rsvd1[3];
+};
+
+struct drm_i915_query_engine_info_hdr {
+	uint32_t	num_engines;
+	uint32_t	rsvd[3];
+	/* engines[num_engines] follows */
+};
+
+struct drm_i915_gem_memory_class_instance {
+	uint16_t	memory_class;
+	uint16_t	memory_instance;
+};
+
+struct drm_i915_memory_region_info {
+	struct drm_i915_gem_memory_class_instance region;
+	uint32_t	rsvd0;
+	uint64_t	probed_size;
+	uint64_t	unallocated_size;
+	uint64_t	rsvd1[8];
+};
+
+struct drm_i915_query_memory_regions_hdr {
+	uint32_t	num_regions;
+	uint32_t	rsvd[3];
+	/* regions[num_regions] follows */
+};
+
+struct drm_i915_query_topology_info_hdr {
+	uint16_t	flags;
+	uint16_t	max_slices;
+	uint16_t	max_subslices;
+	uint16_t	max_eus_per_subslice;
+	uint16_t	subslice_offset;
+	uint16_t	subslice_stride;
+	uint16_t	eu_offset;
+	uint16_t	eu_stride;
+	/* data[] follows: slice_mask, subslice_mask[max_slices],
+	 * eu_mask[max_slices * max_subslices]. */
 };
 
 /*
@@ -222,7 +294,8 @@ igen_i915_getparam_value(struct igen_softc *sc, int32_t param, int32_t *out)
 		*out = 24;	/* KBL GT2 has 24 EUs */
 		return (0);
 	case I915_PARAM_CS_TIMESTAMP_FREQUENCY:
-		*out = 12000000;	/* 12 MHz CS timestamp on gen9 */
+	case I915_PARAM_OA_TIMESTAMP_FREQUENCY:
+		*out = 12000000;	/* 12 MHz CS/OA timestamp on gen9 */
 		return (0);
 	case I915_PARAM_PERF_REVISION:
 		*out = 5;
@@ -357,30 +430,232 @@ igen_i915_gem_context_setparam(struct drm_file *file __unused,
 	return (0);
 }
 
+/*
+ * Build the response for I915_QUERY_ENGINE_INFO into a kernel-side
+ * buffer and return the required size.  KBL exposes render, copy,
+ * video and vebox engines; userspace iris cares only that the render
+ * engine is present.  Caller passes (NULL, 0) to size-query.
+ */
+static int32_t
+igen_i915_query_engine_info_fill(uint8_t *buf, int32_t buf_len)
+{
+	const uint32_t num_engines = 4;
+	int32_t need;
+
+	need = (int32_t)(sizeof(struct drm_i915_query_engine_info_hdr) +
+	    num_engines * sizeof(struct drm_i915_engine_info));
+	if (buf == NULL || buf_len == 0)
+		return (need);
+	if (buf_len < need)
+		return (-EINVAL);
+
+	struct drm_i915_query_engine_info_hdr *h =
+	    (struct drm_i915_query_engine_info_hdr *)buf;
+	struct drm_i915_engine_info *e = (struct drm_i915_engine_info *)(h + 1);
+
+	memset(buf, 0, need);
+	h->num_engines = num_engines;
+	e[0].engine.engine_class = I915_ENGINE_CLASS_RENDER;
+	e[0].engine.engine_instance = 0;
+	e[1].engine.engine_class = I915_ENGINE_CLASS_COPY;
+	e[1].engine.engine_instance = 0;
+	e[2].engine.engine_class = I915_ENGINE_CLASS_VIDEO;
+	e[2].engine.engine_instance = 0;
+	e[3].engine.engine_class = I915_ENGINE_CLASS_VIDEO_ENHANCE;
+	e[3].engine.engine_instance = 0;
+	return (need);
+}
+
+/*
+ * Build the response for I915_QUERY_MEMORY_REGIONS.  We expose one
+ * SYSTEM region covering main RAM; KBL has no LMEM so no DEVICE
+ * region.  probed_size is best-effort — iris uses it for budgeting
+ * but does not enforce equality with anything.
+ */
+static int32_t
+igen_i915_query_memory_regions_fill(uint8_t *buf, int32_t buf_len)
+{
+	const uint32_t num_regions = 1;
+	int32_t need;
+
+	need = (int32_t)(sizeof(struct drm_i915_query_memory_regions_hdr) +
+	    num_regions * sizeof(struct drm_i915_memory_region_info));
+	if (buf == NULL || buf_len == 0)
+		return (need);
+	if (buf_len < need)
+		return (-EINVAL);
+
+	struct drm_i915_query_memory_regions_hdr *h =
+	    (struct drm_i915_query_memory_regions_hdr *)buf;
+	struct drm_i915_memory_region_info *r =
+	    (struct drm_i915_memory_region_info *)(h + 1);
+
+	memset(buf, 0, need);
+	h->num_regions = num_regions;
+	r[0].region.memory_class = I915_MEMORY_CLASS_SYSTEM;
+	r[0].region.memory_instance = 0;
+	r[0].probed_size = (uint64_t)1 << 32;	/* 4 GiB nominal */
+	r[0].unallocated_size = (uint64_t)1 << 32;
+	return (need);
+}
+
+/*
+ * I915_QUERY_TOPOLOGY_INFO for KBL GT2: one slice, three subslices,
+ * eight EUs per subslice (24 total).  Userspace iris uses these masks
+ * to drive shader dispatch and compute thread counts.
+ */
+static int32_t
+igen_i915_query_topology_info_fill(uint8_t *buf, int32_t buf_len)
+{
+	const uint16_t max_slices = 1;
+	const uint16_t max_subslices = 3;
+	const uint16_t max_eus_per_subslice = 8;
+	const uint16_t slice_mask_bytes = (max_slices + 7) / 8;
+	const uint16_t subslice_mask_bytes = (max_subslices + 7) / 8;
+	const uint16_t eu_mask_bytes = (max_eus_per_subslice + 7) / 8;
+	const uint16_t subslice_data = max_slices * subslice_mask_bytes;
+	const uint16_t eu_data =
+	    max_slices * max_subslices * eu_mask_bytes;
+	int32_t need;
+	uint8_t *data;
+
+	need = (int32_t)sizeof(struct drm_i915_query_topology_info_hdr) +
+	    slice_mask_bytes + subslice_data + eu_data;
+	if (buf == NULL || buf_len == 0)
+		return (need);
+	if (buf_len < need)
+		return (-EINVAL);
+
+	struct drm_i915_query_topology_info_hdr *h =
+	    (struct drm_i915_query_topology_info_hdr *)buf;
+	memset(buf, 0, need);
+	h->flags = 0;
+	h->max_slices = max_slices;
+	h->max_subslices = max_subslices;
+	h->max_eus_per_subslice = max_eus_per_subslice;
+	h->subslice_offset = slice_mask_bytes;
+	h->subslice_stride = subslice_mask_bytes;
+	h->eu_offset = slice_mask_bytes + subslice_data;
+	h->eu_stride = eu_mask_bytes;
+
+	data = buf + sizeof(*h);
+	data[0] = 0x01;			/* one slice present */
+	data[h->subslice_offset] = 0x07;	/* three subslices */
+	data[h->eu_offset + 0] = 0xff;	/* 8 EUs in subslice 0 */
+	data[h->eu_offset + 1] = 0xff;	/* 8 EUs in subslice 1 */
+	data[h->eu_offset + 2] = 0xff;	/* 8 EUs in subslice 2 */
+	return (need);
+}
+
 static int
-igen_i915_query(struct drm_file *file, struct drm_i915_query *q)
+igen_i915_query_one(struct drm_i915_query_item *item)
+{
+	uint8_t *buf;
+	int32_t need;
+	int error;
+
+	switch (item->query_id) {
+	case DRM_I915_QUERY_ENGINE_INFO:
+	case DRM_I915_QUERY_MEMORY_REGIONS:
+	case DRM_I915_QUERY_TOPOLOGY_INFO:
+		break;
+	default:
+		/*
+		 * Mark unknown query ids as "no data" without an error so
+		 * iris treats them as missing and moves on.  Anything we
+		 * have a real fill for falls through to the per-id dispatch
+		 * below.
+		 */
+		item->length = 0;
+		return (0);
+	}
+
+	switch (item->query_id) {
+	case DRM_I915_QUERY_ENGINE_INFO:
+		need = igen_i915_query_engine_info_fill(NULL, 0);
+		break;
+	case DRM_I915_QUERY_MEMORY_REGIONS:
+		need = igen_i915_query_memory_regions_fill(NULL, 0);
+		break;
+	case DRM_I915_QUERY_TOPOLOGY_INFO:
+		need = igen_i915_query_topology_info_fill(NULL, 0);
+		break;
+	default:
+		__unreachable();
+	}
+
+	if (item->length == 0) {
+		item->length = need;
+		return (0);
+	}
+
+	if (item->length < need)
+		return (EINVAL);
+	if (item->data_ptr == 0)
+		return (EINVAL);
+
+	buf = malloc(need, M_TEMP, M_WAITOK | M_ZERO);
+	switch (item->query_id) {
+	case DRM_I915_QUERY_ENGINE_INFO:
+		(void)igen_i915_query_engine_info_fill(buf, need);
+		break;
+	case DRM_I915_QUERY_MEMORY_REGIONS:
+		(void)igen_i915_query_memory_regions_fill(buf, need);
+		break;
+	case DRM_I915_QUERY_TOPOLOGY_INFO:
+		(void)igen_i915_query_topology_info_fill(buf, need);
+		break;
+	}
+
+	error = copyout(buf, (void *)(uintptr_t)item->data_ptr, need);
+	free(buf, M_TEMP);
+	if (error != 0)
+		return (error);
+	item->length = need;
+	return (0);
+}
+
+static int
+igen_i915_query(struct drm_file *file __unused, struct drm_i915_query *q)
 {
 	struct drm_i915_query_item item;
 	int error;
 	uint32_t i;
 
 	for (i = 0; i < q->num_items; i++) {
-		error = copyin((const void *)(uintptr_t)(q->items_ptr +
-		    (uint64_t)i * sizeof(item)), &item, sizeof(item));
+		void *uptr = (void *)(uintptr_t)(q->items_ptr +
+		    (uint64_t)i * sizeof(item));
+
+		error = copyin(uptr, &item, sizeof(item));
 		if (error != 0)
 			return (error);
-		/*
-		 * For now mark every query as "no data available" by
-		 * returning length = 0.  iris falls back to GETPARAM-based
-		 * inference for topology / engines.  Wiring real responses
-		 * (I915_QUERY_TOPOLOGY_INFO etc.) is a follow-up commit.
-		 */
-		item.length = 0;
-		error = copyout(&item, (void *)(uintptr_t)(q->items_ptr +
-		    (uint64_t)i * sizeof(item)), sizeof(item));
+		error = igen_i915_query_one(&item);
+		if (error != 0)
+			return (error);
+		error = copyout(&item, uptr, sizeof(item));
 		if (error != 0)
 			return (error);
 	}
+	return (0);
+}
+
+/*
+ * Map a GEM handle to the mmap offset userspace passes to mmap() on
+ * the DRM cdev.  Our cdev_pager hook (kms_gem_object_lookup_offset)
+ * already keys mappings off the same offset the GEM object was
+ * assigned at create time; the iris driver just needs to read it back.
+ */
+static int
+igen_i915_gem_mmap_offset(struct drm_file *file,
+    struct drm_i915_gem_mmap_offset *mo)
+{
+	struct drm_gem_object *obj;
+
+	obj = kms_gem_handle_lookup(file, mo->handle);
+	if (obj == NULL)
+		return (ENOENT);
+	mo->offset = obj->mmap_offset;
+	kms_gem_object_put(obj);
 	return (0);
 }
 
@@ -429,6 +704,9 @@ igen_i915_ioctl(struct drm_file *file, u_long cmd, void *data)
 	case I915_QUERY_NR:
 		return (igen_i915_query(file,
 		    (struct drm_i915_query *)data));
+	case I915_GEM_MMAP_OFFSET_NR:
+		return (igen_i915_gem_mmap_offset(file,
+		    (struct drm_i915_gem_mmap_offset *)data));
 	}
 	return (ENOTTY);
 }
