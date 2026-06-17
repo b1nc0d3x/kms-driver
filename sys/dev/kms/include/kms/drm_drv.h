@@ -10,6 +10,7 @@
 #include <sys/types.h>
 
 struct drm_device;
+struct drm_file;
 
 /*
  * Driver descriptor.  Filled in by the hardware driver and passed to
@@ -24,6 +25,15 @@ struct drm_driver {
 	uint32_t	 minor;
 	uint32_t	 patchlevel;
 	uint32_t	 driver_features;
+	/*
+	 * Per-driver ioctl fallback.  Called by kms_ioctl after the core
+	 * dispatch matches nothing — typically for driver-specific cmd
+	 * codes in the DRM_COMMAND_BASE+ range (e.g. I915_* / RADEON_*
+	 * ioctls iris and amdgpu issue at userspace init).  Return 0 on
+	 * success or a positive errno; the framework returns ENOTTY
+	 * unchanged if this hook is NULL.
+	 */
+	int		(*ioctl)(struct drm_file *file, u_long cmd, void *data);
 };
 
 /*

@@ -484,5 +484,7 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 		return (kms_ioctl_mode_cursor2(file,
 		    (struct drm_mode_cursor2 *)data));
 	}
+	if (file->dev->driver != NULL && file->dev->driver->ioctl != NULL)
+		return (file->dev->driver->ioctl(file, cmd, data));
 	return (ENOTTY);
 }
