@@ -57,6 +57,8 @@
 #define	I915_GEM_SET_DOMAIN_NR			0x1f
 #define	I915_GEM_SW_FINISH_NR			0x20
 
+#define	I915_CONTEXT_PARAM_GTT_SIZE		0x3
+
 #define	DRM_I915_QUERY_TOPOLOGY_INFO		1
 #define	DRM_I915_QUERY_ENGINE_INFO		2
 #define	DRM_I915_QUERY_MEMORY_REGIONS		4
@@ -475,14 +477,23 @@ static int
 igen_i915_gem_context_getparam(struct drm_file *file __unused,
     struct drm_i915_gem_context_param *cp)
 {
-	/*
-	 * Default everything to zero — iris reads the GTT size, scheduler
-	 * priority, and a few other params.  Returning zero advertises
-	 * "feature off but recognised."  Real values land alongside
-	 * EXECBUFFER2.
-	 */
-	cp->value = 0;
-	return (0);
+	switch (cp->param) {
+	case I915_CONTEXT_PARAM_GTT_SIZE:
+		/*
+		 * Skylake / KBL / CFL run full-PPGTT with a 48-bit GTT
+		 * address space.  iris's bufmgr partitions this into
+		 * memzones (SHADER / BINDER / SCRATCH / SURFACE / DYNAMIC
+		 * / OTHER) and refuses to construct itself when gtt_size
+		 * is smaller than IRIS_MEMZONE_OTHER_START (12 GiB).
+		 * Returning the silicon's real 48-bit ceiling unblocks
+		 * iris_bufmgr_create.
+		 */
+		cp->value = 1ull << 48;
+		return (0);
+	default:
+		cp->value = 0;
+		return (0);
+	}
 }
 
 static int
