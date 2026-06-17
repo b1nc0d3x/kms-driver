@@ -56,8 +56,12 @@
 #define	I915_GEM_MADVISE_NR			0x26
 #define	I915_GEM_SET_DOMAIN_NR			0x1f
 #define	I915_GEM_SW_FINISH_NR			0x20
+#define	I915_GEM_EXECBUFFER2_NR			0x29
 
 #define	I915_CONTEXT_PARAM_GTT_SIZE		0x3
+
+#define	EXEC_OBJECT_PINNED			(1u << 4)
+#define	I915_EXEC_FENCE_OUT			(1ull << 17)
 
 #define	DRM_I915_QUERY_TOPOLOGY_INFO		1
 #define	DRM_I915_QUERY_ENGINE_INFO		2
@@ -227,6 +231,31 @@ struct drm_i915_reset_stats {
 struct drm_i915_reg_read {
 	uint64_t	offset;
 	uint64_t	val;
+};
+
+struct drm_i915_gem_exec_object2 {
+	uint32_t	handle;
+	uint32_t	relocation_count;
+	uint64_t	relocs_ptr;
+	uint64_t	alignment;
+	uint64_t	offset;
+	uint64_t	flags;
+	uint64_t	rsvd1;
+	uint64_t	rsvd2;
+};
+
+struct drm_i915_gem_execbuffer2 {
+	uint64_t	buffers_ptr;
+	uint32_t	buffer_count;
+	uint32_t	batch_start_offset;
+	uint32_t	batch_len;
+	uint32_t	DR1;
+	uint32_t	DR4;
+	uint32_t	num_cliprects;
+	uint64_t	cliprects_ptr;
+	uint64_t	flags;
+	uint64_t	rsvd1;
+	uint64_t	rsvd2;
 };
 
 struct i915_engine_class_instance {
@@ -829,6 +858,85 @@ igen_i915_reg_read(struct drm_file *file __unused,
 }
 
 /*
+ * EXECBUFFER2: submit a GPU batch.  iris hands us an array of BO
+ * handles, one of which is the batch buffer holding the rendering
+ * commands.  Each BO is pinned at a fixed GTT virtual address chosen
+ * by userspace (softpin / EXEC_OBJECT_PINNED, which iris always sets
+ * since we advertised HAS_EXEC_SOFTPIN).
+ *
+ * Phase A (this commit): validate the array, look up every handle so
+ * iris's bookkeeping can rely on the BO refs we drop on return, and
+ * return success without programming the render ring.  The GPU does
+ * not actually execute the batch — kwin's first GL frame will write
+ * to a back buffer that we never blit, so the visible output is
+ * whatever the BO was last initialised to.  This is enough to keep
+ * iris from bailing on the ioctl, which is the gating bottleneck for
+ * exercising the rest of the pipeline (fences, buffer rotation,
+ * page-flip).  Phase B will wire the execlist port and actually
+ * dispatch the batch through the render engine.
+ */
+static int
+igen_i915_gem_execbuffer2(struct drm_file *file,
+    struct drm_i915_gem_execbuffer2 *eb)
+{
+	struct drm_i915_gem_exec_object2 *objs;
+	struct drm_gem_object **gem_refs;
+	uint32_t i;
+	size_t bytes;
+	int error;
+
+	if (eb->buffer_count == 0 || eb->buffer_count > 1024)
+		return (EINVAL);
+	if (eb->buffers_ptr == 0)
+		return (EINVAL);
+
+	bytes = (size_t)eb->buffer_count * sizeof(*objs);
+	objs = malloc(bytes, M_TEMP, M_WAITOK);
+	gem_refs = malloc((size_t)eb->buffer_count * sizeof(*gem_refs),
+	    M_TEMP, M_WAITOK | M_ZERO);
+
+	error = copyin((const void *)(uintptr_t)eb->buffers_ptr, objs, bytes);
+	if (error != 0)
+		goto out;
+
+	/*
+	 * Lookup pass: every handle has to resolve, otherwise the batch is
+	 * malformed and the request is rejected as a whole.  We don't bind
+	 * pages to the softpin offset yet; iris's first batch after
+	 * bufmgr_create will exercise this path and we can iterate.
+	 */
+	for (i = 0; i < eb->buffer_count; i++) {
+		gem_refs[i] = kms_gem_handle_lookup(file, objs[i].handle);
+		if (gem_refs[i] == NULL) {
+			error = ENOENT;
+			goto out;
+		}
+	}
+
+	/*
+	 * Echo each object's offset back to userspace so iris updates its
+	 * presumed_offset bookkeeping with whatever it sent us — the
+	 * contract for softpin is "if you pinned it, the kernel keeps it
+	 * at that address" and a stub that ignores the field would have
+	 * iris see a regressed offset on the next batch.
+	 */
+	error = copyout(objs, (void *)(uintptr_t)eb->buffers_ptr, bytes);
+	if (error != 0)
+		goto out;
+
+	/* TODO: program render-engine execlist port for actual dispatch. */
+
+out:
+	for (i = 0; i < eb->buffer_count; i++) {
+		if (gem_refs[i] != NULL)
+			kms_gem_object_put(gem_refs[i]);
+	}
+	free(gem_refs, M_TEMP);
+	free(objs, M_TEMP);
+	return (error);
+}
+
+/*
  * Driver-level ioctl fallback registered as drm_driver.ioctl.  The
  * core kms_ioctl forwards anything its main switch doesn't recognise
  * here so the i915 namespace (cmd nr >= 0x40) lands in one place.
@@ -910,6 +1018,9 @@ igen_i915_ioctl(struct drm_file *file, u_long cmd, void *data)
 	case I915_REG_READ_NR:
 		return (igen_i915_reg_read(file,
 		    (struct drm_i915_reg_read *)data));
+	case I915_GEM_EXECBUFFER2_NR:
+		return (igen_i915_gem_execbuffer2(file,
+		    (struct drm_i915_gem_execbuffer2 *)data));
 	}
 	return (ENOTTY);
 }
