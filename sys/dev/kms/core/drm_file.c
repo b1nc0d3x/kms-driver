@@ -49,6 +49,8 @@ kms_file_dtor(void *data)
 	 */
 	kms_gem_release_all(file);
 	sx_destroy(&file->handle_lock);
+	kms_syncobj_release_all(file);
+	sx_destroy(&file->syncobj_lock);
 	kms_event_queue_drain(file);
 
 	free(file, M_KMS);
@@ -96,6 +98,9 @@ kms_open(struct cdev *cdev, int oflags __unused, int devtype __unused,
 	sx_init(&file->handle_lock, "drmgem");
 	TAILQ_INIT(&file->handles);
 	file->next_handle = 0;
+	sx_init(&file->syncobj_lock, "drmsync");
+	TAILQ_INIT(&file->syncobjs);
+	file->next_syncobj_handle = 0;
 	kms_event_queue_init(file);
 
 	sx_xlock(&dev->dev_lock);

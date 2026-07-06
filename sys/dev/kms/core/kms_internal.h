@@ -40,6 +40,11 @@ struct drm_mode_create_blob;
 struct drm_mode_destroy_blob;
 struct drm_mode_get_blob;
 struct drm_mode_atomic;
+struct drm_syncobj_create;
+struct drm_syncobj_destroy;
+struct drm_syncobj_wait;
+struct drm_syncobj_array;
+struct drm_syncobj_handle;
 
 MALLOC_DECLARE(M_KMS);
 
@@ -107,6 +112,20 @@ int	kms_ioctl_mode_getpropblob(struct drm_file *file,
 	    struct drm_mode_get_blob *r);
 int	kms_ioctl_mode_atomic(struct drm_file *file,
 	    struct drm_mode_atomic *r);
+
+int	kms_ioctl_syncobj_create(struct drm_file *file,
+	    struct drm_syncobj_create *args);
+int	kms_ioctl_syncobj_destroy(struct drm_file *file,
+	    struct drm_syncobj_destroy *args);
+int	kms_ioctl_syncobj_wait(struct drm_file *file,
+	    struct drm_syncobj_wait *args);
+int	kms_ioctl_syncobj_reset(struct drm_file *file,
+	    struct drm_syncobj_array *args);
+int	kms_ioctl_syncobj_signal(struct drm_file *file,
+	    struct drm_syncobj_array *args);
+int	kms_ioctl_syncobj_handle_to_fd(struct thread *td,
+	    struct drm_file *file, struct drm_syncobj_handle *args);
+void	kms_syncobj_release_all(struct drm_file *file);
 
 struct drm_crtc;
 union drm_wait_vblank;

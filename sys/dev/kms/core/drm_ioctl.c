@@ -186,9 +186,20 @@ drm_ioctl_get_cap(struct drm_file *file __unused, struct drm_get_cap *c)
 		 */
 		c->value = 1;
 		return (0);
+	case DRM_CAP_SYNCOBJ:
+		/*
+		 * Binary (single-point) sync objects are stub-implemented:
+		 * CREATE / DESTROY / WAIT / RESET / SIGNAL succeed against a
+		 * per-file handle table without backing GPU fences, since
+		 * every syncobj is treated as already-signaled.  This is
+		 * enough to keep kwin's per-frame atomic-commit allocator
+		 * from spinning on ENOTTY.  Timeline syncobjs and FD
+		 * import/export remain unsupported.
+		 */
+		c->value = 1;
+		return (0);
 	case DRM_CAP_ASYNC_PAGE_FLIP:
 	case DRM_CAP_PAGE_FLIP_TARGET:
-	case DRM_CAP_SYNCOBJ:
 	case DRM_CAP_SYNCOBJ_TIMELINE:
 	case DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP:
 		c->value = 0;
@@ -199,7 +210,7 @@ drm_ioctl_get_cap(struct drm_file *file __unused, struct drm_get_cap *c)
 
 int
 kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
-    int fflag __unused, struct thread *td __unused)
+    int fflag __unused, struct thread *td)
 {
 	struct drm_file *file;
 	int error;
@@ -474,6 +485,24 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 	case DRM_IOCTL_MODE_ATOMIC:
 		return (kms_ioctl_mode_atomic(file,
 		    (struct drm_mode_atomic *)data));
+	case DRM_IOCTL_SYNCOBJ_CREATE:
+		return (kms_ioctl_syncobj_create(file,
+		    (struct drm_syncobj_create *)data));
+	case DRM_IOCTL_SYNCOBJ_DESTROY:
+		return (kms_ioctl_syncobj_destroy(file,
+		    (struct drm_syncobj_destroy *)data));
+	case DRM_IOCTL_SYNCOBJ_WAIT:
+		return (kms_ioctl_syncobj_wait(file,
+		    (struct drm_syncobj_wait *)data));
+	case DRM_IOCTL_SYNCOBJ_RESET:
+		return (kms_ioctl_syncobj_reset(file,
+		    (struct drm_syncobj_array *)data));
+	case DRM_IOCTL_SYNCOBJ_SIGNAL:
+		return (kms_ioctl_syncobj_signal(file,
+		    (struct drm_syncobj_array *)data));
+	case DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD:
+		return (kms_ioctl_syncobj_handle_to_fd(td, file,
+		    (struct drm_syncobj_handle *)data));
 	case DRM_IOCTL_WAIT_VBLANK:
 		return (kms_ioctl_wait_vblank(file,
 		    (union drm_wait_vblank *)data));

@@ -16,8 +16,10 @@
 struct drm_device;
 struct drm_gem_handle;
 struct drm_pending_event;
+struct kms_syncobj;
 TAILQ_HEAD(drm_gem_handle_list, drm_gem_handle);
 TAILQ_HEAD(drm_pending_event_list, drm_pending_event);
+TAILQ_HEAD(kms_syncobj_list, kms_syncobj);
 
 /*
  * Pending kernel→user event queued on a drm_file's event ring.  The
@@ -76,6 +78,17 @@ struct drm_file {
 	struct drm_pending_event_list	 events;
 	uint32_t			 events_bytes;
 	struct selinfo			 event_select;
+
+	/*
+	 * Sync-object handle table.  Separate from the GEM handle table
+	 * because Linux DRM keeps the two namespaces independent — a GEM
+	 * handle of 5 and a syncobj handle of 5 are unrelated.  All
+	 * syncobjs allocated here are stubs (no GPU-side fence backing);
+	 * see drm_syncobj.c for the WAIT/RESET/SIGNAL semantics.
+	 */
+	struct sx			 syncobj_lock;
+	struct kms_syncobj_list		 syncobjs;
+	uint32_t			 next_syncobj_handle;
 };
 
 #endif /* _KMS_DRM_FILE_H_ */
