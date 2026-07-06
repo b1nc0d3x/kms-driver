@@ -37,6 +37,7 @@
 #define	I915_GEM_SET_TILING_NR			0x21
 #define	I915_GEM_GET_TILING_NR			0x22
 #define	I915_GEM_GET_APERTURE_NR		0x23
+#define	I915_GEM_MMAP_GTT_NR			0x24
 #define	I915_GEM_CONTEXT_CREATE_NR		0x2d
 #define	I915_GEM_CONTEXT_DESTROY_NR		0x2e
 #define	I915_GEM_CONTEXT_GETPARAM_NR		0x34
@@ -49,7 +50,6 @@
 #define	I915_GEM_USERPTR_NR			0x33
 #define	I915_GEM_VM_CREATE_NR			0x3a
 #define	I915_GEM_VM_DESTROY_NR			0x3b
-#define	I915_GEM_CONTEXT_CREATE_EXT_NR		0x3c
 #define	I915_GEM_THROTTLE_NR			0x18
 #define	I915_GEM_WAIT_NR			0x2c
 #define	I915_GEM_BUSY_NR			0x17
@@ -132,6 +132,21 @@ struct drm_i915_gem_create {
 	uint32_t	pad;
 };
 
+/*
+ * GEM_CREATE_EXT (Linux 5.13+).  Same as GEM_CREATE but the caller can
+ * chain memory-region / placement / set-pat extensions through
+ * `extensions`.  iris always issues this on KBL — falling back to plain
+ * GEM_CREATE only on older kernels.  We ignore both `flags` and
+ * `extensions` (KBL has only the system memory class so there's no
+ * placement choice to honour).
+ */
+struct drm_i915_gem_create_ext {
+	uint64_t	size;
+	uint32_t	handle;
+	uint32_t	flags;
+	uint64_t	extensions;
+};
+
 struct drm_i915_gem_set_tiling {
 	uint32_t	handle;
 	uint32_t	tiling_mode;
@@ -181,6 +196,18 @@ struct drm_i915_gem_mmap_offset {
 	uint32_t	pad;
 	uint64_t	offset;
 	uint64_t	flags;
+};
+
+/*
+ * Pre-5.13 legacy mmap path.  Same shape as drm_i915_gem_mmap_offset
+ * minus the flags tail.  iris still issues this on KBL for the
+ * workaround_bo and a few other tiny BOs before falling through to
+ * MMAP_OFFSET for the larger surfaces — so we have to honour it.
+ */
+struct drm_i915_gem_mmap_gtt {
+	uint32_t	handle;
+	uint32_t	pad;
+	uint64_t	offset;
 };
 
 struct drm_i915_gem_userptr {
@@ -437,6 +464,27 @@ igen_i915_gem_create(struct drm_file *file, struct drm_i915_gem_create *gc)
 		return (error);
 	gc->handle = handle;
 	gc->pad = 0;
+	return (0);
+}
+
+static int
+igen_i915_gem_create_ext(struct drm_file *file,
+    struct drm_i915_gem_create_ext *gce)
+{
+	struct drm_gem_object *obj;
+	uint32_t handle;
+	int error;
+
+	if (gce->size == 0)
+		return (EINVAL);
+	obj = kms_gem_object_create(file->dev, gce->size);
+	if (obj == NULL)
+		return (ENOMEM);
+	error = kms_gem_handle_create(file, obj, &handle);
+	kms_gem_object_put(obj);
+	if (error != 0)
+		return (error);
+	gce->handle = handle;
 	return (0);
 }
 
@@ -762,6 +810,25 @@ igen_i915_gem_mmap_offset(struct drm_file *file,
 }
 
 /*
+ * Legacy mmap_gtt: same as mmap_offset, just without the flags tail.
+ * Shares the per-object mmap_offset that the cdev_pager hook keys off,
+ * so the same offset value works for both paths.
+ */
+static int
+igen_i915_gem_mmap_gtt(struct drm_file *file,
+    struct drm_i915_gem_mmap_gtt *mg)
+{
+	struct drm_gem_object *obj;
+
+	obj = kms_gem_handle_lookup(file, mg->handle);
+	if (obj == NULL)
+		return (ENOENT);
+	mg->offset = obj->mmap_offset;
+	kms_gem_object_put(obj);
+	return (0);
+}
+
+/*
  * USERPTR: wrap a userspace memory region in a kernel BO so the GPU
  * can DMA from it.  We don't have GPU command submission yet, but
  * libdrm_intel's bufmgr probes USERPTR at init by allocating a page,
@@ -937,90 +1004,238 @@ out:
 }
 
 /*
+ * Translate an i915-namespace ioctl NR (already stripped of
+ * DRM_COMMAND_BASE) to a short symbolic name for the entry/exit
+ * trace.  Returns NULL for NRs we don't recognise so the trace can
+ * fall back to printing the raw NR.
+ */
+static const char *
+igen_i915_ioctl_name(uint8_t i915_nr)
+{
+	switch (i915_nr) {
+	case I915_GETPARAM_NR:			return ("GETPARAM");
+	case I915_GEM_CREATE_NR:		return ("GEM_CREATE");
+	case I915_GEM_CREATE_EXT_NR:		return ("GEM_CREATE_EXT");
+	case I915_GEM_SET_TILING_NR:		return ("GEM_SET_TILING");
+	case I915_GEM_GET_TILING_NR:		return ("GEM_GET_TILING");
+	case I915_GEM_GET_APERTURE_NR:		return ("GEM_GET_APERTURE");
+	case I915_GEM_MMAP_GTT_NR:		return ("GEM_MMAP_GTT");
+	case I915_GEM_CONTEXT_CREATE_NR:	return ("CONTEXT_CREATE");
+	case I915_GEM_CONTEXT_DESTROY_NR:	return ("CONTEXT_DESTROY");
+	case I915_GEM_CONTEXT_GETPARAM_NR:	return ("CONTEXT_GETPARAM");
+	case I915_GEM_CONTEXT_SETPARAM_NR:	return ("CONTEXT_SETPARAM");
+	case I915_QUERY_NR:			return ("QUERY");
+	case I915_GEM_MMAP_OFFSET_NR:		return ("MMAP_OFFSET");
+	case I915_GEM_USERPTR_NR:		return ("GEM_USERPTR");
+	case I915_GEM_BUSY_NR:			return ("GEM_BUSY");
+	case I915_GEM_WAIT_NR:			return ("GEM_WAIT");
+	case I915_GEM_MADVISE_NR:		return ("GEM_MADVISE");
+	case I915_GEM_SET_DOMAIN_NR:		return ("GEM_SET_DOMAIN");
+	case I915_GEM_SW_FINISH_NR:		return ("GEM_SW_FINISH");
+	case I915_GEM_THROTTLE_NR:		return ("GEM_THROTTLE");
+	case I915_GEM_VM_CREATE_NR:		return ("GEM_VM_CREATE");
+	case I915_GEM_VM_DESTROY_NR:		return ("GEM_VM_DESTROY");
+	case I915_GET_RESET_STATS_NR:		return ("RESET_STATS");
+	case I915_REG_READ_NR:			return ("REG_READ");
+	case I915_GEM_EXECBUFFER2_NR:		return ("EXECBUFFER2");
+	}
+	return (NULL);
+}
+
+/*
  * Driver-level ioctl fallback registered as drm_driver.ioctl.  The
  * core kms_ioctl forwards anything its main switch doesn't recognise
  * here so the i915 namespace (cmd nr >= 0x40) lands in one place.
+ *
+ * When sc_debug >= 3 every i915-namespace ioctl logs an entry line on
+ * the way in and an exit line with the return value on the way out.
+ * For the BO-suspect ioctls (GEM_CREATE / MMAP_OFFSET / EXECBUFFER2)
+ * the exit line also prints the key data fields so the trace shows
+ * which BO size / handle / batch is in flight — that's what makes
+ * "iris bufmgr_create did N GEM_CREATEs and then bailed" tractable
+ * from dmesg alone.
  */
 int
 igen_i915_ioctl(struct drm_file *file, u_long cmd, void *data)
 {
 	struct igen_softc *sc = file->dev->driver_priv;
 	uint8_t nr = cmd & 0xff;
+	uint8_t i915_nr;
+	const char *name;
+	int error;
 
 	if (nr < DRM_COMMAND_BASE)
 		return (ENOTTY);
 
-	switch (nr - DRM_COMMAND_BASE) {
+	i915_nr = nr - DRM_COMMAND_BASE;
+	name = igen_i915_ioctl_name(i915_nr);
+	DPRINTF(sc, 2,
+	    "i915 ioctl %s(0x%02x) enter pid=%d cmd=0x%lx\n",
+	    name != NULL ? name : "UNK", i915_nr,
+	    curthread->td_proc->p_pid, (u_long)cmd);
+
+	switch (i915_nr) {
 	case I915_GETPARAM_NR:
-		return (igen_i915_getparam(sc,
-		    (struct drm_i915_getparam *)data));
+		error = igen_i915_getparam(sc,
+		    (struct drm_i915_getparam *)data);
+		break;
 	case I915_GEM_CREATE_NR:
-		return (igen_i915_gem_create(file,
-		    (struct drm_i915_gem_create *)data));
+		error = igen_i915_gem_create(file,
+		    (struct drm_i915_gem_create *)data);
+		break;
 	case I915_GEM_SET_TILING_NR:
-		return (igen_i915_gem_set_tiling(file,
-		    (struct drm_i915_gem_set_tiling *)data));
+		error = igen_i915_gem_set_tiling(file,
+		    (struct drm_i915_gem_set_tiling *)data);
+		break;
 	case I915_GEM_GET_TILING_NR:
-		return (igen_i915_gem_get_tiling(file,
-		    (struct drm_i915_gem_get_tiling *)data));
+		error = igen_i915_gem_get_tiling(file,
+		    (struct drm_i915_gem_get_tiling *)data);
+		break;
 	case I915_GEM_GET_APERTURE_NR:
-		return (igen_i915_gem_get_aperture(file,
-		    (struct drm_i915_gem_get_aperture *)data));
+		error = igen_i915_gem_get_aperture(file,
+		    (struct drm_i915_gem_get_aperture *)data);
+		break;
+	case I915_GEM_MMAP_GTT_NR:
+		error = igen_i915_gem_mmap_gtt(file,
+		    (struct drm_i915_gem_mmap_gtt *)data);
+		break;
 	case I915_GEM_CONTEXT_CREATE_NR:
-		return (igen_i915_gem_context_create(file,
-		    (struct drm_i915_gem_context_create *)data));
+		error = igen_i915_gem_context_create(file,
+		    (struct drm_i915_gem_context_create *)data);
+		break;
 	case I915_GEM_CONTEXT_DESTROY_NR:
-		return (igen_i915_gem_context_destroy(file,
-		    (struct drm_i915_gem_context_create *)data));
+		error = igen_i915_gem_context_destroy(file,
+		    (struct drm_i915_gem_context_create *)data);
+		break;
 	case I915_GEM_CONTEXT_GETPARAM_NR:
-		return (igen_i915_gem_context_getparam(file,
-		    (struct drm_i915_gem_context_param *)data));
+		error = igen_i915_gem_context_getparam(file,
+		    (struct drm_i915_gem_context_param *)data);
+		break;
 	case I915_GEM_CONTEXT_SETPARAM_NR:
-		return (igen_i915_gem_context_setparam(file,
-		    (struct drm_i915_gem_context_param *)data));
+		error = igen_i915_gem_context_setparam(file,
+		    (struct drm_i915_gem_context_param *)data);
+		break;
 	case I915_QUERY_NR:
-		return (igen_i915_query(file,
-		    (struct drm_i915_query *)data));
+		error = igen_i915_query(file,
+		    (struct drm_i915_query *)data);
+		break;
 	case I915_GEM_MMAP_OFFSET_NR:
-		return (igen_i915_gem_mmap_offset(file,
-		    (struct drm_i915_gem_mmap_offset *)data));
+		error = igen_i915_gem_mmap_offset(file,
+		    (struct drm_i915_gem_mmap_offset *)data);
+		break;
 	case I915_GEM_USERPTR_NR:
-		return (igen_i915_gem_userptr(file,
-		    (struct drm_i915_gem_userptr *)data));
+		error = igen_i915_gem_userptr(file,
+		    (struct drm_i915_gem_userptr *)data);
+		break;
 	case I915_GEM_BUSY_NR:
-		return (igen_i915_gem_busy(file,
-		    (struct drm_i915_gem_busy *)data));
+		error = igen_i915_gem_busy(file,
+		    (struct drm_i915_gem_busy *)data);
+		break;
 	case I915_GEM_WAIT_NR:
-		return (igen_i915_gem_wait(file,
-		    (struct drm_i915_gem_wait *)data));
+		error = igen_i915_gem_wait(file,
+		    (struct drm_i915_gem_wait *)data);
+		break;
 	case I915_GEM_MADVISE_NR:
-		return (igen_i915_gem_madvise(file,
-		    (struct drm_i915_gem_madvise *)data));
+		error = igen_i915_gem_madvise(file,
+		    (struct drm_i915_gem_madvise *)data);
+		break;
 	case I915_GEM_SET_DOMAIN_NR:
-		return (igen_i915_gem_set_domain(file,
-		    (struct drm_i915_gem_set_domain *)data));
+		error = igen_i915_gem_set_domain(file,
+		    (struct drm_i915_gem_set_domain *)data);
+		break;
 	case I915_GEM_SW_FINISH_NR:
-		return (igen_i915_gem_sw_finish(file, data));
+		error = igen_i915_gem_sw_finish(file, data);
+		break;
 	case I915_GEM_THROTTLE_NR:
-		return (igen_i915_gem_throttle(file, data));
+		error = igen_i915_gem_throttle(file, data);
+		break;
 	case I915_GEM_VM_CREATE_NR:
-		return (igen_i915_gem_vm_create(file,
-		    (struct drm_i915_gem_vm_control *)data));
+		error = igen_i915_gem_vm_create(file,
+		    (struct drm_i915_gem_vm_control *)data);
+		break;
 	case I915_GEM_VM_DESTROY_NR:
-		return (igen_i915_gem_vm_destroy(file,
-		    (struct drm_i915_gem_vm_control *)data));
-	case I915_GEM_CONTEXT_CREATE_EXT_NR:
-		return (igen_i915_gem_context_create(file,
-		    (struct drm_i915_gem_context_create *)data));
+		error = igen_i915_gem_vm_destroy(file,
+		    (struct drm_i915_gem_vm_control *)data);
+		break;
+	case I915_GEM_CREATE_EXT_NR:
+		error = igen_i915_gem_create_ext(file,
+		    (struct drm_i915_gem_create_ext *)data);
+		break;
 	case I915_GET_RESET_STATS_NR:
-		return (igen_i915_get_reset_stats(file,
-		    (struct drm_i915_reset_stats *)data));
+		error = igen_i915_get_reset_stats(file,
+		    (struct drm_i915_reset_stats *)data);
+		break;
 	case I915_REG_READ_NR:
-		return (igen_i915_reg_read(file,
-		    (struct drm_i915_reg_read *)data));
+		error = igen_i915_reg_read(file,
+		    (struct drm_i915_reg_read *)data);
+		break;
 	case I915_GEM_EXECBUFFER2_NR:
-		return (igen_i915_gem_execbuffer2(file,
-		    (struct drm_i915_gem_execbuffer2 *)data));
+		error = igen_i915_gem_execbuffer2(file,
+		    (struct drm_i915_gem_execbuffer2 *)data);
+		break;
+	default:
+		error = ENOTTY;
+		break;
 	}
-	return (ENOTTY);
+
+	/*
+	 * Exit trace.  GEM_CREATE / MMAP_OFFSET / EXECBUFFER2 read back
+	 * key fields that iris uses for its next decision (size + handle
+	 * for the BO chain, mmap fake-offset for mapping, batch geometry
+	 * for execbuf).  Everything else just logs the return value.
+	 */
+	switch (i915_nr) {
+	case I915_GEM_CREATE_NR: {
+		const struct drm_i915_gem_create *c = data;
+
+		DPRINTF(sc, 2,
+		    "i915 ioctl GEM_CREATE exit err=%d size=0x%lx handle=%u\n",
+		    error, (u_long)c->size, c->handle);
+		break;
+	}
+	case I915_GEM_CREATE_EXT_NR: {
+		const struct drm_i915_gem_create_ext *c = data;
+
+		DPRINTF(sc, 2,
+		    "i915 ioctl GEM_CREATE_EXT exit err=%d size=0x%lx "
+		    "handle=%u flags=0x%x ext=0x%lx\n",
+		    error, (u_long)c->size, c->handle, c->flags,
+		    (u_long)c->extensions);
+		break;
+	}
+	case I915_GEM_MMAP_OFFSET_NR: {
+		const struct drm_i915_gem_mmap_offset *m = data;
+
+		DPRINTF(sc, 2,
+		    "i915 ioctl MMAP_OFFSET exit err=%d handle=%u "
+		    "offset=0x%lx\n",
+		    error, m->handle, (u_long)m->offset);
+		break;
+	}
+	case I915_GEM_MMAP_GTT_NR: {
+		const struct drm_i915_gem_mmap_gtt *m = data;
+
+		DPRINTF(sc, 2,
+		    "i915 ioctl GEM_MMAP_GTT exit err=%d handle=%u "
+		    "offset=0x%lx\n",
+		    error, m->handle, (u_long)m->offset);
+		break;
+	}
+	case I915_GEM_EXECBUFFER2_NR: {
+		const struct drm_i915_gem_execbuffer2 *e = data;
+
+		DPRINTF(sc, 2,
+		    "i915 ioctl EXECBUFFER2 exit err=%d bufs=%u "
+		    "batch_len=%u flags=0x%lx\n",
+		    error, e->buffer_count, e->batch_len,
+		    (u_long)e->flags);
+		break;
+	}
+	default:
+		DPRINTF(sc, 2, "i915 ioctl %s(0x%02x) exit err=%d\n",
+		    name != NULL ? name : "UNK", i915_nr, error);
+		break;
+	}
+
+	return (error);
 }
