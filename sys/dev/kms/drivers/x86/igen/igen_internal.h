@@ -12,6 +12,17 @@
 #ifndef _IGEN_INTERNAL_H_
 #define _IGEN_INTERNAL_H_
 
+/*
+ * Silicon generation constants used at every dispatch site.  Kept as
+ * integer "gen*10" values so HSW (gen 7.5) is representable alongside
+ * the whole-integer gens.  Use these in comparisons rather than bare
+ * literals so the dispatch seams are greppable.
+ */
+#define	IGEN_GEN_HSW	75	/* Haswell (gen 7.5) */
+#define	IGEN_GEN_SKL	9	/* Skylake / Kabylake / Coffee Lake */
+#define	IGEN_GEN_ICL	11	/* Ice Lake (placeholder) */
+#define	IGEN_GEN_TGL	12	/* Tiger Lake+ (placeholder) */
+
 #include <sys/types.h>
 #include <sys/bus.h>
 #include <sys/rman.h>
@@ -26,6 +37,8 @@
 #include <kms/drm_encoder.h>
 #include <kms/drm_framebuffer.h>
 #include <kms/drm_plane.h>
+
+#include "igen_aux.h"
 
 /*
  * 8 MiB scratch framebuffer used by the scanout playground.  Owned by
@@ -47,10 +60,16 @@ struct igen_test_fb {
 
 /*
  * User-FB GTT slot cache sizes.  Each ADDFB2 dumb buffer gets one slot
- * of USER_FB_GTT_SLOT_PAGES (8 MiB) at USER_FB_GTT_FIRST + slot*PAGES.
+ * of USER_FB_GTT_SLOT_PAGES (32 MiB) at USER_FB_GTT_FIRST + slot*PAGES.
+ *
+ * 32 MiB / slot covers the high end of what modesetting hands us in
+ * practice: 2880×1800 XR24 (Retina-class) is ~20 MiB, 3840×2160 XR24
+ * (4K) is ~32 MiB on the nose.  At 8 slots that's a 256 MiB GTT
+ * footprint, well inside the 2 GiB HSW aperture.  Bumping NSLOTS or
+ * SLOT_PAGES further only costs GTT address space, not memory.
  */
 #define	USER_FB_GTT_FIRST	0xa0000
-#define	USER_FB_GTT_SLOT_PAGES	2048
+#define	USER_FB_GTT_SLOT_PAGES	8192
 #define	USER_FB_GTT_NSLOTS	8
 
 /*
@@ -77,10 +96,17 @@ struct igen_softc {
 	uint16_t		 pci_id;
 
 	/*
-	 * Silicon generation: 9 = SKL / KBL / CFL, 11 = ICL, 12 = TGL+.
+	 * Silicon generation, as the integer "gen number" with one
+	 * fractional digit times ten so all values fit in an int:
+	 *   75 = HSW (Haswell / gen 7.5: BDW shares display IP enough
+	 *        to land here too, but only HSW is wired up today)
+	 *    9 = SKL / KBL / CFL (gen 9 / 9.5 display engine)
+	 *   11 = ICL, 12 = TGL+
 	 * Populated at attach from the PCI ID table.  Gen-specific code
-	 * paths (DPLL programming, DDI_BUF_TRANS table, power-well topology)
-	 * branch on this rather than carrying separate driver names.
+	 * paths (CDCLK programming, DPLL / WRPLL topology, DDI_BUF_TRANS
+	 * tables, power-well topology, PHY layout) branch on this rather
+	 * than carrying separate driver names.  Use the IGEN_GEN_* macros
+	 * below at the comparison sites so the seam is greppable.
 	 */
 	int			 gen;
 
@@ -106,6 +132,24 @@ struct igen_softc {
 	struct drm_plane	 primary;
 	struct drm_encoder	 encoder;
 	struct drm_connector	 connector;
+
+	/*
+	 * Per-DDI AUX channels.  Only those a physical port actually
+	 * uses are wired up at attach (DDI A always, others on demand
+	 * as DP/eDP sinks are detected via VBT/HPD).  Lives in igen_aux.c.
+	 */
+	struct igen_aux_channel	 aux_a;
+
+	/*
+	 * Cached EDID base block (128 bytes) from the last successful
+	 * acquisition path — GMBus or AUX-I2C.  The framework stores the
+	 * full EDID as a property blob (private), so we keep a local
+	 * copy here for the bring-up path to re-parse the DTD timings
+	 * when it programs the transcoder.  Length is 128 on a successful
+	 * read, 0 if we never got a valid EDID.
+	 */
+	uint8_t			 cached_edid[128];
+	size_t			 cached_edid_len;
 
 	/* Driver-owned scanout buffer (scanout_hold sysctl). */
 	struct igen_test_fb	*scanout_fb;
@@ -291,5 +335,15 @@ void	igen_gtt_register_sysctls(struct igen_softc *sc);
 
 /* Unwind held scanout + exposed FB on detach. */
 void	igen_gtt_detach(struct igen_softc *sc);
+
+/*
+ * igen_hsw_pipe.c — Haswell-specific pipe/transcoder/DDI bring-up.
+ * Owns the hsw_dp_dump (diagnostic) + hsw_panel_on (drives the panel
+ * from cold) sysctls and the lower-level helpers behind them.  The
+ * register_sysctls function is a no-op on non-HSW gens so igen.c can
+ * call it unconditionally.
+ */
+int	igen_hsw_panel_on(struct igen_softc *sc);
+void	igen_hsw_pipe_register_sysctls(struct igen_softc *sc);
 
 #endif /* _IGEN_INTERNAL_H_ */

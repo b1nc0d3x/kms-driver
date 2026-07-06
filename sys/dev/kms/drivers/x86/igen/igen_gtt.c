@@ -453,10 +453,26 @@ igen_sysctl_scanout_hold(SYSCTL_HANDLER_ARGS)
 		return (error);
 
 	if (hold && !sc->scanout_held) {
+		uint32_t w = 1920, h = 1080;
+		/*
+		 * Prefer the connector's native mode if we have an EDID
+		 * cached — that's what the transcoder will be programmed
+		 * for if we go through hsw_panel_on, and a mismatched
+		 * source / pipe size scans junk.
+		 */
+		if (sc->cached_edid_len >= 128) {
+			const uint8_t *d = sc->cached_edid + 54;
+			uint32_t hactive = d[2] | ((d[4] & 0xf0) << 4);
+			uint32_t vactive = d[5] | ((d[7] & 0xf0) << 4);
+			if (hactive >= 640 && hactive <= 8192 &&
+			    vactive >= 480 && vactive <= 8192) {
+				w = hactive;
+				h = vactive;
+			}
+		}
 		sc->scanout_fb = malloc(sizeof(*sc->scanout_fb),
 		    M_KMS, M_WAITOK | M_ZERO);
-		error = igen_test_fb_alloc(sc, sc->scanout_fb,
-		    1920, 1080);
+		error = igen_test_fb_alloc(sc, sc->scanout_fb, w, h);
 		if (error != 0) {
 			device_printf(sc->dev,
 			    "scanout_hold: alloc failed: %d\n", error);

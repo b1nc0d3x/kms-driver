@@ -66,24 +66,95 @@
 #define	INTEL_PCI_VENDOR	0x8086
 
 /*
- * Gen9 PCI IDs.  Sourced from Intel's "graphics-pciids" header; this is a
- * representative subset that covers the bulk of Skylake-S / -H / -U laptops
- * and desktops 2015-2018 plus Kabylake / Coffee Lake refreshes (which share
- * the gen9 / gen9.5 display engine).  Add more here as they're observed
- * in the wild.
- */
-/*
- * Each PCI ID carries the silicon generation it belongs to (9 for
- * Skylake / Kabylake / Coffee Lake — they share the gen9/9.5 display
- * engine; future entries will carry 11, 12, etc.).  igen_attach copies
- * gen into the softc so per-gen code paths can branch on it without
- * re-scanning the ID table.
+ * Intel PCI IDs igen attaches to.  Sourced from Intel's
+ * "graphics-pciids" header.  Each entry carries the silicon generation
+ * it belongs to:
+ *   75 = Haswell (gen 7.5) — display engine: LCPLL-fed CDCLK,
+ *        WRPLL1/2 + SPLL for clock generation, single PWELL1 for
+ *        non-AON power, DDI A (eDP) / B / C / D + DDI E on -ULT.
+ *    9 = Skylake / Kabylake / Coffee Lake — gen9/9.5 display engine:
+ *        CD2X-divider CDCLK, DPLL0..3 with WRPLL fractional-N solver,
+ *        PWELL1 + PWELL2 + DC_OFF/DC5/DC6.
+ * igen_attach copies gen into the softc so per-gen code paths can
+ * branch on it without re-scanning this table.  Use IGEN_GEN_*
+ * (igen_internal.h) at comparison sites.
  */
 static const struct {
 	uint16_t	id;
 	uint8_t		gen;
 	const char	*desc;
 } igen_ids[] = {
+	/*
+	 * Haswell (gen 7.5).  All shipping desktop / mobile / mobile
+	 * GT3e SKUs, including the BGA-only Crystal Well GT3e (Iris Pro
+	 * 5200) found in NUCs and the 2013-2015 Retina MBPs.
+	 *
+	 * Encoding rule per i915: bits[15:12]=0x0 desktop/mobile chassis
+	 * tag, bits[11:8] mark the GT tier (0/1=GT1, 2=GT2, 6=GT3 / 5200,
+	 * a=ULT), bits[7:0] are stepping/sub-SKU.
+	 */
+	{ 0x0402, IGEN_GEN_HSW, "Intel HD (Haswell Desktop GT1)" },
+	{ 0x0412, IGEN_GEN_HSW, "Intel HD 4600 (Haswell Desktop GT2)" },
+	{ 0x0422, IGEN_GEN_HSW, "Intel HD (Haswell Desktop GT3)" },
+	{ 0x0406, IGEN_GEN_HSW, "Intel HD (Haswell Mobile GT1)" },
+	{ 0x0416, IGEN_GEN_HSW, "Intel HD 4600 (Haswell Mobile GT2)" },
+	{ 0x0426, IGEN_GEN_HSW, "Intel HD 5000 (Haswell Mobile GT3)" },
+	{ 0x040a, IGEN_GEN_HSW, "Intel HD (Haswell Server GT1)" },
+	{ 0x041a, IGEN_GEN_HSW, "Intel HD P4600/P4700 (Haswell Server GT2)" },
+	{ 0x042a, IGEN_GEN_HSW, "Intel HD (Haswell Server GT3)" },
+	{ 0x040b, IGEN_GEN_HSW, "Intel HD (Haswell Reserved GT1)" },
+	{ 0x041b, IGEN_GEN_HSW, "Intel HD (Haswell Reserved GT2)" },
+	{ 0x042b, IGEN_GEN_HSW, "Intel HD (Haswell Reserved GT3)" },
+	{ 0x040e, IGEN_GEN_HSW, "Intel HD (Haswell CRW GT1)" },
+	{ 0x041e, IGEN_GEN_HSW, "Intel HD 4400 (Haswell CRW GT2)" },
+	{ 0x042e, IGEN_GEN_HSW, "Intel HD (Haswell CRW GT3)" },
+	{ 0x0a02, IGEN_GEN_HSW, "Intel HD (Haswell ULT GT1)" },
+	{ 0x0a12, IGEN_GEN_HSW, "Intel HD (Haswell ULT GT2)" },
+	{ 0x0a22, IGEN_GEN_HSW, "Intel HD 5000 (Haswell ULT GT3)" },
+	{ 0x0a06, IGEN_GEN_HSW, "Intel HD (Haswell ULT GT1)" },
+	{ 0x0a16, IGEN_GEN_HSW, "Intel HD 4400 (Haswell ULT GT2)" },
+	{ 0x0a26, IGEN_GEN_HSW, "Intel HD 5000 (Haswell ULT GT3)" },
+	{ 0x0a0a, IGEN_GEN_HSW, "Intel HD (Haswell ULT GT1)" },
+	{ 0x0a1a, IGEN_GEN_HSW, "Intel HD (Haswell ULT GT2)" },
+	{ 0x0a2a, IGEN_GEN_HSW, "Intel HD (Haswell ULT GT3)" },
+	{ 0x0a0b, IGEN_GEN_HSW, "Intel HD (Haswell ULT GT1 Reserved)" },
+	{ 0x0a1b, IGEN_GEN_HSW, "Intel HD (Haswell ULT GT2 Reserved)" },
+	{ 0x0a2b, IGEN_GEN_HSW, "Intel HD (Haswell ULT GT3 Reserved)" },
+	{ 0x0a0e, IGEN_GEN_HSW, "Intel HD (Haswell ULX GT1)" },
+	{ 0x0a1e, IGEN_GEN_HSW, "Intel HD (Haswell ULX GT2)" },
+	{ 0x0a2e, IGEN_GEN_HSW, "Intel Iris 5100 (Haswell ULX GT3)" },
+	{ 0x0c02, IGEN_GEN_HSW, "Intel HD (Haswell SDV GT1)" },
+	{ 0x0c12, IGEN_GEN_HSW, "Intel HD (Haswell SDV GT2)" },
+	{ 0x0c22, IGEN_GEN_HSW, "Intel HD (Haswell SDV GT3)" },
+	{ 0x0c06, IGEN_GEN_HSW, "Intel HD (Haswell SDV Mobile GT1)" },
+	{ 0x0c16, IGEN_GEN_HSW, "Intel HD P4600/P4700 (Haswell SDV Mobile GT2)" },
+	{ 0x0c26, IGEN_GEN_HSW, "Intel HD (Haswell SDV Mobile GT3)" },
+	{ 0x0c0a, IGEN_GEN_HSW, "Intel HD (Haswell SDV Server GT1)" },
+	{ 0x0c1a, IGEN_GEN_HSW, "Intel HD (Haswell SDV Server GT2)" },
+	{ 0x0c2a, IGEN_GEN_HSW, "Intel HD (Haswell SDV Server GT3)" },
+	{ 0x0c0b, IGEN_GEN_HSW, "Intel HD (Haswell SDV Reserved GT1)" },
+	{ 0x0c1b, IGEN_GEN_HSW, "Intel HD (Haswell SDV Reserved GT2)" },
+	{ 0x0c2b, IGEN_GEN_HSW, "Intel HD (Haswell SDV Reserved GT3)" },
+	{ 0x0c0e, IGEN_GEN_HSW, "Intel HD (Haswell SDV CRW GT1)" },
+	{ 0x0c1e, IGEN_GEN_HSW, "Intel HD (Haswell SDV CRW GT2)" },
+	{ 0x0c2e, IGEN_GEN_HSW, "Intel HD (Haswell SDV CRW GT3)" },
+	{ 0x0d02, IGEN_GEN_HSW, "Intel HD (Haswell CRW Desktop GT1)" },
+	{ 0x0d12, IGEN_GEN_HSW, "Intel HD 4600 (Haswell CRW Desktop GT2)" },
+	{ 0x0d22, IGEN_GEN_HSW, "Intel Iris Pro 5200 (Haswell CRW Desktop GT3e)" },
+	{ 0x0d06, IGEN_GEN_HSW, "Intel HD (Haswell CRW Mobile GT1)" },
+	{ 0x0d16, IGEN_GEN_HSW, "Intel HD 4600 (Haswell CRW Mobile GT2)" },
+	{ 0x0d26, IGEN_GEN_HSW, "Intel Iris Pro 5200 (Haswell CRW Mobile GT3e)" },
+	{ 0x0d0a, IGEN_GEN_HSW, "Intel HD (Haswell CRW Server GT1)" },
+	{ 0x0d1a, IGEN_GEN_HSW, "Intel HD (Haswell CRW Server GT2)" },
+	{ 0x0d2a, IGEN_GEN_HSW, "Intel Iris Pro P5200 (Haswell CRW Server GT3e)" },
+	{ 0x0d0b, IGEN_GEN_HSW, "Intel HD (Haswell CRW Reserved GT1)" },
+	{ 0x0d1b, IGEN_GEN_HSW, "Intel HD (Haswell CRW Reserved GT2)" },
+	{ 0x0d2b, IGEN_GEN_HSW, "Intel Iris Pro (Haswell CRW Reserved GT3e)" },
+	{ 0x0d0e, IGEN_GEN_HSW, "Intel HD (Haswell CRW GT1)" },
+	{ 0x0d1e, IGEN_GEN_HSW, "Intel HD (Haswell CRW GT2)" },
+	{ 0x0d2e, IGEN_GEN_HSW, "Intel Iris Pro (Haswell CRW GT3e)" },
+
+	/* Skylake / Kabylake / Coffee Lake — gen 9 / 9.5. */
 	{ 0x1902, 9, "Intel HD 510 (Skylake GT1)" },
 	{ 0x1906, 9, "Intel HD 510 (Skylake GT1 ULT)" },
 	{ 0x190b, 9, "Intel HD 510 (Skylake GT1 Halo)" },
@@ -476,6 +547,11 @@ igen_re_sysctls_init(struct igen_softc *sc)
 	 * are owned by igen_dpll.c.
 	 */
 	igen_dpll_register_sysctls(sc);
+	/*
+	 * Haswell pipe/transcoder/DDI bring-up sysctls (no-op on
+	 * non-HSW gens; the function itself early-returns).
+	 */
+	igen_hsw_pipe_register_sysctls(sc);
 
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "current_mode",
@@ -934,8 +1010,96 @@ igen_edid_to_mode(const uint8_t *d, struct drm_display_mode *m)
 	kms_mode_set_name(m);
 }
 
+/*
+ * Walk the populated EDID buffer's 4 DTD slots, build drm_display_mode
+ * entries, and publish them on the connector.  Shared between the
+ * GMBus (HDMI) and AUX (DP/eDP) EDID acquisition paths so the parse
+ * logic doesn't fork.
+ */
 static int
-igen_attach_edid_modes(struct igen_softc *sc)
+igen_publish_edid(struct igen_softc *sc, const uint8_t *edid, size_t len)
+{
+	int published = 0;
+
+	if (len < 128 || edid[0] != 0x00 || edid[1] != 0xff || edid[7] != 0x00) {
+		device_printf(sc->dev, "edid: header invalid\n");
+		return (EIO);
+	}
+	for (int i = 54; i <= 108; i += 18) {
+		if (edid[i] == 0 && edid[i + 1] == 0)
+			continue;
+		struct drm_display_mode *m = kms_mode_create();
+		if (m == NULL)
+			return (ENOMEM);
+		igen_edid_to_mode(&edid[i], m);
+		kms_connector_add_mode(&sc->connector, m);
+		published++;
+		device_printf(sc->dev,
+		    "edid: added mode %s @%u kHz  %u Hz  flags=0x%x\n",
+		    m->name, m->clock, m->vrefresh, m->flags);
+	}
+	(void)kms_connector_update_edid(&sc->connector, edid, len);
+	sc->connector.status = connector_status_connected;
+	/*
+	 * Cache the base block locally so the HSW bring-up path can
+	 * re-parse the preferred DTD when programming the transcoder
+	 * without going back through the framework property store.
+	 */
+	if (len >= sizeof(sc->cached_edid)) {
+		memcpy(sc->cached_edid, edid, sizeof(sc->cached_edid));
+		sc->cached_edid_len = sizeof(sc->cached_edid);
+	}
+	return (published > 0 ? 0 : ENOENT);
+}
+
+/*
+ * Try AUX-EDID on DDI_A.  Used on HSW when PORT_CLK_SEL of DDI_A is
+ * driven by LCPLL (the firmware-programmed eDP panel).  EDID lives at
+ * I2C address 0x50 over the DP I2C-over-AUX channel.  Returns 0 on
+ * success.
+ *
+ * Validates eDP capability before reading EDID: a successful DPCD rev
+ * read confirms the AUX channel is wired and the sink answers — that
+ * also tells us whether we should re-tag the connector as eDP.
+ */
+static int
+igen_attach_edid_modes_aux_a(struct igen_softc *sc)
+{
+	uint8_t edid[128];
+	uint8_t dpcd_rev = 0;
+	ssize_t got;
+	int error;
+
+	got = kms_dp_dpcd_read(&sc->aux_a.aux, 0x000, &dpcd_rev, 1);
+	if (got != 1) {
+		DPRINTF(sc, 1, "edid/aux: DPCD rev read failed (%zd)\n", got);
+		return (EIO);
+	}
+	device_printf(sc->dev, "edid/aux: DDI_A DPCD rev=0x%02x\n", dpcd_rev);
+
+	error = igen_aux_i2c_read_block(&sc->aux_a.aux, EDID_SLAVE, 0,
+	    edid, sizeof(edid));
+	if (error < 0) {
+		DPRINTF(sc, 1, "edid/aux: I2C-AUX read failed (%d)\n", error);
+		return (-error);
+	}
+	if (error < (int)sizeof(edid)) {
+		device_printf(sc->dev,
+		    "edid/aux: short read %d/%zu — sink truncated\n",
+		    error, sizeof(edid));
+		return (EIO);
+	}
+	return (igen_publish_edid(sc, edid, sizeof(edid)));
+}
+
+/*
+ * Try GMBus-EDID on PCH pin DDI_B (canonical SKL+ HDMI-B map).  The
+ * pre-HSW path; retained for HDMI ports on any gen that wires a
+ * working GMBus pin (HSW with a real HDMI sink, SKL with HDMI-B
+ * captured in the original baseline).
+ */
+static int
+igen_attach_edid_modes_gmbus_b(struct igen_softc *sc)
 {
 	uint8_t edid[128];
 	int error = EIO;
@@ -951,36 +1115,50 @@ igen_attach_edid_modes(struct igen_softc *sc)
 		if (error == 0)
 			break;
 		DPRINTF(sc, 1,
-		    "edid: GMBus read attempt %d failed (%d), retrying\n",
+		    "edid/gmbus: read attempt %d failed (%d), retrying\n",
 		    try + 1, error);
 		DELAY(5000);
 	}
-	if (error != 0) {
-		device_printf(sc->dev,
-		    "edid: GMBus read gave up — connector stays UNKNOWN\n");
+	if (error != 0)
 		return (error);
-	}
-	if (edid[0] != 0x00 || edid[1] != 0xff || edid[7] != 0x00) {
-		device_printf(sc->dev, "edid: header invalid\n");
-		return (EIO);
+	return (igen_publish_edid(sc, edid, sizeof(edid)));
+}
+
+static int
+igen_attach_edid_modes(struct igen_softc *sc)
+{
+	int error = ENOENT;
+
+	/*
+	 * On HSW, the firmware almost always brings up the eDP panel on
+	 * DDI_A (LCPLL-fed PORT_CLK_SEL).  Try AUX-EDID there first so
+	 * the internal panel registers as the live sink with its native
+	 * mode — without this the Apple Retina panel on macbsd shows up
+	 * with zero modes and Xorg refuses to set a config.
+	 *
+	 * Detection rule: PORT_CLK_SEL of DDI_A is non-NONE (top 3 bits
+	 * != 7).  That covers LCPLL_2700 / LCPLL_1350 / LCPLL_810 / SPLL
+	 * / WRPLL1 / WRPLL2 — anything except "port idle".
+	 */
+	if (sc->gen == IGEN_GEN_HSW) {
+		uint32_t sel = igen_r32(sc, 0x00046100u);	/* DDI_A */
+
+		if (((sel >> 29) & 7) != 7) {
+			error = igen_attach_edid_modes_aux_a(sc);
+			if (error == 0)
+				return (0);
+			device_printf(sc->dev,
+			    "edid/aux: DDI_A read failed (%d), trying GMBus-B"
+			    " as fallback\n", error);
+		}
 	}
 
-	for (int i = 54; i <= 108; i += 18) {
-		/* Skip non-DTD descriptors (pixclk == 0). */
-		if (edid[i] == 0 && edid[i + 1] == 0)
-			continue;
-		struct drm_display_mode *m = kms_mode_create();
-		if (m == NULL)
-			return (ENOMEM);
-		igen_edid_to_mode(&edid[i], m);
-		kms_connector_add_mode(&sc->connector, m);
-		DPRINTF(sc, 0,
-		    "edid: added mode %s @%u kHz  %u Hz  flags=0x%x\n",
-		    m->name, m->clock, m->vrefresh, m->flags);
-	}
-	(void)kms_connector_update_edid(&sc->connector, edid, sizeof(edid));
-	sc->connector.status = connector_status_connected;
-	return (0);
+	/* GMBus path (SKL canonical; HSW fallback when DDI_A is idle). */
+	error = igen_attach_edid_modes_gmbus_b(sc);
+	if (error != 0)
+		device_printf(sc->dev,
+		    "edid: all paths failed — connector stays UNKNOWN\n");
+	return (error);
 }
 
 /* HPD live decoder lives in igen_hpd.c. */
@@ -1160,6 +1338,31 @@ igen_sysctl_cap_dump(SYSCTL_HANDLER_ARGS)
 #define	GEN8_DE_PIPE_IER(p)		(0x0004440c + (p) * 0x10000)
 #define	GEN8_PIPE_VBLANK		(1u << 0)
 
+/*
+ * Haswell (gen 7.5) IRQ layout — completely different from BDW+.
+ * Single DEISR/DEIMR/DEIIR/DEIER block at 0x44000, with per-pipe and
+ * per-port event bits packed into bit fields rather than per-pipe
+ * banks.  We define the addresses here for the gen-aware path; full
+ * HSW IRQ handler implementation is a follow-up.
+ *
+ * IMPORTANT: writing GEN8_* registers above on HSW lands on RESERVED
+ * MMIO offsets that, in observed practice, destabilise the PCIe link
+ * arbiter and take down xhci (USB host controller halt → USB ethernet
+ * goes offline → we lose ssh).  Until HSW IRQ handling is implemented,
+ * the safe path is to skip MSI/IRQ alloc and register access entirely
+ * for HSW and rely on framework polled vblank.
+ */
+#define	HSW_DEISR			0x00044000
+#define	HSW_DEIMR			0x00044004
+#define	HSW_DEIIR			0x00044008
+#define	HSW_DEIER			0x0004400c
+#define	  HSW_DE_PIPE_A_VBLANK		(1u << 0)
+#define	  HSW_DE_PIPE_B_VBLANK		(1u << 5)
+#define	  HSW_DE_PIPE_C_VBLANK		(1u << 10)
+#define	  HSW_DE_MASTER_IRQ_CONTROL	(0u)	/* HSW has no master bit —
+						   DEIER bit being set per-event
+						   is the enable. */
+
 static void
 igen_irq_handler(void *arg)
 {
@@ -1215,6 +1418,22 @@ igen_irq_setup(struct igen_softc *sc)
 {
 	int msi_count = 1;
 	int error;
+
+	/*
+	 * HSW uses a different IRQ register layout (DEIMR/DEIIR/DEIER/
+	 * DEISR @ 0x44000-0x4400C, single regs not per-pipe) and the
+	 * GEN8_* writes below land on reserved MMIO that destabilises
+	 * the PCIe link arbiter (observed: xhci controller halt → USB
+	 * ethernet drop on macbsd).  Skip IRQ alloc on HSW entirely
+	 * until the HSW IRQ path is implemented; framework polled
+	 * vblank covers display correctness in the meantime.
+	 */
+	if (sc->gen == IGEN_GEN_HSW) {
+		device_printf(sc->dev,
+		    "irq: skipped on gen75/HSW (using polled vblank;"
+		    " HSW DEIMR/DEIIR/DEIER path not implemented yet)\n");
+		return (0);
+	}
 
 	/*
 	 * Quiesce: master off, per-pipe banks all masked / IIRs cleared.
@@ -1275,12 +1494,19 @@ igen_irq_teardown(struct igen_softc *sc)
 {
 	if (sc->irq_res == NULL)
 		return;
-	/* Master off, per-pipe banks masked + cleared. */
-	igen_w32(sc, GEN8_MASTER_IRQ, 0);
-	for (int p = 0; p < 3; p++) {
-		igen_w32(sc, GEN8_DE_PIPE_IMR(p), 0xffffffff);
-		igen_w32(sc, GEN8_DE_PIPE_IER(p), 0);
-		igen_w32(sc, GEN8_DE_PIPE_IIR(p), 0xffffffff);
+	/*
+	 * Master off, per-pipe banks masked + cleared.  Only valid on
+	 * gens that use the GEN8 IRQ layout (BDW+ / SKL+).  HSW never
+	 * brought irq_res up so we won't reach here on HSW, but guard
+	 * anyway in case future code changes that.
+	 */
+	if (sc->gen != IGEN_GEN_HSW) {
+		igen_w32(sc, GEN8_MASTER_IRQ, 0);
+		for (int p = 0; p < 3; p++) {
+			igen_w32(sc, GEN8_DE_PIPE_IMR(p), 0xffffffff);
+			igen_w32(sc, GEN8_DE_PIPE_IER(p), 0);
+			igen_w32(sc, GEN8_DE_PIPE_IIR(p), 0xffffffff);
+		}
 	}
 
 	bus_teardown_intr(sc->dev, sc->irq_res, sc->irq_cookie);
@@ -1799,13 +2025,35 @@ igen_attach(device_t dev)
 		 */
 		sc->encoder.possible_crtcs = 1u;
 	}
+	/*
+	 * Connector type: on HSW with DDI_A driven by LCPLL the firmware
+	 * is scanning the internal eDP panel and the right userspace
+	 * tag is eDP, not HDMIA.  Apple eDP panels also refuse a few
+	 * power-management DPCD writes that Xorg modesetting emits when
+	 * the connector is mistyped — so getting this right matters for
+	 * the first modeset, not just for cosmetics.
+	 */
+	uint32_t conn_type = DRM_MODE_CONNECTOR_HDMIA;
+	if (sc->gen == IGEN_GEN_HSW) {
+		uint32_t sel_a = igen_r32(sc, 0x00046100u);
+
+		if (((sel_a >> 29) & 7) != 7)
+			conn_type = DRM_MODE_CONNECTOR_eDP;
+	}
 	if (error == 0)
 		error = kms_connector_init(sc->drm_dev, &sc->connector,
-		    &igen_connector_funcs,
-		    DRM_MODE_CONNECTOR_HDMIA);
+		    &igen_connector_funcs, conn_type);
 	if (error == 0)
 		error = kms_connector_attach_encoder(&sc->connector,
 		    &sc->encoder);
+
+	/*
+	 * AUX channel for DDI A (always; the framework helpers are
+	 * harmless to register even if no eDP panel is wired).  Adding
+	 * DDI B/C/D/E channels lands when external DP/DP++ sinks are
+	 * detected via VBT or HPD live state.
+	 */
+	igen_aux_init(sc, &sc->aux_a, 0, "DDI_A");
 	if (error != 0)
 		device_printf(dev, "topology init: %d (will appear with"
 		    " empty/partial resources)\n", error);

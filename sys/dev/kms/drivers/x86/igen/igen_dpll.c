@@ -66,6 +66,82 @@
  */
 #define	CDCLK_CTL		0x00046000
 
+/*
+ * Haswell display clock registers.  On HSW, CDCLK is driven from
+ * LCPLL @ 0x130040 with a 3-way frequency select (450 / 540 / 337.5 MHz;
+ * the 675 MHz tier is BDW+ via LCPLL_BIAS).  HSW has two display PLLs
+ * for HDMI/DVI: WRPLL1 and WRPLL2 (same MMIO offsets as SKL's WRPLL
+ * ENABLE regs but their CTL register is at the same offset — bit
+ * layout differs).  SPLL @ 0x46020 is the single-PLL DisplayPort
+ * source clock.
+ *
+ * Per-port clock select on HSW lives in PORT_CLK_SEL (3 bits at
+ * DDI_BUF_CTL[31:29] in older parts; on HSW the port-clock-select
+ * register is at 0x46100 + port*4 instead — read-only feedback of the
+ * PORT_CLK_SEL field driven from PORT_CLK_SEL bits of DPLL_CFG).
+ */
+#define	HSW_LCPLL_CTL		0x00130040
+#define	HSW_LCPLL_CD_SOURCE_FCLK	(1u << 21)
+#define	HSW_LCPLL_CLK_FREQ_MASK		(3u << 26)
+#define	HSW_LCPLL_CLK_FREQ_SHIFT	26
+/*
+ * LCPLL CD freq encoding (BSpec haswell-display, vol4 LCPLL_CTL):
+ *   00 = 450 MHz, 01 = 540 MHz, 10 = 337.5 MHz, 11 = 675 MHz (reserved)
+ */
+#define	HSW_WRPLL1_CTL		0x00046040
+#define	HSW_WRPLL2_CTL		0x00046060
+#define	HSW_SPLL_CTL		0x00046020
+#define	HSW_PORT_CLK_SEL(p)	(0x00046100u + (p) * 4u)
+#define	  HSW_PORT_CLK_SEL_SHIFT	29
+#define	  HSW_PORT_CLK_SEL_MASK		(7u << 29)
+/*
+ * PORT_CLK_SEL bit values (HSW BSpec):
+ *   000 = LCPLL_2700, 001 = LCPLL_1350, 010 = LCPLL_810, 011 = SPLL,
+ *   100 = WRPLL1, 101 = WRPLL2, 111 = NONE
+ */
+
+/*
+ * HSW power well (single PWELL1 — gates the entire display engine
+ * except always-on resources).  Bits per BSpec:
+ *   bit 31 = ENABLE_REQUEST
+ *   bit 30 = STATE  (read-only)
+ * Per-port-well select fields live in bits[29:16] but on HSW
+ * everything except DDI A always-on goes through the same well.
+ */
+#define	HSW_PWR_WELL_CTL1	0x00045400	/* BIOS-owned */
+#define	HSW_PWR_WELL_CTL2	0x00045404	/* driver-owned */
+#define	HSW_PWR_WELL_CTL3	0x00045408
+#define	HSW_PWR_WELL_CTL4	0x0004540c
+#define	  HSW_PWR_WELL_ENABLE_REQUEST	(1u << 31)
+#define	  HSW_PWR_WELL_STATE		(1u << 30)
+
+static const char *
+igen_hsw_lcpll_freq_str(uint32_t lcpll)
+{
+	switch ((lcpll & HSW_LCPLL_CLK_FREQ_MASK) >> HSW_LCPLL_CLK_FREQ_SHIFT) {
+	case 0:	return "450 MHz";
+	case 1:	return "540 MHz";
+	case 2:	return "337.5 MHz";
+	case 3:	return "675 MHz (BDW)";
+	default: return "?";
+	}
+}
+
+static const char *
+igen_hsw_port_clk_str(uint32_t sel)
+{
+	switch ((sel & HSW_PORT_CLK_SEL_MASK) >> HSW_PORT_CLK_SEL_SHIFT) {
+	case 0:	return "LCPLL_2700";
+	case 1:	return "LCPLL_1350";
+	case 2:	return "LCPLL_810";
+	case 3:	return "SPLL";
+	case 4:	return "WRPLL1";
+	case 5:	return "WRPLL2";
+	case 7:	return "NONE";
+	default: return "?";
+	}
+}
+
 static const char *
 igen_cdclk_decode(uint32_t cdclk_ctl)
 {
@@ -96,16 +172,9 @@ igen_cdclk_decode(uint32_t cdclk_ctl)
 #define	LCPLL1_CTL		0x00046010
 #define	LCPLL2_CTL		0x00046014
 
-static int
-igen_sysctl_clock_state(SYSCTL_HANDLER_ARGS)
+static void
+igen_clock_state_skl(struct igen_softc *sc)
 {
-	struct igen_softc *sc = arg1;
-	int trigger = 0;
-	int error = sysctl_handle_int(oidp, &trigger, 0, req);
-
-	if (error || req->newptr == NULL || trigger == 0)
-		return (error);
-
 	uint32_t cdclk = igen_r32(sc, CDCLK_CTL);
 	uint32_t lcpll1 = igen_r32(sc, LCPLL1_CTL);
 	uint32_t lcpll2 = igen_r32(sc, LCPLL2_CTL);
@@ -140,6 +209,76 @@ igen_sysctl_clock_state(SYSCTL_HANDLER_ARGS)
 		    "  DDI_%c: %s  DPLL_SEL=%u (DPLL%u)%s\n",
 		    'A' + port, off ? "CLOCK_OFF" : "clock-on", sel, sel,
 		    ovr ? "  OVERRIDE" : "");
+	}
+}
+
+static void
+igen_clock_state_hsw(struct igen_softc *sc)
+{
+	/*
+	 * HSW has no SKL-style CDCLK_CTL / DPLL_CTRL{1,2}; the display
+	 * clock is fed from LCPLL with a small 3-way frequency select,
+	 * and per-port routing is read out of PORT_CLK_SEL.  WRPLL1/2 +
+	 * SPLL gate themselves via their own CTL bit 31 = ENABLE.
+	 */
+	uint32_t lcpll = igen_r32(sc, HSW_LCPLL_CTL);
+	uint32_t wrpll1 = igen_r32(sc, HSW_WRPLL1_CTL);
+	uint32_t wrpll2 = igen_r32(sc, HSW_WRPLL2_CTL);
+	uint32_t spll = igen_r32(sc, HSW_SPLL_CTL);
+	uint32_t pw1 = igen_r32(sc, HSW_PWR_WELL_CTL1);
+	uint32_t pw2 = igen_r32(sc, HSW_PWR_WELL_CTL2);
+
+	device_printf(sc->dev,
+	    "clock: LCPLL_CTL=0x%08x  (CDCLK=%s, CD_SOURCE=%s)\n",
+	    lcpll, igen_hsw_lcpll_freq_str(lcpll),
+	    (lcpll & HSW_LCPLL_CD_SOURCE_FCLK) ? "FCLK" : "LCPLL");
+	device_printf(sc->dev,
+	    "clock: WRPLL1_CTL=0x%08x  WRPLL2_CTL=0x%08x  SPLL_CTL=0x%08x\n",
+	    wrpll1, wrpll2, spll);
+	device_printf(sc->dev,
+	    "  WRPLL1 %s  WRPLL2 %s  SPLL %s\n",
+	    (wrpll1 & (1u << 31)) ? "ENABLED" : "off",
+	    (wrpll2 & (1u << 31)) ? "ENABLED" : "off",
+	    (spll & (1u << 31)) ? "ENABLED" : "off");
+	device_printf(sc->dev,
+	    "pwell: PWR_WELL_CTL1=0x%08x  (BIOS req=%u state=%u)\n",
+	    pw1,
+	    (pw1 & HSW_PWR_WELL_ENABLE_REQUEST) ? 1 : 0,
+	    (pw1 & HSW_PWR_WELL_STATE) ? 1 : 0);
+	device_printf(sc->dev,
+	    "pwell: PWR_WELL_CTL2=0x%08x  (drv req=%u state=%u)\n",
+	    pw2,
+	    (pw2 & HSW_PWR_WELL_ENABLE_REQUEST) ? 1 : 0,
+	    (pw2 & HSW_PWR_WELL_STATE) ? 1 : 0);
+	for (int port = 0; port < 5; port++) {
+		uint32_t sel = igen_r32(sc, HSW_PORT_CLK_SEL(port));
+		device_printf(sc->dev,
+		    "  DDI_%c PORT_CLK_SEL=0x%08x  source=%s\n",
+		    'A' + port, sel, igen_hsw_port_clk_str(sel));
+	}
+}
+
+static int
+igen_sysctl_clock_state(SYSCTL_HANDLER_ARGS)
+{
+	struct igen_softc *sc = arg1;
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+
+	if (error || req->newptr == NULL || trigger == 0)
+		return (error);
+
+	switch (sc->gen) {
+	case IGEN_GEN_HSW:
+		igen_clock_state_hsw(sc);
+		break;
+	case IGEN_GEN_SKL:
+		igen_clock_state_skl(sc);
+		break;
+	default:
+		device_printf(sc->dev,
+		    "clock_state: no decoder for gen%d\n", sc->gen);
+		return (EOPNOTSUPP);
 	}
 	return (0);
 }
@@ -1442,10 +1581,26 @@ igen_dpll_register_sysctls(struct igen_softc *sc)
 	struct sysctl_oid_list *children =
 	    SYSCTL_CHILDREN(sc->re_sysctl_tree);
 
+	/*
+	 * clock_state is registered on every gen; the handler itself
+	 * dispatches to a per-gen body (HSW LCPLL/WRPLL/SPLL vs SKL
+	 * DPLL_CTRL1/2/CDCLK_CTL).  Read-only, safe everywhere.
+	 */
 	SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "clock_state",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
 	    sc, 0, igen_sysctl_clock_state, "I",
-	    "write 1 to dump CDCLK / LCPLL / DPLL / DDI clock-on-off state");
+	    "write 1 to dump display-clock state (decoded per gen)");
+
+	/*
+	 * Everything below this point writes SKL-specific register
+	 * layouts (DPLL_CTRL1/2, the gen9 WRPLL CFGCR1/2, the SKL
+	 * power-well topology).  Register them only on gen9 so users
+	 * on other gens see an honest "no such sysctl" rather than a
+	 * handler that would silently scribble the wrong bits.  HSW
+	 * gets its own bring-up sysctls in a parallel block below.
+	 */
+	if (sc->gen != IGEN_GEN_SKL)
+		goto register_gen_specific;
 
 	SYSCTL_ADD_UINT(ctx, children, OID_AUTO,
 	    "wrpll_target_khz", CTLFLAG_RW, &sc->wrpll_target_khz, 0,
@@ -1514,4 +1669,14 @@ igen_dpll_register_sysctls(struct igen_softc *sc)
 	    sc, 0, igen_sysctl_try_pipe_resume, "I",
 	    "write 1 to write BASELINE timing/format and enable Pipe A ->"
 	    " DDI_B (HDMI 1920x1080@60); upstream clocks must be alive");
+
+register_gen_specific:
+	/*
+	 * Per-gen bring-up sysctls land below.  HSW currently exposes
+	 * only the read-only clock_state above; write-side helpers
+	 * (LCPLL CD_FREQ change, WRPLL{1,2} program, SPLL program,
+	 * PWR_WELL_CTL2 request) land here as they're implemented.
+	 */
+	(void)ctx;
+	(void)children;
 }
