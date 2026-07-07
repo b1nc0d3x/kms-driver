@@ -35,15 +35,17 @@
  *      page-flips).
  *   8. PLANE_CTL[A] ENABLE — first pixel hits the panel.
  *
- * Exposed as two sysctls so we can drive bring-up by hand during
- * diagnosis before promoting it inside atomic_commit:
+ * igen_hsw_panel_on() is called from igen_atomic_commit when the pipe
+ * is cold — that's the normal path once a compositor requests a
+ * mode set on macbsd.  The two sysctls remain for diagnostic /
+ * bring-up-by-hand use before a compositor is running:
  *
  *   dev.igen.<n>.re.hsw_dp_dump   diagnostic dump of every register
  *                                  + DPCD page involved in eDP scanout
  *   dev.igen.<n>.re.hsw_panel_on  run the whole sequence end-to-end
  *
- * Both are gated to gen == HSW so SKL hosts don't accidentally fire
- * the SKL-incompatible writes.
+ * All entry points are gated to gen == HSW so SKL hosts don't
+ * accidentally fire the SKL-incompatible writes.
  */
 
 #include <sys/param.h>

@@ -1790,6 +1790,39 @@ igen_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 			    "atomic_commit: pipe %u off-request (no-op)\n", i);
 			continue;
 		}
+
+		/*
+		 * HSW cold-panel bring-up.  Macbsd (15" MBP Retina) firmware
+		 * leaves the display half-up: CDCLK live and both PWELLs on
+		 * but PIPE_CONF reads 0 — no transcoder, no DDI buffer, dark
+		 * panel.  On that path atomic_commit used to reject with
+		 * ENOTSUP because live.hdisplay came back as 1 (register was
+		 * 0, +1 in read_pipe_mode) and no size match landed.
+		 *
+		 * Instead: on HSW pipe 0 only, if the pipe isn't currently
+		 * scanning, walk the panel-on sequence from cached EDID.  It
+		 * programs TRANS_EDP timing + PIPE_DATA_M/N + PLANE_SIZE +
+		 * PIPE_CONF ENABLE.  When that returns 0 the pipe is live at
+		 * the panel's native mode and the size-compare below is
+		 * meaningful.  hsw_panel_on is a no-op on non-HSW gens
+		 * (they're already running from firmware).
+		 */
+		if (sc->gen == IGEN_GEN_HSW && i == 0) {
+			uint32_t pconf = igen_r32(sc, PIPE_CONF(0));
+			bool pipe_up = (pconf &
+			    (PIPE_CONF_ENABLE | PIPE_CONF_STATE)) ==
+			    (PIPE_CONF_ENABLE | PIPE_CONF_STATE);
+			if (!pipe_up) {
+				int perr = igen_hsw_panel_on(sc);
+				if (perr != 0) {
+					device_printf(sc->dev,
+					    "atomic_commit: HSW panel_on"
+					    " failed: %d\n", perr);
+					return (perr);
+				}
+			}
+		}
+
 		igen_read_pipe_mode(sc, 0, &live);
 		/*
 		 * Loosened match: accept any mode whose visible size
