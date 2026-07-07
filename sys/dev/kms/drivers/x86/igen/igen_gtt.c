@@ -148,6 +148,19 @@ igen_gtt_bind_user_fb(struct igen_softc *sc,
 		return (0);
 	}
 
+	/*
+	 * Cache coherency: GEM pages allocated via VM_MEMATTR_DEFAULT
+	 * (write-back on x86) hold compositor writes in CPU cache; the
+	 * display engine reads through GTT which bypasses the CPU cache
+	 * entirely, so without a flush it scans stale/zeroed lines —
+	 * screen goes black with backlight on.  Flush unconditionally,
+	 * before the cache-hit early-return: compositors reuse the same
+	 * FB per frame (dumb-buffer double-buffering, kwin's damage
+	 * repaint) so hitting our slot cache doesn't imply cache-clean
+	 * pages.  See project_igen9_scanout_2026_06_15.md path A.
+	 */
+	pmap_invalidate_cache_pages(obj->pages, obj->npages);
+
 	/* Cache hit: reuse the slot we already mapped this FB into. */
 	for (uint32_t i = 0; i < USER_FB_GTT_NSLOTS; i++)
 		if (sc->user_fb_slots[i].fb == fb)
