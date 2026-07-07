@@ -26,6 +26,9 @@ bus_if.h
 device_if.h
 ofw_bus_if.h
 pci_if.h
+vnode_if.h
+vnode_if_newproto.h
+vnode_if_typedef.h
 export_syms
 drm_probe
 drm_probe.full
