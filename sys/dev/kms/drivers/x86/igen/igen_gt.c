@@ -74,8 +74,21 @@ MALLOC_DECLARE(M_KMS);
 #define	RING_BUFFER_START(b)		((b) + 0x38)
 #define	RING_BUFFER_CTL(b)		((b) + 0x3c)
 #define	RING_HWS_PGA(b)			((b) + 0x80)
+#define	RING_MI_MODE(b)			((b) + 0x9c)
+#define	RING_HWSTAM(b)			((b) + 0x98)
 #define	RING_MODE(b)			((b) + 0x29c)
-#define	RING_HWSTAM(b)			((b) + 0xe8)
+
+#define	STOP_RING			(1u << 8)
+#define	GFX_RUN_LIST_ENABLE		(1u << 15)
+
+/*
+ * "Masked" writes: high 16 bits are a write-enable mask over the low 16.
+ * Used for RING_MODE_GEN7 / RING_MI_MODE / RING_CONTEXT_CONTROL and other
+ * registers where individual bits can be toggled without a read-modify-
+ * write.  Matches Linux i915 _MASKED_BIT_ENABLE / _MASKED_BIT_DISABLE.
+ */
+#define	_MASKED_BIT_ENABLE(v)		((((v) & 0xffffu) << 16) | ((v) & 0xffffu))
+#define	_MASKED_BIT_DISABLE(v)		(((v) & 0xffffu) << 16)
 
 /*
  * ExecList Submission Port — 4×32-bit writes form a context descriptor
@@ -255,36 +268,68 @@ igen_sysctl_gt_status(SYSCTL_HANDLER_ARGS)
  * user-FB cache tops out at 0xa0000 - 0xa0fff and the test_fb at
  * 0x80000 - 0x807ff).  Ring is 2 pages (i915 minimum); LRC is 1 page.
  */
+/* LRC layout — page 0 is reserved header, page 1+ is register state. */
+#define	IGT_LRC_HEADER_PAGES		1
+#define	IGT_LRC_STATE_PAGES		1
+#define	IGT_LRC_TOTAL_PAGES		(IGT_LRC_HEADER_PAGES + \
+					    IGT_LRC_STATE_PAGES + 2)
+#define	IGT_LRC_STATE_OFFSET		(IGT_LRC_HEADER_PAGES * PAGE_SIZE)
+
 #define	IGT_GTT_FIRST_RCS_RING		0x80800
 #define	IGT_RCS_RING_PAGES		2
 #define	IGT_GTT_FIRST_RCS_LRC		(IGT_GTT_FIRST_RCS_RING + \
 					    IGT_RCS_RING_PAGES)
 #define	IGT_RCS_LRC_PAGES		IGT_LRC_TOTAL_PAGES
+#define	IGT_GTT_FIRST_RCS_HWSP		(IGT_GTT_FIRST_RCS_LRC + \
+					    IGT_RCS_LRC_PAGES)
+#define	IGT_RCS_HWSP_PAGES		1
 
 /*
- * Context descriptor field layout for gen 9 (i915 v4.19 intel_lrc.h):
- *   bit 63..32: bits 31..0 of LRCA (LRC GGTT address, page-aligned)
- *   bit 31..16: reserved
- *   bit 15..12: engine_class (RCS = 0)
- *   bit 11:     PRIVILEGE
- *   bit 10:     IRQ_DISABLE
- *   bit 9..8:   addressing_mode (0 = ADDRESSING_MODE_LEGACY_64B)
- *   bit 1:      FAULT_DISABLE
- *   bit 0:      VALID
+ * HWSP (Hardware Status Page) layout — intel_ringbuffer.h v4.19:
+ *   dword index 0x10..0x1b : Context Status Buffer (CSB), 6 entries of
+ *                            two dwords each: (status, ctx_id).
+ *   dword index 0x1f       : CSB write pointer (bits 0..7 = write ptr,
+ *                            bits 8..15 = read ptr the CS observed).
  */
-#define	GEN8_CTX_VALID			(1ull << 0)
-#define	GEN8_CTX_PRIVILEGE		(1ull << 11)
-#define	GEN8_CTX_ADDR_MODE_LEGACY_64B	(0ull << 8)
-#define	GEN8_CTX_ENGINE_CLASS_RCS	(0ull << 12)
+#define	I915_HWS_CSB_BUF0_INDEX		0x10
+#define	I915_HWS_CSB_WRITE_INDEX	0x1f
+#define	GEN8_CSB_ENTRIES		6
+
+/*
+ * Context descriptor field layout, gen 8/9 (i915 v4.19 intel_lrc.c comment
+ * lines 200-207, i915_reg.h GEN8_CTX_*, i915_gem_context.c
+ * default_desc_template):
+ *
+ *   bits 63..53:  group ID (0)
+ *   bits 52..32:  HW context ID (GEN8_CTX_ID_WIDTH = 21)
+ *   bits 31..12:  LRCA — GGTT byte address of the LRC *state* page,
+ *                 page-aligned so low 12 bits are naturally 0
+ *   bits 11..0:   control flags (GEN8_CTX_*)
+ *
+ * The LRCA points at the STATE page (buffer_start + LRC_HEADER_PAGES *
+ * PAGE_SIZE), NOT the buffer start — the CS-restore machinery reads
+ * (offset, value) pairs directly from that page.
+ */
+#define	GEN8_CTX_VALID			(1u <<  0)
+#define	GEN8_CTX_FORCE_PD_RESTORE	(1u <<  1)
+#define	GEN8_CTX_FORCE_RESTORE		(1u <<  2)
+#define	GEN8_CTX_L3LLC_COHERENT		(1u <<  5)	/* gen8 only */
+#define	GEN8_CTX_PRIVILEGE		(1u <<  8)
+#define	GEN8_CTX_ADDRESSING_MODE_SHIFT	3
+#define	INTEL_LEGACY_32B_CONTEXT	0u
+#define	INTEL_LEGACY_64B_CONTEXT	3u
+#define	GEN8_CTX_ID_SHIFT		32
 
 static uint64_t
-igen_gt_context_desc(uint64_t lrca_ggtt)
+igen_gt_context_desc(uint32_t lrc_buffer_ggtt, uint32_t hw_id)
 {
-	return (GEN8_CTX_VALID |
-	    GEN8_CTX_PRIVILEGE |
-	    GEN8_CTX_ADDR_MODE_LEGACY_64B |
-	    GEN8_CTX_ENGINE_CLASS_RCS |
-	    ((lrca_ggtt & 0xfffff000ull) << 32));
+	uint32_t flags = GEN8_CTX_VALID | GEN8_CTX_PRIVILEGE |
+	    (INTEL_LEGACY_32B_CONTEXT << GEN8_CTX_ADDRESSING_MODE_SHIFT);
+	uint32_t lrca = (lrc_buffer_ggtt + IGT_LRC_STATE_OFFSET) & 0xfffff000u;
+
+	return ((uint64_t)flags) |
+	    ((uint64_t)lrca) |
+	    (((uint64_t)hw_id) << GEN8_CTX_ID_SHIFT);
 }
 
 /* MI commands (gen 9 instruction set). */
@@ -374,12 +419,10 @@ igen_gt_context_desc(uint64_t lrca_ggtt)
 #define	CTX_R_PWR_CLK_STATE		0x42
 #define	CTX_LRC_STATE_END		0x44	/* one past last populated DWORD */
 
-/* LRC layout — page 0 is reserved header, page 1+ is register state. */
-#define	IGT_LRC_HEADER_PAGES		1
-#define	IGT_LRC_STATE_PAGES		1
-#define	IGT_LRC_TOTAL_PAGES		(IGT_LRC_HEADER_PAGES + \
-					    IGT_LRC_STATE_PAGES + 2)
-#define	IGT_LRC_STATE_OFFSET		(IGT_LRC_HEADER_PAGES * PAGE_SIZE)
+/*
+ * LRC layout defs live upstream (near GTT slot reservations) because
+ * igen_gt_context_desc needs IGT_LRC_STATE_OFFSET when composing LRCA.
+ */
 
 /*
  * Place a (register_mmio_offset, value) pair at the specified DWORD
@@ -432,7 +475,13 @@ igen_gt_compose_lrc(uint8_t *lrc_base, uint32_t ring_ggtt,
 	CTX_REG(regs, CTX_RING_BUFFER_CONTROL, RCS_MMIO_RING_CTL,       ring_ctl_val);
 	CTX_REG(regs, CTX_BB_HEAD_U,           RCS_MMIO_BB_HEAD_U,      0);
 	CTX_REG(regs, CTX_BB_HEAD_L,           RCS_MMIO_BB_HEAD_L,      0);
-	CTX_REG(regs, CTX_BB_STATE,            RCS_MMIO_BB_STATE,       RING_BB_PPGTT);
+	/*
+	 * BB_STATE — leave PPGTT bit CLEAR.  For the no-op smoke batch we
+	 * use LEGACY_32B addressing (see igen_gt_context_desc) and no PDPs;
+	 * setting RING_BB_PPGTT here without valid PDPs would fault on the
+	 * first memory access.
+	 */
+	CTX_REG(regs, CTX_BB_STATE,            RCS_MMIO_BB_STATE,       0);
 	CTX_REG(regs, CTX_SECOND_BB_HEAD_U,    RCS_MMIO_SBB_HEAD_U,     0);
 	CTX_REG(regs, CTX_SECOND_BB_HEAD_L,    RCS_MMIO_SBB_HEAD_L,     0);
 	CTX_REG(regs, CTX_SECOND_BB_STATE,     RCS_MMIO_SBB_STATE,      0);
@@ -521,6 +570,26 @@ igen_gt_free_pages_gtt(struct igen_softc *sc, uint32_t gtt_first_idx,
 }
 
 /*
+ * Enable execlist submission on the RCS engine.  Must run before any
+ * ELSP write — without RING_MODE.GFX_RUN_LIST_ENABLE set the engine's
+ * execlist state machine is idle and ELSP writes silently drop.
+ *
+ * Mirrors i915 v4.19 intel_lrc.c:enable_execlists (lines 1734-1761).
+ * Caller must be holding forcewake on the render domain.
+ */
+static void
+igen_gt_enable_execlists(struct igen_softc *sc, uint32_t hwsp_ggtt)
+{
+	igen_w32(sc, RING_HWSTAM(RING_BASE_RCS), 0xffffffffu);
+	igen_w32(sc, RING_MODE(RING_BASE_RCS),
+	    _MASKED_BIT_ENABLE(GFX_RUN_LIST_ENABLE));
+	igen_w32(sc, RING_MI_MODE(RING_BASE_RCS),
+	    _MASKED_BIT_DISABLE(STOP_RING));
+	igen_w32(sc, RING_HWS_PGA(RING_BASE_RCS), hwsp_ggtt);
+	(void)igen_r32(sc, RING_HWS_PGA(RING_BASE_RCS));	/* posting read */
+}
+
+/*
  * Dry-run path.  Allocates the same buffers a real submit would use,
  * fills in LRC and ring contents, prints everything, frees, returns.
  * Touches the GGTT for the duration (we don't have a "compute PTE
@@ -561,7 +630,7 @@ igen_sysctl_gt_first_batch_dry(SYSCTL_HANDLER_ARGS)
 	batch_len = igen_gt_compose_batch_noop(ring_va);
 	lrc_len   = igen_gt_compose_lrc((uint8_t *)lrc_va, ring_ggtt,
 	    IGT_RCS_RING_PAGES * PAGE_SIZE, batch_len);
-	ctx_desc  = igen_gt_context_desc(lrc_ggtt);
+	ctx_desc  = igen_gt_context_desc(lrc_ggtt, /* hw_id */ 1);
 
 	device_printf(sc->dev,
 	    "gt: ring  GGTT=0x%08x  PA=0x%llx  VA=%p  batch_len=%zu\n",
@@ -592,9 +661,10 @@ igen_sysctl_gt_first_batch_dry(SYSCTL_HANDLER_ARGS)
 		}
 	}
 	device_printf(sc->dev,
-	    "gt: ctx_desc = 0x%016llx (LRCA=0x%08x | VALID | PRIVILEGE"
-	    " | RCS)\n",
-	    (unsigned long long)ctx_desc, lrc_ggtt);
+	    "gt: ctx_desc = 0x%016llx"
+	    "  (LRCA=0x%08x | hw_id=1 | VALID | PRIVILEGE | LEGACY_32B)\n",
+	    (unsigned long long)ctx_desc,
+	    lrc_ggtt + (uint32_t)IGT_LRC_STATE_OFFSET);
 	device_printf(sc->dev,
 	    "gt: DRY-RUN — nothing written to ELSP, LRC not handed to HW\n");
 
@@ -607,19 +677,39 @@ igen_sysctl_gt_first_batch_dry(SYSCTL_HANDLER_ARGS)
 
 /*
  * Live submission.  Refuses if any pipe is active (same scanout-wedge
- * hazard as gt_status / phy_scan_bc); write 2 to override.  Sequence
- * mirrors the dry-run, then takes forcewake, writes the context
- * descriptor to ELSP, polls EXECLIST_STATUS for the completed bit,
- * reads back RING_HEAD to confirm advance, releases forcewake, frees.
+ * hazard as gt_status / phy_scan_bc); write 2 to override.
+ *
+ * Sequence per i915 v4.19 (intel_lrc.c enable_execlists +
+ * execlists_submit_ports):
+ *
+ *   1. Allocate ring (2p) + LRC (4p) + HWSP (1p).  Compose batch and
+ *      register-state image.
+ *   2. Take forcewake render.
+ *   3. Program engine: RING_HWSTAM = ~0, RING_MODE = GFX_RUN_LIST_ENABLE
+ *      masked-set, RING_MI_MODE = STOP_RING masked-clear, RING_HWS_PGA =
+ *      HWSP GGTT.  Without RING_MODE.GFX_RUN_LIST_ENABLE the engine's
+ *      execlist state machine is idle and ELSP writes drop silently.
+ *   4. Write descriptor pair to ELSP: (port[1]_hi=0, port[1]_lo=0,
+ *      port[0]_hi=ctx_desc>>32, port[0]_lo=ctx_desc&0xffffffff).  This
+ *      matches v4.19 write_desc() — high dword first, low dword second,
+ *      per port, loop from port[num-1] down to port[0].
+ *   5. Poll RING_HEAD until it equals the ring TAIL we composed into the
+ *      LRC.  The CS advances HEAD as it retires commands.
+ *      (The BSpec "completed" signal is a CSB entry in HWSP with
+ *      GEN8_CTX_STATUS_COMPLETED_MASK set; HEAD==TAIL is a sufficient
+ *      first-fire smoke check that doesn't require a CSB parser yet.)
+ *   6. Dump the raw CSB slots + write pointer for post-mortem.
+ *   7. Release forcewake, free everything.
  */
 static int
 igen_sysctl_gt_first_batch_submit(SYSCTL_HANDLER_ARGS)
 {
 	struct igen_softc *sc = arg1;
-	void *ring_va = NULL, *lrc_va = NULL;
-	vm_paddr_t ring_pa = 0, lrc_pa = 0;
-	uint32_t ring_ggtt = 0, lrc_ggtt = 0;
+	void *ring_va = NULL, *lrc_va = NULL, *hwsp_va = NULL;
+	vm_paddr_t ring_pa = 0, lrc_pa = 0, hwsp_pa = 0;
+	uint32_t ring_ggtt = 0, lrc_ggtt = 0, hwsp_ggtt = 0;
 	uint64_t ctx_desc;
+	size_t batch_len;
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
 
@@ -652,16 +742,25 @@ igen_sysctl_gt_first_batch_submit(SYSCTL_HANDLER_ARGS)
 		    IGT_RCS_RING_PAGES, ring_va);
 		return (ENOMEM);
 	}
-
-	{
-		size_t blen = igen_gt_compose_batch_noop(ring_va);
-		(void)igen_gt_compose_lrc((uint8_t *)lrc_va, ring_ggtt,
-		    IGT_RCS_RING_PAGES * PAGE_SIZE, blen);
+	hwsp_ggtt = igen_gt_alloc_pages_gtt(sc, IGT_GTT_FIRST_RCS_HWSP,
+	    IGT_RCS_HWSP_PAGES, &hwsp_va, &hwsp_pa);
+	if (hwsp_ggtt == 0) {
+		igen_gt_free_pages_gtt(sc, IGT_GTT_FIRST_RCS_LRC,
+		    IGT_RCS_LRC_PAGES, lrc_va);
+		igen_gt_free_pages_gtt(sc, IGT_GTT_FIRST_RCS_RING,
+		    IGT_RCS_RING_PAGES, ring_va);
+		return (ENOMEM);
 	}
-	ctx_desc = igen_gt_context_desc(lrc_ggtt);
+
+	batch_len = igen_gt_compose_batch_noop(ring_va);
+	(void)igen_gt_compose_lrc((uint8_t *)lrc_va, ring_ggtt,
+	    IGT_RCS_RING_PAGES * PAGE_SIZE, batch_len);
+	ctx_desc = igen_gt_context_desc(lrc_ggtt, /* hw_id */ 1);
 
 	error = igen_gt_fw_render_take(sc);
 	if (error != 0) {
+		igen_gt_free_pages_gtt(sc, IGT_GTT_FIRST_RCS_HWSP,
+		    IGT_RCS_HWSP_PAGES, hwsp_va);
 		igen_gt_free_pages_gtt(sc, IGT_GTT_FIRST_RCS_LRC,
 		    IGT_RCS_LRC_PAGES, lrc_va);
 		igen_gt_free_pages_gtt(sc, IGT_GTT_FIRST_RCS_RING,
@@ -669,48 +768,90 @@ igen_sysctl_gt_first_batch_submit(SYSCTL_HANDLER_ARGS)
 		return (error);
 	}
 
-	uint32_t head_before = igen_r32(sc, RING_BUFFER_HEAD(RING_BASE_RCS));
+	igen_gt_enable_execlists(sc, hwsp_ggtt);
+
+	uint32_t head_before   = igen_r32(sc, RING_BUFFER_HEAD(RING_BASE_RCS));
 	uint32_t status_before = igen_r32(sc, EXECLIST_STATUS_RCS);
+	uint32_t mode_before   = igen_r32(sc, RING_MODE(RING_BASE_RCS));
+	uint32_t mi_mode       = igen_r32(sc, RING_MI_MODE(RING_BASE_RCS));
+
 	device_printf(sc->dev,
-	    "gt: pre-submit HEAD=0x%08x STATUS=0x%08x\n",
-	    head_before, status_before);
+	    "gt: pre-submit HEAD=0x%08x STATUS=0x%08x MODE=0x%08x"
+	    " MI_MODE=0x%08x HWSP_GGTT=0x%08x ctx_desc=0x%016llx\n",
+	    head_before, status_before, mode_before, mi_mode, hwsp_ggtt,
+	    (unsigned long long)ctx_desc);
 
 	/*
-	 * Write descriptor pair to ELSP.  Order matters per BSpec:
-	 * the four 32-bit writes form a (ctx1_hi, ctx1_lo, ctx0_hi,
-	 * ctx0_lo) pair queued into the engine's two-deep slot.  We
-	 * only need ctx0 — pad ctx1 with zeros.
+	 * ELSP write sequence per i915 v4.19 write_desc + submit_ports:
+	 *   for (n = num_ports; n--;)
+	 *       writel(upper_32(port[n].desc), submit_reg);
+	 *       writel(lower_32(port[n].desc), submit_reg);
+	 * With num_ports=2, port[1] loads first (empty here → both 0),
+	 * then port[0] loads (our ctx_desc, high then low).
 	 */
-	igen_w32(sc, ELSP_RCS, 0);
-	igen_w32(sc, ELSP_RCS, 0);
-	igen_w32(sc, ELSP_RCS, (uint32_t)(ctx_desc >> 32));
-	igen_w32(sc, ELSP_RCS, (uint32_t)(ctx_desc & 0xffffffffu));
+	igen_w32(sc, ELSP_RCS, 0);				/* port[1] hi */
+	igen_w32(sc, ELSP_RCS, 0);				/* port[1] lo */
+	igen_w32(sc, ELSP_RCS, (uint32_t)(ctx_desc >> 32));	/* port[0] hi */
+	igen_w32(sc, ELSP_RCS,
+	    (uint32_t)(ctx_desc & 0xffffffffu));		/* port[0] lo */
 
-	/* Poll EXECLIST_STATUS bit 7 (completed) or active bits going low. */
-	uint32_t status = 0;
+	/*
+	 * Poll RING_HEAD until it equals TAIL = batch_len (our composed
+	 * ring TAIL).  Timeout at 100ms (10000 × 10us).
+	 */
+	uint32_t head_after = head_before;
+	uint32_t tail = (uint32_t)batch_len;
 	int spin;
+
 	for (spin = 0; spin < 10000; spin++) {
-		status = igen_r32(sc, EXECLIST_STATUS_RCS);
-		if (status & (1u << 7))
+		head_after = igen_r32(sc, RING_BUFFER_HEAD(RING_BASE_RCS));
+		if ((head_after & 0x1fffffu) == tail)
 			break;
 		DELAY(10);
 	}
 
-	uint32_t head_after = igen_r32(sc, RING_BUFFER_HEAD(RING_BASE_RCS));
+	uint32_t status_after = igen_r32(sc, EXECLIST_STATUS_RCS);
 
 	device_printf(sc->dev,
-	    "gt: post-submit HEAD=0x%08x STATUS=0x%08x after %d us\n",
-	    head_after, status, spin * 10);
-	if (head_after != head_before)
+	    "gt: post-submit HEAD=0x%08x TAIL=%u STATUS=0x%08x after %d us\n",
+	    head_after, tail, status_after, spin * 10);
+	if ((head_after & 0x1fffffu) == tail)
 		device_printf(sc->dev,
-		    "gt: HEAD advanced by %u dwords — engine executed.\n",
-		    (head_after - head_before) / 4);
+		    "gt: HEAD == TAIL — engine executed the ring.\n");
+	else if (head_after != head_before)
+		device_printf(sc->dev,
+		    "gt: HEAD advanced from 0x%08x to 0x%08x but didn't reach"
+		    " TAIL=%u — batch partially consumed / mid-execution.\n",
+		    head_before, head_after, tail);
 	else
 		device_printf(sc->dev,
-		    "gt: HEAD did not advance — engine did not run.  "
-		    "LRC layout almost certainly needs BSpec verification.\n");
+		    "gt: HEAD did not advance — engine did not run.\n");
+
+	/*
+	 * CSB (Context Status Buffer) — six (status, ctx_id) entries at
+	 * HWSP dword indices 0x10..0x1b, write pointer at 0x1f.  We don't
+	 * parse the status bits yet; dump raw for post-mortem.
+	 */
+	{
+		volatile uint32_t *hws = (volatile uint32_t *)hwsp_va;
+		uint32_t wptr = hws[I915_HWS_CSB_WRITE_INDEX];
+
+		device_printf(sc->dev,
+		    "gt: CSB write_ptr=0x%08x  (bits 0..7 = wptr,"
+		    " 8..15 = engine-observed rptr)\n", wptr);
+		for (int i = 0; i < GEN8_CSB_ENTRIES; i++) {
+			uint32_t sts = hws[I915_HWS_CSB_BUF0_INDEX + i * 2];
+			uint32_t cid = hws[I915_HWS_CSB_BUF0_INDEX + i * 2 + 1];
+
+			device_printf(sc->dev,
+			    "gt: CSB[%d] status=0x%08x ctx_id=0x%08x\n",
+			    i, sts, cid);
+		}
+	}
 
 	igen_gt_fw_render_release(sc);
+	igen_gt_free_pages_gtt(sc, IGT_GTT_FIRST_RCS_HWSP, IGT_RCS_HWSP_PAGES,
+	    hwsp_va);
 	igen_gt_free_pages_gtt(sc, IGT_GTT_FIRST_RCS_LRC, IGT_RCS_LRC_PAGES,
 	    lrc_va);
 	igen_gt_free_pages_gtt(sc, IGT_GTT_FIRST_RCS_RING, IGT_RCS_RING_PAGES,
