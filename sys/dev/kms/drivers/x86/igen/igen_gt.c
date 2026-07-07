@@ -294,40 +294,85 @@ igen_gt_context_desc(uint64_t lrca_ggtt)
 #define	MI_LRI_FORCE_POSTED		(1u << 12)
 
 /*
- * Engine-local register offsets used inside the LRC LRI sequence.
- * The engine adds RING_BASE_RCS (0x2000) to each on restore.
- * Sourced from i915 v4.19 intel_lrc.c populate_lr_context.
+ * Absolute MMIO offsets (RING_BASE_RCS added).  MI_LOAD_REGISTER_IMM
+ * writes at whatever absolute offset the LRI stores — the CS restore
+ * machinery does NOT add mmio_base for you (that was the "engine-local"
+ * misreading of populate_lr_context that shipped in the first pass).
+ * Sourced from i915 v4.19 intel_ringbuffer.h RING_*(base) macros.
  */
-#define	RCS_CONTEXT_CONTROL		0x244
-#define	RCS_RING_TAIL_LOC		0x30
-#define	RCS_RING_HEAD_LOC		0x34
-#define	RCS_RING_START_LOC		0x38
-#define	RCS_RING_CTL_LOC		0x3c
-#define	RCS_BB_HEAD_U			0x168
-#define	RCS_BB_HEAD_L			0x140
-#define	RCS_BB_STATE			0x110
-#define	RCS_SBB_HEAD_U			0x16c
-#define	RCS_SBB_HEAD_L			0x144
-#define	RCS_SBB_STATE			0x114
-#define	RCS_INDIRECT_CTX		0x1bc
-#define	RCS_INDIRECT_CTX_OFFSET		0x1c8
-#define	RCS_BB_PER_CTX_PTR		0x1c0
-#define	RCS_CTX_TIMESTAMP		0x3a8
-#define	RCS_PDP_LDW(n)			(0x270 + (n) * 8)
-#define	RCS_PDP_UDW(n)			(0x270 + (n) * 8 + 4)
-#define	RCS_R_PWR_CLK_STATE		0x0c8
+#define	RCS_MMIO_CONTEXT_CONTROL	(RING_BASE_RCS + 0x244)
+#define	RCS_MMIO_RING_HEAD		(RING_BASE_RCS + 0x034)
+#define	RCS_MMIO_RING_TAIL		(RING_BASE_RCS + 0x030)
+#define	RCS_MMIO_RING_START		(RING_BASE_RCS + 0x038)
+#define	RCS_MMIO_RING_CTL		(RING_BASE_RCS + 0x03c)
+#define	RCS_MMIO_BB_HEAD_U		(RING_BASE_RCS + 0x168)
+#define	RCS_MMIO_BB_HEAD_L		(RING_BASE_RCS + 0x140)
+#define	RCS_MMIO_BB_STATE		(RING_BASE_RCS + 0x110)
+#define	RCS_MMIO_SBB_HEAD_U		(RING_BASE_RCS + 0x16c)
+#define	RCS_MMIO_SBB_HEAD_L		(RING_BASE_RCS + 0x144)
+#define	RCS_MMIO_SBB_STATE		(RING_BASE_RCS + 0x114)
+#define	RCS_MMIO_BB_PER_CTX_PTR		(RING_BASE_RCS + 0x1c0)
+#define	RCS_MMIO_INDIRECT_CTX		(RING_BASE_RCS + 0x1bc)
+#define	RCS_MMIO_INDIRECT_CTX_OFFSET	(RING_BASE_RCS + 0x1c8)
+#define	RCS_MMIO_CTX_TIMESTAMP		(RING_BASE_RCS + 0x3a8)
+#define	RCS_MMIO_PDP_LDW(n)		(RING_BASE_RCS + 0x270 + (n) * 8)
+#define	RCS_MMIO_PDP_UDW(n)		(RING_BASE_RCS + 0x270 + (n) * 8 + 4)
+#define	GEN8_R_PWR_CLK_STATE		0x0000a09c
 
 /*
- * CONTEXT_CONTROL value per i915 v4.19:
+ * CONTEXT_CONTROL value per i915 v4.19 execlists_init_reg_state:
  *   _MASKED_BIT_DISABLE(CTX_CTRL_ENGINE_CTX_RESTORE_INHIBIT |
- *                      CTX_CTRL_ENGINE_CTX_SAVE_INHIBIT) |
+ *                       CTX_CTRL_ENGINE_CTX_SAVE_INHIBIT)      = 0x00050000
  *   _MASKED_BIT_ENABLE (CTX_CTRL_INHIBIT_SYN_CTX_SWITCH |
- *                      CTX_CTRL_RS_CTX_ENABLE)
- * Resolves to 0x401800C8.
+ *                       CTX_CTRL_RS_CTX_ENABLE)                = 0x000a000a
+ * OR                                                          = 0x000f000a
+ * Bits used (see intel_lrc.h): RESTORE_INHIBIT bit 0, RS_CTX_ENABLE
+ * bit 1, SAVE_INHIBIT bit 2, INHIBIT_SYN_CTX_SWITCH bit 3.
  */
-#define	RCS_CONTEXT_CONTROL_VALUE	0x401800c8u
-#define	RING_BB_PPGTT			(1u << 5)	/* RCS_BB_STATE bit */
+#define	RCS_CONTEXT_CONTROL_VALUE	0x000f000au
+#define	RING_BB_PPGTT			(1u << 5)	/* BB_STATE bit */
 #define	RING_VALID			0x1u
+
+/*
+ * Positions inside the state page, DWORD-indexed.  Match Linux v4.19
+ * intel_lrc_reg.h exactly — the CS-restore machinery + subsequent
+ * mid-flight updates (Linux's regs[CTX_RING_TAIL + 1] = tail; etc.)
+ * assume these packed positions.
+ *
+ * regs[0] is left as MI_NOOP (zero-init) so LRI_HEADER_0 lands at
+ * regs[1], not regs[0].  The gaps 0x1e..0x20 and 0x34..0x40 are NOOP
+ * padding — the engine walks them without side effects but the fixed
+ * positions of LRI_HEADER_1 (0x21) and LRI_HEADER_2 (0x41) are what
+ * the HW expects.
+ */
+#define	CTX_LRI_HEADER_0		0x01
+#define	CTX_CONTEXT_CONTROL		0x02
+#define	CTX_RING_HEAD			0x04
+#define	CTX_RING_TAIL			0x06
+#define	CTX_RING_BUFFER_START		0x08
+#define	CTX_RING_BUFFER_CONTROL		0x0a
+#define	CTX_BB_HEAD_U			0x0c
+#define	CTX_BB_HEAD_L			0x0e
+#define	CTX_BB_STATE			0x10
+#define	CTX_SECOND_BB_HEAD_U		0x12
+#define	CTX_SECOND_BB_HEAD_L		0x14
+#define	CTX_SECOND_BB_STATE		0x16
+#define	CTX_BB_PER_CTX_PTR		0x18
+#define	CTX_RCS_INDIRECT_CTX		0x1a
+#define	CTX_RCS_INDIRECT_CTX_OFFSET	0x1c
+#define	CTX_LRI_HEADER_1		0x21
+#define	CTX_CTX_TIMESTAMP		0x22
+#define	CTX_PDP3_UDW			0x24
+#define	CTX_PDP3_LDW			0x26
+#define	CTX_PDP2_UDW			0x28
+#define	CTX_PDP2_LDW			0x2a
+#define	CTX_PDP1_UDW			0x2c
+#define	CTX_PDP1_LDW			0x2e
+#define	CTX_PDP0_UDW			0x30
+#define	CTX_PDP0_LDW			0x32
+#define	CTX_LRI_HEADER_2		0x41
+#define	CTX_R_PWR_CLK_STATE		0x42
+#define	CTX_LRC_STATE_END		0x44	/* one past last populated DWORD */
 
 /* LRC layout — page 0 is reserved header, page 1+ is register state. */
 #define	IGT_LRC_HEADER_PAGES		1
@@ -337,7 +382,17 @@ igen_gt_context_desc(uint64_t lrca_ggtt)
 #define	IGT_LRC_STATE_OFFSET		(IGT_LRC_HEADER_PAGES * PAGE_SIZE)
 
 /*
- * Compose the canonical SKL/KBL RCS Logical Ring Context image.
+ * Place a (register_mmio_offset, value) pair at the specified DWORD
+ * position inside the LRC state image.  Mirrors Linux CTX_REG.
+ */
+#define	CTX_REG(regs, pos, mmio, val)	do {				\
+	(regs)[(pos) + 0] = (mmio);					\
+	(regs)[(pos) + 1] = (val);					\
+} while (0)
+
+/*
+ * Compose the canonical SKL/KBL RCS Logical Ring Context image, matching
+ * Linux v4.19 execlists_init_reg_state byte-for-byte.
  *
  * The LRC is laid out as:
  *   page 0 (offset 0x0000)        : engine header (DMA scratch — zero)
@@ -345,87 +400,75 @@ igen_gt_context_desc(uint64_t lrca_ggtt)
  *   page 2+                       : URB / scratch / per-process state
  *                                   (zero is fine for a pure-MI no-op)
  *
- * Three back-to-back MI_LOAD_REGISTER_IMM blocks make up the state
- * image.  Offsets in the LRI are engine-local — engine adds
- * RING_BASE_RCS at restore time.
- *
- * See docs/skl_kbl_rcs_lrc_layout.md for the BSpec-derived reference.
+ * The register state image consists of three MI_LOAD_REGISTER_IMM blocks
+ * at fixed DWORD positions inside page 1.  Positions between them are
+ * left as MI_NOOP (zero-init) — the CS-restore machinery walks them
+ * without side effects.
  *
  * `lrc_base` is the start of the LRC buffer (offset 0).  The register
  * image starts at lrc_base + IGT_LRC_STATE_OFFSET = 0x1000.
  *
  * Returns the byte length of the register image (i.e. the number of
- * bytes after IGT_LRC_STATE_OFFSET that this routine populated).
+ * bytes after IGT_LRC_STATE_OFFSET this routine populated, up to and
+ * including the last populated DWORD, so callers can dump exactly the
+ * meaningful range).
  */
 static size_t
 igen_gt_compose_lrc(uint8_t *lrc_base, uint32_t ring_ggtt,
     uint32_t ring_len_bytes, uint32_t ring_tail)
 {
-	uint32_t *p = (uint32_t *)(lrc_base + IGT_LRC_STATE_OFFSET);
-	uint32_t *start = p;
+	uint32_t *regs = (uint32_t *)(lrc_base + IGT_LRC_STATE_OFFSET);
+	uint32_t ring_ctl_val =
+	    (((ring_len_bytes / PAGE_SIZE) - 1u) << 12) | RING_VALID;
 
-	/* LRI Header 0: 14 register pairs. */
-	*p++ = MI_LOAD_REGISTER_IMM(14) | MI_LRI_FORCE_POSTED;
-	*p++ = RCS_CONTEXT_CONTROL;
-	*p++ = RCS_CONTEXT_CONTROL_VALUE;
-	*p++ = RCS_RING_HEAD_LOC;
-	*p++ = 0;
-	*p++ = RCS_RING_TAIL_LOC;
-	*p++ = ring_tail;
-	*p++ = RCS_RING_START_LOC;
-	*p++ = ring_ggtt;
-	*p++ = RCS_RING_CTL_LOC;
-	*p++ = (((ring_len_bytes / PAGE_SIZE) - 1u) << 12) | RING_VALID;
-	*p++ = RCS_BB_HEAD_U;
-	*p++ = 0;
-	*p++ = RCS_BB_HEAD_L;
-	*p++ = 0;
-	*p++ = RCS_BB_STATE;
-	*p++ = RING_BB_PPGTT;
-	*p++ = RCS_SBB_HEAD_U;
-	*p++ = 0;
-	*p++ = RCS_SBB_HEAD_L;
-	*p++ = 0;
-	*p++ = RCS_SBB_STATE;
-	*p++ = 0;
-	*p++ = RCS_INDIRECT_CTX;
-	*p++ = 0;
-	*p++ = RCS_INDIRECT_CTX_OFFSET;
-	*p++ = 0;
-	*p++ = RCS_BB_PER_CTX_PTR;
-	*p++ = 0;
+	/* Block 0 — 14 pairs starting at CTX_LRI_HEADER_0 (DWORD 1). */
+	regs[CTX_LRI_HEADER_0] = MI_LOAD_REGISTER_IMM(14) |
+	    MI_LRI_FORCE_POSTED;
+	CTX_REG(regs, CTX_CONTEXT_CONTROL,     RCS_MMIO_CONTEXT_CONTROL,
+	    RCS_CONTEXT_CONTROL_VALUE);
+	CTX_REG(regs, CTX_RING_HEAD,           RCS_MMIO_RING_HEAD,      0);
+	CTX_REG(regs, CTX_RING_TAIL,           RCS_MMIO_RING_TAIL,      ring_tail);
+	CTX_REG(regs, CTX_RING_BUFFER_START,   RCS_MMIO_RING_START,     ring_ggtt);
+	CTX_REG(regs, CTX_RING_BUFFER_CONTROL, RCS_MMIO_RING_CTL,       ring_ctl_val);
+	CTX_REG(regs, CTX_BB_HEAD_U,           RCS_MMIO_BB_HEAD_U,      0);
+	CTX_REG(regs, CTX_BB_HEAD_L,           RCS_MMIO_BB_HEAD_L,      0);
+	CTX_REG(regs, CTX_BB_STATE,            RCS_MMIO_BB_STATE,       RING_BB_PPGTT);
+	CTX_REG(regs, CTX_SECOND_BB_HEAD_U,    RCS_MMIO_SBB_HEAD_U,     0);
+	CTX_REG(regs, CTX_SECOND_BB_HEAD_L,    RCS_MMIO_SBB_HEAD_L,     0);
+	CTX_REG(regs, CTX_SECOND_BB_STATE,     RCS_MMIO_SBB_STATE,      0);
+	CTX_REG(regs, CTX_BB_PER_CTX_PTR,      RCS_MMIO_BB_PER_CTX_PTR, 0);
+	CTX_REG(regs, CTX_RCS_INDIRECT_CTX,    RCS_MMIO_INDIRECT_CTX,   0);
+	CTX_REG(regs, CTX_RCS_INDIRECT_CTX_OFFSET,
+	                                       RCS_MMIO_INDIRECT_CTX_OFFSET, 0);
 
-	/* LRI Header 1: CTX_TIMESTAMP + 4 PDP pairs (lo/hi each) = 9. */
-	*p++ = MI_LOAD_REGISTER_IMM(9) | MI_LRI_FORCE_POSTED;
-	*p++ = RCS_CTX_TIMESTAMP;
-	*p++ = 0;
-	*p++ = RCS_PDP_UDW(3);
-	*p++ = 0;
-	*p++ = RCS_PDP_LDW(3);
-	*p++ = 0;
-	*p++ = RCS_PDP_UDW(2);
-	*p++ = 0;
-	*p++ = RCS_PDP_LDW(2);
-	*p++ = 0;
-	*p++ = RCS_PDP_UDW(1);
-	*p++ = 0;
-	*p++ = RCS_PDP_LDW(1);
-	*p++ = 0;
-	*p++ = RCS_PDP_UDW(0);
-	*p++ = 0;
-	*p++ = RCS_PDP_LDW(0);
-	*p++ = 0;
+	/* Gap 0x1e..0x20 stays MI_NOOP. */
+
+	/* Block 1 — CTX_TIMESTAMP + 4 PDP{UDW,LDW} pairs = 9 pairs. */
+	regs[CTX_LRI_HEADER_1] = MI_LOAD_REGISTER_IMM(9) |
+	    MI_LRI_FORCE_POSTED;
+	CTX_REG(regs, CTX_CTX_TIMESTAMP,       RCS_MMIO_CTX_TIMESTAMP,  0);
+	CTX_REG(regs, CTX_PDP3_UDW,            RCS_MMIO_PDP_UDW(3),     0);
+	CTX_REG(regs, CTX_PDP3_LDW,            RCS_MMIO_PDP_LDW(3),     0);
+	CTX_REG(regs, CTX_PDP2_UDW,            RCS_MMIO_PDP_UDW(2),     0);
+	CTX_REG(regs, CTX_PDP2_LDW,            RCS_MMIO_PDP_LDW(2),     0);
+	CTX_REG(regs, CTX_PDP1_UDW,            RCS_MMIO_PDP_UDW(1),     0);
+	CTX_REG(regs, CTX_PDP1_LDW,            RCS_MMIO_PDP_LDW(1),     0);
+	CTX_REG(regs, CTX_PDP0_UDW,            RCS_MMIO_PDP_UDW(0),     0);
+	CTX_REG(regs, CTX_PDP0_LDW,            RCS_MMIO_PDP_LDW(0),     0);
+
+	/* Gap 0x34..0x40 stays MI_NOOP. */
 
 	/*
-	 * LRI Header 2: R_PWR_CLK_STATE (RPCS).  Leave 0 — engine uses
-	 * its boot-time slice/subslice/EU defaults.  Real Mesa workloads
-	 * will need make_rpcs() but a no-op MI batch doesn't care.
+	 * Block 2 — R_PWR_CLK_STATE (RPCS).  Leave 0 — engine uses its
+	 * boot-time slice/subslice/EU defaults.  Real Mesa workloads will
+	 * need make_rpcs() but a no-op MI batch doesn't care.  Note the
+	 * absence of MI_LRI_FORCE_POSTED here matches Linux v4.19 (block
+	 * 2 was reworked in later kernels but v4.19 leaves it off).
 	 */
-	*p++ = MI_LOAD_REGISTER_IMM(1) | MI_LRI_FORCE_POSTED;
-	*p++ = RCS_R_PWR_CLK_STATE;
-	*p++ = 0;
+	regs[CTX_LRI_HEADER_2] = MI_LOAD_REGISTER_IMM(1);
+	CTX_REG(regs, CTX_R_PWR_CLK_STATE,     GEN8_R_PWR_CLK_STATE,    0);
 
-	return ((p - start) * sizeof(uint32_t));
+	return (CTX_LRC_STATE_END * sizeof(uint32_t));
 }
 
 static size_t
