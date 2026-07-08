@@ -1,6 +1,6 @@
-PROG=	drm_probe
+PROGS=	drm_probe addfb2_h3_test
 MAN=
 
 CFLAGS+=	-I${.CURDIR}/../uapi
 
-.include <bsd.prog.mk>
+.include <bsd.progs.mk>

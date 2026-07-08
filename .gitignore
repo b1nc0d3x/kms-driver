@@ -33,6 +33,9 @@ export_syms
 drm_probe
 drm_probe.full
 drm_probe.debug
+addfb2_h3_test
+addfb2_h3_test.full
+addfb2_h3_test.debug
 
 # obj subtree if someone runs make in-tree without MAKEOBJDIRPREFIX
 obj/
