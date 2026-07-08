@@ -565,6 +565,14 @@ kms_atomic_state_set_property(struct drm_atomic_state *state,
 			    DRM_MODE_OBJECT_FB, &error);
 			if (error != 0)
 				return (error);
+			/*
+			 * A single ATOMIC batch that writes the same
+			 * fb-id property twice on the same plane would
+			 * otherwise leak the first resolved fb's ref —
+			 * release the existing binding before the swap.
+			 */
+			if (ps->fb != NULL)
+				kms_mode_object_put(&ps->fb->base);
 			ps->fb = (o != NULL) ?
 			    __containerof(o, struct drm_framebuffer, base) :
 			    NULL;
@@ -575,6 +583,8 @@ kms_atomic_state_set_property(struct drm_atomic_state *state,
 			    DRM_MODE_OBJECT_CRTC, &error);
 			if (error != 0)
 				return (error);
+			if (ps->crtc != NULL)
+				kms_mode_object_put(&ps->crtc->base);
 			ps->crtc = (o != NULL) ?
 			    __containerof(o, struct drm_crtc, base) : NULL;
 			if (ps->crtc != NULL) {
@@ -635,6 +645,8 @@ kms_atomic_state_set_property(struct drm_atomic_state *state,
 			    DRM_MODE_OBJECT_CRTC, &error);
 			if (error != 0)
 				return (error);
+			if (cs->crtc != NULL)
+				kms_mode_object_put(&cs->crtc->base);
 			cs->crtc = (o != NULL) ?
 			    __containerof(o, struct drm_crtc, base) : NULL;
 			if (cs->crtc != NULL) {

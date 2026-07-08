@@ -45,6 +45,15 @@ struct drm_mode_object {
 	TAILQ_ENTRY(drm_mode_object)	 reg;	/* master id->object list */
 	TAILQ_HEAD(, drm_object_property) properties;
 	uint32_t			 prop_count;
+	/*
+	 * Optional final-release callback.  Populated by the concrete
+	 * object's init helper (e.g. kms_framebuffer_init); fired by
+	 * kms_mode_object_put on the last refcount release so lifetime
+	 * is owned by refs rather than by whoever calls _cleanup.  NULL
+	 * for embedded-in-driver objects that never get freed
+	 * individually (CRTCs, encoders, planes).
+	 */
+	void				(*free)(struct drm_mode_object *);
 };
 
 TAILQ_HEAD(drm_mode_object_list, drm_mode_object);
@@ -84,7 +93,17 @@ struct drm_mode_object *kms_mode_object_find(struct drm_device *dev,
 	    uint32_t id, uint32_t type);
 
 /*
- * Drop a reference acquired via kms_mode_object_find.
+ * Take an additional reference on an object the caller already holds
+ * a ref to (via kms_mode_object_find or by being embedded in driver
+ * storage that outlives this ref).  Used by SETCRTC / PAGE_FLIP to
+ * pin the framebuffer for the lifetime of the crtc->primary_fb
+ * assignment.  Never call this on an object whose ref could be zero.
+ */
+void	kms_mode_object_get(struct drm_mode_object *obj);
+
+/*
+ * Drop a reference acquired via kms_mode_object_find or _get.  Fires
+ * the object's free callback on the final release.
  */
 void	kms_mode_object_put(struct drm_mode_object *obj);
 

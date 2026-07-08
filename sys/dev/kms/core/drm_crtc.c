@@ -9,6 +9,7 @@
 
 #include <kms/drm_crtc.h>
 #include <kms/drm_device.h>
+#include <kms/drm_framebuffer.h>
 #include <kms/drm_mode_config.h>
 #include <kms/drm_mode_object.h>
 #include <kms/drm_property.h>
@@ -66,6 +67,15 @@ kms_crtc_cleanup(struct drm_crtc *crtc)
 
 	if (crtc == NULL || crtc->dev == NULL)
 		return;
+	/*
+	 * Drop the ref that SETCRTC / PAGE_FLIP acquired on primary_fb
+	 * so tearing down the CRTC doesn't leak the framebuffer's
+	 * backing GEM allocation.
+	 */
+	if (crtc->primary_fb != NULL) {
+		kms_mode_object_put(&crtc->primary_fb->base);
+		crtc->primary_fb = NULL;
+	}
 	while ((pe = TAILQ_FIRST(&crtc->pending_vblank_events)) != NULL) {
 		TAILQ_REMOVE(&crtc->pending_vblank_events, pe, link);
 		free(pe, M_KMS);

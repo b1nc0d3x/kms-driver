@@ -251,19 +251,34 @@ kms_ioctl_mode_setcrtc(struct drm_file *file, struct drm_mode_crtc *r)
 			goto out;
 	}
 
-	sx_xlock(&mc->mutex);
-	crtc->primary_fb = fb;
-	crtc->x = r->x;
-	crtc->y = r->y;
-	crtc->mode_valid = r->mode_valid;
-	if (r->mode_valid) {
-		crtc->mode = requested_mode;
-		crtc->enabled = true;
-	} else {
-		memset(&crtc->mode, 0, sizeof(crtc->mode));
-		crtc->enabled = false;
+	{
+		struct drm_framebuffer *old_fb;
+
+		/*
+		 * Swap primary_fb under the mode-config lock so the crtc's
+		 * fb pointer is never observed dangling.  Take a fresh ref
+		 * on the new fb before assignment; drop the old one after
+		 * releasing the lock (put may reach the free callback).
+		 */
+		sx_xlock(&mc->mutex);
+		old_fb = crtc->primary_fb;
+		if (fb != NULL)
+			kms_mode_object_get(&fb->base);
+		crtc->primary_fb = fb;
+		crtc->x = r->x;
+		crtc->y = r->y;
+		crtc->mode_valid = r->mode_valid;
+		if (r->mode_valid) {
+			crtc->mode = requested_mode;
+			crtc->enabled = true;
+		} else {
+			memset(&crtc->mode, 0, sizeof(crtc->mode));
+			crtc->enabled = false;
+		}
+		sx_xunlock(&mc->mutex);
+		if (old_fb != NULL)
+			kms_mode_object_put(&old_fb->base);
 	}
-	sx_xunlock(&mc->mutex);
 
 out:
 	if (conn_arr != NULL) {
@@ -309,7 +324,18 @@ kms_ioctl_mode_page_flip(struct drm_file *file,
 		error = crtc->funcs->page_flip(crtc, fb, r->flags, r->user_data);
 
 	if (error == 0) {
+		struct drm_framebuffer *old_fb;
+
 		sx_xlock(&file->dev->mode_config.mutex);
+		old_fb = crtc->primary_fb;
+		/*
+		 * Take a persistent ref before swapping primary_fb — the
+		 * next RMFB on the outgoing fb must not free storage that
+		 * the CRTC still points at.  Old fb's ref is dropped after
+		 * releasing the lock so the free callback (if it fires)
+		 * doesn't run under mc->mutex.
+		 */
+		kms_mode_object_get(&fb->base);
 		crtc->primary_fb = fb;
 		/*
 		 * If PAGE_FLIP_EVENT was requested, stash the requesting
@@ -325,6 +351,8 @@ kms_ioctl_mode_page_flip(struct drm_file *file,
 			    crtc->base.id, file);
 		}
 		sx_xunlock(&file->dev->mode_config.mutex);
+		if (old_fb != NULL)
+			kms_mode_object_put(&old_fb->base);
 	}
 
 	kms_mode_object_put(fb_obj);

@@ -247,11 +247,21 @@ kms_gem_object_lookup_offset(struct drm_device *dev, uint64_t offset)
 
 	sx_slock(&dev->gem_lock);
 	TAILQ_FOREACH(obj, &dev->gem_objects, device_link) {
-		if (obj->mmap_offset == offset) {
-			refcount_acquire(&obj->refs);
-			sx_sunlock(&dev->gem_lock);
-			return (obj);
-		}
+		if (obj->mmap_offset != offset)
+			continue;
+		/*
+		 * Concurrent put may have driven refs to 0 already but not
+		 * yet reached drm_gem_object_release's TAILQ_REMOVE (that
+		 * removal needs gem_lock exclusive, which is blocked by our
+		 * slock).  Refcount_acquire on a zero ref would resurrect a
+		 * dead object; if_not_zero rejects it so the caller sees
+		 * ENOENT — same behaviour as if put ordering had won the
+		 * race by a hair.
+		 */
+		if (!refcount_acquire_if_not_zero(&obj->refs))
+			break;
+		sx_sunlock(&dev->gem_lock);
+		return (obj);
 	}
 	sx_sunlock(&dev->gem_lock);
 	return (NULL);

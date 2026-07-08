@@ -8,6 +8,7 @@
 #include <sys/systm.h>
 #include <sys/conf.h>
 #include <sys/errno.h>
+#include <sys/priv.h>
 #include <sys/proc.h>
 #include <sys/sysctl.h>
 
@@ -324,9 +325,22 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 		 * a second opener (Xwayland forked from kwin, a screencast
 		 * helper, ...) calling SET_MASTER would remain non-master
 		 * and any subsequent AUTH_MAGIC returns EACCES.
+		 *
+		 * Privilege gate: only allow the caller if it either
+		 * already holds master (re-take is a no-op), or has
+		 * PRIV_DRIVER — matching Linux drm_master_ioctl's
+		 * CAP_SYS_ADMIN check.  Without this any concurrent
+		 * opener could steal master from the active Xorg /
+		 * kwin_wayland session mid-flight.
 		 */
 		struct drm_file *peer;
+		int error;
 
+		if (!file->is_master) {
+			error = priv_check(td, PRIV_DRIVER);
+			if (error != 0)
+				return (error);
+		}
 		sx_xlock(&file->dev->dev_lock);
 		TAILQ_FOREACH(peer, &file->dev->files, link) {
 			if (peer != file)

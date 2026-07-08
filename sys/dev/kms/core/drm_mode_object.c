@@ -160,11 +160,27 @@ kms_mode_object_find(struct drm_device *dev, uint32_t id, uint32_t type)
 			obj = NULL;
 			break;
 		}
-		refcount_acquire(&obj->refs);
+		/*
+		 * refcount_acquire_if_not_zero rejects a resurrection: a
+		 * parallel unregister may have driven refs to zero before
+		 * the TAILQ_REMOVE ran (both happen under xlock; we hold
+		 * slock so the removal is queued behind us, but the ref
+		 * has already been dropped).  Treat that as "gone".
+		 */
+		if (!refcount_acquire_if_not_zero(&obj->refs))
+			obj = NULL;
 		break;
 	}
 	sx_sunlock(&mc->mutex);
 	return (obj);
+}
+
+void
+kms_mode_object_get(struct drm_mode_object *obj)
+{
+	if (obj == NULL)
+		return;
+	refcount_acquire(&obj->refs);
 }
 
 void
@@ -173,10 +189,13 @@ kms_mode_object_put(struct drm_mode_object *obj)
 	if (obj == NULL)
 		return;
 	/*
-	 * Final release is the caller's responsibility — the object is
-	 * embedded in driver storage, so we have no allocation to free.
-	 * refcount_release returning true is the signal that whoever
-	 * owns the storage may reclaim it.
+	 * On the last release, fire the concrete object's free callback.
+	 * This is where lifetime is actually enforced — cleanup helpers
+	 * only drop the registry ref and let the object linger until
+	 * every SETCRTC / pending flip / find caller has dropped its
+	 * ref.  Objects with no free callback (embedded in driver
+	 * storage, e.g. CRTCs) simply reach ref 0 and stay resident.
 	 */
-	(void)refcount_release(&obj->refs);
+	if (refcount_release(&obj->refs) && obj->free != NULL)
+		obj->free(obj);
 }
