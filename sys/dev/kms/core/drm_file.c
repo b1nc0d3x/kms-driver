@@ -19,9 +19,11 @@
 #include <vm/vm.h>
 #include <vm/vm_object.h>
 
+#include <kms/drm_crtc.h>
 #include <kms/drm_device.h>
 #include <kms/drm_file.h>
 #include <kms/drm_gem.h>
+#include <kms/drm_mode_config.h>
 
 #include "kms_internal.h"
 
@@ -30,6 +32,10 @@ kms_file_dtor(void *data)
 {
 	struct drm_file *file = data;
 	struct drm_device *dev;
+	struct drm_mode_config *mc;
+	struct drm_mode_object *obj;
+	struct drm_crtc *crtc;
+	struct kms_pending_vblank_event *pe, *pe_next;
 
 	if (file == NULL)
 		return;
@@ -40,6 +46,35 @@ kms_file_dtor(void *data)
 	if (dev->open_count > 0)
 		dev->open_count--;
 	sx_xunlock(&dev->dev_lock);
+
+	/*
+	 * Scrub every reference the mode_config still holds to this
+	 * drm_file BEFORE we free it.  A vblank IRQ that fires between
+	 * here and the free would otherwise dereference a dangling
+	 * pointer: `crtc->pending_flip_file` and every
+	 * `pending_vblank_events` entry can point at us.
+	 *
+	 * Under mc->mutex so the vblank handler (drm_events.c:kms_vblank_
+	 * handler) sees a consistent view — either the entry is still
+	 * queued (before we take the lock) or it's gone (after).
+	 */
+	mc = &dev->mode_config;
+	sx_xlock(&mc->mutex);
+	TAILQ_FOREACH(obj, &mc->crtcs, link) {
+		crtc = __containerof(obj, struct drm_crtc, base);
+		if (crtc->pending_flip_file == file) {
+			crtc->pending_flip_file = NULL;
+			crtc->pending_flip_user_data = 0;
+		}
+		TAILQ_FOREACH_SAFE(pe, &crtc->pending_vblank_events,
+		    link, pe_next) {
+			if (pe->file != file)
+				continue;
+			TAILQ_REMOVE(&crtc->pending_vblank_events, pe, link);
+			free(pe, M_KMS);
+		}
+	}
+	sx_xunlock(&mc->mutex);
 
 	/*
 	 * Walk the handle table and drop the ref each one holds.  Done

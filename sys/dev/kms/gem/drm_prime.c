@@ -220,17 +220,16 @@ kms_ioctl_prime_fd_to_handle(struct drm_file *file,
 
 	/*
 	 * Create a fresh handle on the importing drm_file pointing at the
-	 * same underlying GEM.  Bump the GEM ref so the handle and the
-	 * exporting fd both keep it alive; the handle release path drops
-	 * its ref, the fd close path drops the export ref.
+	 * same underlying GEM.  kms_gem_handle_create takes its own ref on
+	 * success and balances it on internal-failure, so we must not
+	 * double-get here — a stray get with only an error-path put leaks
+	 * one ref per successful import (pinning the wired contig pages
+	 * for the life of the driver).
 	 */
-	kms_gem_object_get(pf->obj);
 	error = kms_gem_handle_create(file, pf->obj, &handle);
 	fdrop(fp, curthread);
-	if (error != 0) {
-		kms_gem_object_put(pf->obj);
+	if (error != 0)
 		return (error);
-	}
 	args->handle = handle;
 	return (0);
 }

@@ -183,13 +183,14 @@ retry_alloc:
 		if (vm_page_iter_insert(obj->pages[i], obj->pager, i,
 		    &pages_iter) != 0) {
 			VM_OBJECT_WUNLOCK(obj->pager);
+			/*
+			 * vm_object_deallocate runs drm_gem_pager_dtor, which
+			 * already unwires + frees every page (including the
+			 * ones we did successfully insert), frees obj->pages,
+			 * and frees obj itself.  Any manual cleanup here is
+			 * a double-free.
+			 */
 			vm_object_deallocate(obj->pager);
-			for (; i > 0; i--) {
-				vm_page_unwire_noq(obj->pages[i - 1]);
-				vm_page_free(obj->pages[i - 1]);
-			}
-			free(obj->pages, M_KMS);
-			free(obj, M_KMS);
 			return (NULL);
 		}
 	}
