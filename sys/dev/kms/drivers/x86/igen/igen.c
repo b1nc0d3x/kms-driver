@@ -460,8 +460,7 @@ static int	igen_sysctl_cap_dump(SYSCTL_HANDLER_ARGS);
 /* DPLL/WRPLL/pw1 sysctl handlers live in igen_dpll.c. */
 static int	igen_sysctl_current_mode(SYSCTL_HANDLER_ARGS);
 /* GTT / scanout playground sysctl handlers live in igen_gtt.c. */
-static void	igen_edid_to_mode(const uint8_t *dtd,
-		    struct drm_display_mode *m);
+/* igen_edid_to_mode: public — declared in igen_internal.h. */
 static int	igen_attach_edid_modes(struct igen_softc *sc);
 
 static void
@@ -470,6 +469,7 @@ igen_re_sysctls_init(struct igen_softc *sc)
 	struct sysctl_oid_list *children;
 
 	sx_init(&sc->re_lock, "igen_re");
+	sx_init(&sc->scanout_lock, "igen_scanout");
 	sysctl_ctx_init(&sc->re_sysctl_ctx);
 	sc->re_sysctl_tree = SYSCTL_ADD_NODE(&sc->re_sysctl_ctx,
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(sc->dev)),
@@ -488,6 +488,28 @@ igen_re_sysctls_init(struct igen_softc *sc)
 	    OID_AUTO, "debug", CTLFLAG_RWTUN, &sc->sc_debug, 0,
 	    "Debug verbosity: 0=silent, 1=milestones, 2=protocol,"
 	    " 3=per-frame, 4=hex");
+
+	/*
+	 * EXECBUFFER2 -> ELSP dispatch gate.  Default 0 (validate-only)
+	 * so a bad batch from userspace can't wedge the display pipe
+	 * during KMS bring-up.
+	 */
+	SYSCTL_ADD_INT(&sc->re_sysctl_ctx, children,
+	    OID_AUTO, "i915_dispatch_enable", CTLFLAG_RWTUN,
+	    &sc->i915_dispatch_enable, 0,
+	    "EXECBUFFER2 dispatch: 0=off, 1=idle-pipe only, 2=force");
+
+	/*
+	 * gen9 DDI-side enable gate for igen_gen9_panel_on.  Default 0
+	 * because enabling DDI_BUF_CTL against a cold port PLL wedges
+	 * the whole display fabric.  Operator opts in after verifying
+	 * the port PLL is up (via hpd_dump / SDEISR HPD_LIVE).
+	 */
+	SYSCTL_ADD_INT(&sc->re_sysctl_ctx, children,
+	    OID_AUTO, "gen9_ddi_enable", CTLFLAG_RWTUN,
+	    &sc->gen9_ddi_enable, 0,
+	    "gen9_panel_on writes TRANS_CLK_SEL + TRANS_DDI_FUNC_CTL +"
+	    " DDI_BUF_CTL enables (0=off, 1=on — DANGER without PLL)");
 
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "mmio_snapshot_save",
@@ -582,6 +604,7 @@ igen_re_sysctls_fini(struct igen_softc *sc)
 		sc->snapshot_valid = false;
 	}
 	sx_destroy(&sc->re_lock);
+	sx_destroy(&sc->scanout_lock);
 }
 
 
@@ -979,7 +1002,7 @@ igen_sysctl_current_mode(SYSCTL_HANDLER_ARGS)
  *   14:   h border / v border (ignored)
  *   17:   feature flags incl sync polarity bits [2:1] (h=2, v=1)
  */
-static void
+void
 igen_edid_to_mode(const uint8_t *d, struct drm_display_mode *m)
 {
 	uint32_t pixclk_10kHz = d[0] | ((uint32_t)d[1] << 8);
@@ -1631,13 +1654,8 @@ igen_legacy_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
  * cursor's reference point (hotspot); we subtract it from each MOVE to
  * derive top-left.
  */
-#define	CUR_CTL_A		0x70080
-#define	CUR_BASE_A		0x70084
-#define	CUR_POS_A		0x70088
-#define	CUR_MODE_DISABLE	0x00u
-#define	CUR_MODE_64_ARGB	0x07u
-#define	CUR_MODE_128_ARGB	0x22u
-#define	CUR_MODE_256_ARGB	0x27u
+/* CUR_CTL_A / CUR_BASE_A / CUR_POS_A + modes live in igen_internal.h so
+ * igen_hsw_pipe.c's pipe-off primitive can disable the cursor too. */
 
 static int
 igen_cursor_set(struct drm_crtc *crtc, struct drm_file *file,
@@ -1658,8 +1676,10 @@ igen_cursor_set(struct drm_crtc *crtc, struct drm_file *file,
 	sc->cursor_h = height;
 
 	if (handle == 0 || width == 0 || height == 0) {
+		sx_xlock(&sc->scanout_lock);
 		igen_w32(sc, CUR_CTL_A, CUR_MODE_DISABLE);
 		igen_w32(sc, CUR_BASE_A, 0);
+		sx_xunlock(&sc->scanout_lock);
 		prev = sc->cursor_obj;
 		sc->cursor_obj = NULL;
 		if (prev != NULL)
@@ -1695,8 +1715,11 @@ igen_cursor_set(struct drm_crtc *crtc, struct drm_file *file,
 
 	prev = sc->cursor_obj;
 	sc->cursor_obj = obj;
+	/* Serialize with atomic_commit + cursor_move (same pipe A regs). */
+	sx_xlock(&sc->scanout_lock);
 	igen_w32(sc, CUR_BASE_A, surf);
 	igen_w32(sc, CUR_CTL_A, mode);
+	sx_xunlock(&sc->scanout_lock);
 	if (prev != NULL)
 		kms_gem_object_put(prev);
 	return (0);
@@ -1724,7 +1747,16 @@ igen_cursor_move(struct drm_crtc *crtc, int32_t x, int32_t y)
 		pos |= (1u << 31) | (((uint32_t)(-tly) & 0x7fffu) << 16);
 	else
 		pos |= (((uint32_t)tly & 0x7fffu) << 16);
+
+	/*
+	 * Serialize with atomic_commit — both target pipe A registers
+	 * and share the scanout timing.  Without the lock a cursor move
+	 * during a plane swap can land between the atomic_commit's
+	 * vblank wait and its PLANE_SURF write, corrupting the frame.
+	 */
+	sx_xlock(&sc->scanout_lock);
 	igen_w32(sc, CUR_POS_A, pos);
+	sx_xunlock(&sc->scanout_lock);
 	return (0);
 }
 
@@ -1777,7 +1809,9 @@ igen_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
     bool nonblock __unused)
 {
 	struct igen_softc *sc = dev->driver_priv;
+	int error = 0;
 
+	sx_xlock(&sc->scanout_lock);
 	for (uint32_t i = 0; i < state->num_crtc; i++) {
 		struct drm_crtc_state *cs = state->crtc_states[i];
 		struct drm_display_mode live;
@@ -1807,18 +1841,37 @@ igen_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 		 * meaningful.  hsw_panel_on is a no-op on non-HSW gens
 		 * (they're already running from firmware).
 		 */
-		if (sc->gen == IGEN_GEN_HSW && i == 0) {
-			uint32_t pconf = igen_r32(sc, PIPE_CONF(0));
-			bool pipe_up = (pconf &
-			    (PIPE_CONF_ENABLE | PIPE_CONF_STATE)) ==
-			    (PIPE_CONF_ENABLE | PIPE_CONF_STATE);
-			if (!pipe_up) {
-				int perr = igen_hsw_panel_on(sc);
+		if ((sc->gen == IGEN_GEN_HSW || sc->gen == IGEN_GEN_SKL) &&
+		    i == 0) {
+			/*
+			 * "Needs bring-up" is broader than "PIPE_CONF bits
+			 * clear."  On our KBL, firmware routinely hands us
+			 * PIPE_CONF = 0xc0000000 (ENABLE + STATE set) but
+			 * TRANS_HTOTAL / TRANS_VTOTAL are zero — so the pipe
+			 * is "scanning" but the transcoder produces a null
+			 * frame and read_pipe_mode reports 1x1.  Trigger the
+			 * cold bring-up whenever the live pipe timing is
+			 * clearly bogus (hdisplay < 32) regardless of what
+			 * PIPE_CONF says.
+			 */
+			struct drm_display_mode probe;
+			igen_read_pipe_mode(sc, 0, &probe);
+			bool needs_bringup = (probe.hdisplay < 32 ||
+			    probe.vdisplay < 32);
+			if (needs_bringup) {
+				int perr;
+				if (sc->gen == IGEN_GEN_HSW)
+					perr = igen_hsw_panel_on(sc);
+				else
+					perr = igen_gen9_panel_on(sc,
+					    &cs->mode);
 				if (perr != 0) {
 					device_printf(sc->dev,
-					    "atomic_commit: HSW panel_on"
-					    " failed: %d\n", perr);
-					return (perr);
+					    "atomic_commit: panel_on"
+					    " (gen %d) failed: %d\n",
+					    sc->gen, perr);
+					error = perr;
+					goto out;
 				}
 			}
 		}
@@ -1849,7 +1902,8 @@ igen_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 			    " full modeset not yet implemented\n",
 			    cs->mode.hdisplay, cs->mode.vdisplay,
 			    live.hdisplay, live.vdisplay);
-			return (ENOTSUP);
+			error = ENOTSUP;
+			goto out;
 		}
 		if (cs->mode.htotal != live.htotal ||
 		    cs->mode.vtotal != live.vtotal) {
@@ -1889,6 +1943,7 @@ igen_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 			if (!sc->scanout_held)
 				sc->scanout_prev_surf =
 				    igen_r32(sc, PLANE_SURF(0));
+			igen_wait_vblank(sc, 0);
 			igen_w32(sc, PLANE_SURF(0), new_surf);
 			sc->scanout_held = true;
 			DPRINTF(sc, 1,
@@ -1919,6 +1974,7 @@ igen_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 			igen_w32(sc, PLANE_SURF(0), new_surf);
 			sc->scanout_held = true;
 		} else if (ps->fb == NULL && sc->scanout_held) {
+			igen_wait_vblank(sc, 0);
 			igen_w32(sc, PLANE_SURF(0), sc->scanout_prev_surf);
 			sc->scanout_held = false;
 			DPRINTF(sc, 1,
@@ -1926,7 +1982,9 @@ igen_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 			    " restored to 0x%08x\n", sc->scanout_prev_surf);
 		}
 	}
-	return (0);
+out:
+	sx_xunlock(&sc->scanout_lock);
+	return (error);
 }
 
 static const struct drm_mode_config_funcs igen_mode_config_funcs = {

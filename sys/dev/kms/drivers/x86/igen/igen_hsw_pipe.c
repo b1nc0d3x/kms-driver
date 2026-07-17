@@ -556,6 +556,293 @@ igen_sysctl_hsw_panel_on(SYSCTL_HANDLER_ARGS)
 	return (igen_hsw_panel_on(sc));
 }
 
+/* --------------------------- pipe-off primitive --------------------------- */
+
+/*
+ * Symmetric counterpart to igen_hsw_panel_on: drives pipe A to the fully
+ * quiescent state (planes off, cursor off, PIPE_CONF ENABLE + STATE both
+ * clear) so the display engine stops walking GGTT.
+ *
+ * Motivation: on macbsd (Iris Pro 5200 HSW), firmware hands the driver
+ * a live pipe A with PIPE_CONF=0xc0000000.  Any subsequent ELSP submit
+ * (gt_first_batch_submit=2 or EXECBUFFER2 dispatch under
+ * i915_dispatch_enable=2) that allocates ring/LRC/HWSP through
+ * igen_gtt_alloc lands in GGTT the display engine is concurrently
+ * fetching from — bus stall, kernel-side wedge, net stack goes down,
+ * only physical power-cycle recovers.  This is the pre-flight primitive
+ * that makes live-fire ELSP submission safe.
+ *
+ * Sequence (matches BSpec HSW display pipe-off — the compact form; we
+ * leave transcoder / DDI / DPLL up because they can't fetch memory
+ * without pipe, and leaving them powered avoids a full re-LT if the
+ * caller later wants panel_on):
+ *
+ *   1. Disable primary plane (PLANE_CTL bit 31 = 0).
+ *   2. Arm the plane change by rewriting PLANE_SURF — the double-
+ *      buffered plane state only latches on the next vblank + SURF
+ *      write.
+ *   3. Disable cursor (CUR_CTL_A = 0, CUR_BASE_A = 0).
+ *   4. Wait one vblank so both plane + cursor disables land.
+ *   5. Clear PIPE_CONF ENABLE.
+ *   6. Poll PIPE_CONF STATE bit — this drains any in-flight scanout
+ *      fetches.  Cap at ~100 ms.
+ *
+ * Serialized via scanout_lock against any concurrent atomic_commit /
+ * cursor_move so the pipe MMIO doesn't get re-poked mid-teardown.
+ */
+int
+igen_pipe_a_off(struct igen_softc *sc)
+{
+	uint32_t pconf, pctl, cur_surf;
+	int spin;
+
+	sx_xlock(&sc->scanout_lock);
+
+	pconf = igen_r32(sc, PIPE_CONF(0));
+	if ((pconf & PIPE_CONF_ENABLE) == 0) {
+		device_printf(sc->dev,
+		    "hsw_pipe_off: pipe A already off (PIPE_CONF=0x%08x)\n",
+		    pconf);
+		sx_xunlock(&sc->scanout_lock);
+		return (0);
+	}
+
+	pctl = igen_r32(sc, PLANE_CTL(0));
+	cur_surf = igen_r32(sc, PLANE_SURF(0));
+	device_printf(sc->dev,
+	    "hsw_pipe_off: entry  PIPE_CONF=0x%08x  PLANE_CTL=0x%08x"
+	    "  PLANE_SURF=0x%08x\n", pconf, pctl, cur_surf);
+
+	/* Step 1 + 2: primary plane disable, arm with SURF rewrite. */
+	if (pctl & PLANE_CTL_ENABLE) {
+		igen_w32(sc, PLANE_CTL(0), pctl & ~PLANE_CTL_ENABLE);
+		igen_w32(sc, PLANE_SURF(0), cur_surf);
+	}
+
+	/* Step 3: cursor disable. */
+	igen_w32(sc, CUR_CTL_A, CUR_MODE_DISABLE);
+	igen_w32(sc, CUR_BASE_A, 0);
+
+	/* Step 4: let plane + cursor disable latch at vblank. */
+	igen_wait_vblank(sc, 0);
+
+	/* Step 5: pipe disable. */
+	pconf = igen_r32(sc, PIPE_CONF(0));
+	igen_w32(sc, PIPE_CONF(0), pconf & ~PIPE_CONF_ENABLE);
+
+	/*
+	 * Step 6: wait for PIPE_STATE to clear.  On a pipe with no
+	 * scanout backlog this drops in one or two vblanks; the 100 ms
+	 * cap is generous but bounded so a stuck pipe cannot wedge the
+	 * sysctl thread indefinitely.
+	 */
+	for (spin = 0; spin < 100; spin++) {
+		pconf = igen_r32(sc, PIPE_CONF(0));
+		if ((pconf & PIPE_CONF_STATE) == 0)
+			break;
+		pause("gen9pipeoff", hz / 1000);
+	}
+
+	device_printf(sc->dev,
+	    "hsw_pipe_off: exit  PIPE_CONF=0x%08x  spin=%d/100  %s\n",
+	    pconf, spin,
+	    (pconf & PIPE_CONF_STATE) ? "STILL ACTIVE" : "quiescent");
+
+	sc->scanout_held = false;
+	sx_xunlock(&sc->scanout_lock);
+
+	return ((pconf & PIPE_CONF_STATE) ? ETIMEDOUT : 0);
+}
+
+static int
+igen_sysctl_pipe_a_off(SYSCTL_HANDLER_ARGS)
+{
+	struct igen_softc *sc = arg1;
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+
+	if (error || req->newptr == NULL || trigger == 0)
+		return (error);
+	/* PIPE_CONF layout (bits 31/30), PLANE_CTL/SURF, CUR_CTL_A are
+	 * identical across HSW/BDW/SKL/KBL, so no gen gate.  Later gens
+	 * (ICL+) grow universal-plane registers but pipe A itself is still
+	 * disabled by the same PIPE_CONF write. */
+	return (igen_pipe_a_off(sc));
+}
+
+/* ------------------- gen9 (SKL/KBL) pipe-A cold bring-up ------------------ */
+
+/*
+ * Bring pipe A up on gen9 (SKL/KBL) from a firmware-off state.
+ *
+ * Assumption: firmware/BIOS has already programmed CDCLK, port PLL,
+ * DDI_BUF_TRANS voltage swing tables, TRANS_DDI_FUNC_CTL port select,
+ * and DDI_BUF_CTL — the common EFI/UEFI handoff pattern.  What
+ * firmware often SKIPS on shutdown-then-boot is the transcoder timing
+ * writes and the PIPE_CONF enable.  So we program TRANS_H* / TRANS_V*
+ * from the cached EDID DTD, set PIPE_SRCSZ, program the primary plane
+ * for whatever scanout_fb the caller has installed (or leave it at
+ * firmware SURF as a smoke test), then flip PIPE_CONF ENABLE.
+ *
+ * This does NOT handle:
+ *   - Cold PLL / CDCLK bring-up (firmware-programmed only).
+ *   - DDI voltage swing table selection.
+ *   - Link training for DP/eDP.
+ *   - Non-primary planes.
+ *
+ * Live-verified 2026-07-16 as the atomic_commit path when firmware
+ * boots with pipe A off — kwin's mode request from EDID + our
+ * transcoder-timing writes are enough to light the panel.  For deeper
+ * cold-boot cases (fresh CDCLK, unlinked DP), stage-3 modeset work is
+ * still needed.
+ *
+ * `mode` — the target mode.  hdisplay, vdisplay, htotal, vtotal,
+ * hsync_start/end, vsync_start/end must all be populated.  Typically
+ * comes from cs->mode in atomic_commit, which kwin builds from EDID.
+ */
+int
+igen_gen9_panel_on(struct igen_softc *sc, const struct drm_display_mode *m)
+{
+	int i;
+	uint32_t pconf;
+
+	if (sc->gen != IGEN_GEN_SKL)
+		return (EOPNOTSUPP);
+	if (m == NULL || m->hdisplay == 0 || m->vdisplay == 0 ||
+	    m->htotal < m->hdisplay || m->vtotal < m->vdisplay)
+		return (EINVAL);
+
+	/*
+	 * Transcoder A timing.  Format on gen9 (BSpec: matches HSW):
+	 *   TRANS_HTOTAL[28:16] = htotal-1, [12:0] = hdisplay-1
+	 *   TRANS_HBLANK: same, but describes blank region
+	 *   TRANS_HSYNC[28:16] = hsync_end-1, [12:0] = hsync_start-1
+	 *   TRANS_VTOTAL, VBLANK, VSYNC: same layout for vertical.
+	 * Blank == total-active window on this gen; encoder walks through
+	 * (start..sync_start) as active + backporch and (sync_start..
+	 * sync_end) as sync + (sync_end..total) as front porch.
+	 */
+	igen_w32(sc, TRANS_HTOTAL(0),
+	    (((uint32_t)m->htotal - 1) << 16) | ((uint32_t)m->hdisplay - 1));
+	igen_w32(sc, TRANS_HBLANK(0),
+	    (((uint32_t)m->htotal - 1) << 16) | ((uint32_t)m->hdisplay - 1));
+	igen_w32(sc, TRANS_HSYNC(0),
+	    (((uint32_t)m->hsync_end - 1) << 16) |
+	    ((uint32_t)m->hsync_start - 1));
+	igen_w32(sc, TRANS_VTOTAL(0),
+	    (((uint32_t)m->vtotal - 1) << 16) | ((uint32_t)m->vdisplay - 1));
+	igen_w32(sc, TRANS_VBLANK(0),
+	    (((uint32_t)m->vtotal - 1) << 16) | ((uint32_t)m->vdisplay - 1));
+	igen_w32(sc, TRANS_VSYNC(0),
+	    (((uint32_t)m->vsync_end - 1) << 16) |
+	    ((uint32_t)m->vsync_start - 1));
+
+	/*
+	 * DDI + TRANS_CLK_SEL + TRANS_DDI_FUNC_CTL enables.  Gated behind
+	 * sc->gen9_ddi_enable because enabling DDI_BUF_CTL against a cold
+	 * port PLL wedges the box hard (5th wedge in the 2026-07-16
+	 * session — see memory `feedback_igen_no_force_submit_pipe_active`).
+	 *
+	 * TODO: check DPLL_CTRL2 / port PLL live state before doing this
+	 * automatically.  Until then, the operator sets
+	 * `dev.igen.<n>.re.gen9_ddi_enable=1` after verifying via
+	 * `hpd_dump` that a port is HPD-live AND its PLL is up.
+	 */
+	if (sc->gen9_ddi_enable != 0) {
+#define	TRANS_CLK_SEL_A			0x00046140
+#define	  TRANS_CLK_SEL_PORT_DDI_B	(2u << 29)
+#define	TRANS_DDI_FUNC_CTL_ENABLE	(1u << 31)
+#define	TRANS_DDI_PORT_B		(1u << 28)
+#define	TRANS_DDI_MODE_HDMI		(0u << 24)
+#define	TRANS_DDI_BPC_8			(0u << 20)
+#define	DDI_BUF_CTL_B			0x00064100
+#define	  DDI_BUF_CTL_ENABLE_B		(1u << 31)
+#define	  DDI_BUF_PORT_WIDTH_X4		(3u << 1)
+		uint32_t fctl_cur = igen_r32(sc, TRANS_DDI_FUNC_CTL(0));
+		uint32_t sync_bits = fctl_cur & 0x00030000;
+
+		igen_w32(sc, TRANS_CLK_SEL_A, TRANS_CLK_SEL_PORT_DDI_B);
+		igen_w32(sc, TRANS_DDI_FUNC_CTL(0),
+		    TRANS_DDI_FUNC_CTL_ENABLE | TRANS_DDI_PORT_B |
+		    TRANS_DDI_MODE_HDMI | TRANS_DDI_BPC_8 | sync_bits);
+		igen_w32(sc, DDI_BUF_CTL_B,
+		    DDI_BUF_CTL_ENABLE_B | DDI_BUF_PORT_WIDTH_X4);
+		(void)igen_r32(sc, DDI_BUF_CTL_B);
+		device_printf(sc->dev,
+		    "gen9_panel_on: DDI/CLK enables written (opt-in)\n");
+	}
+
+	/* PIPE source size — matches transcoder active. */
+	igen_w32(sc, PIPE_SRCSZ(0),
+	    (((uint32_t)m->hdisplay - 1) << 16) |
+	    ((uint32_t)m->vdisplay - 1));
+
+	/*
+	 * Primary plane setup.  If scanout_fb is installed, program its
+	 * stride and surface address; otherwise leave PLANE_CTL alone
+	 * (firmware SURF stays live).  This mirrors HSW panel_on's
+	 * "trust firmware SURF if we have nothing better" fallback.
+	 */
+	if (sc->scanout_fb != NULL && sc->scanout_fb->mapped) {
+		igen_w32(sc, PLANE_STRIDE(0), sc->scanout_fb->stride / 64);
+		igen_w32(sc, PLANE_SURF(0),
+		    sc->scanout_fb->gtt_first_idx * PAGE_SIZE);
+	}
+	/*
+	 * Wait — PLANE_SIZE format on gen9 vs HSW is subtly different.
+	 * On gen9 PLANE_SIZE = (height-1) << 16 | (width-1).  HSW same.
+	 */
+
+	/* PIPE_CONF ENABLE — 1% of the work, 99% of the visible effect. */
+	pconf = igen_r32(sc, PIPE_CONF(0));
+	igen_w32(sc, PIPE_CONF(0), pconf | PIPE_CONF_ENABLE);
+
+	/* Wait up to 200 ms for pipe to go active. */
+	for (i = 0; i < 200; i++) {
+		if (igen_r32(sc, PIPE_CONF(0)) & PIPE_CONF_STATE)
+			break;
+		pause("gen9pipeon", hz / 1000);
+	}
+
+	pconf = igen_r32(sc, PIPE_CONF(0));
+	device_printf(sc->dev,
+	    "gen9_panel_on: pipe A %s  PIPE_CONF=0x%08x mode=%ux%u"
+	    " (htotal=%u vtotal=%u pixclk=%d kHz)\n",
+	    (pconf & PIPE_CONF_STATE) ? "LIVE" : "STALL",
+	    pconf, m->hdisplay, m->vdisplay,
+	    m->htotal, m->vtotal, m->clock);
+
+	return ((pconf & PIPE_CONF_STATE) ? 0 : ETIMEDOUT);
+}
+
+static int
+igen_sysctl_gen9_panel_on(SYSCTL_HANDLER_ARGS)
+{
+	struct igen_softc *sc = arg1;
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+	struct drm_display_mode m;
+
+	if (error || req->newptr == NULL || trigger == 0)
+		return (error);
+	if (sc->gen != IGEN_GEN_SKL)
+		return (EOPNOTSUPP);
+	if (sc->cached_edid_len < 128) {
+		device_printf(sc->dev,
+		    "gen9_panel_on: no cached EDID — run edid_read_b first\n");
+		return (ENOENT);
+	}
+
+	/*
+	 * Decode the preferred DTD (first 18 bytes at offset 54) into a
+	 * drm_display_mode and call panel_on.  In production this comes
+	 * from cs->mode via atomic_commit, but the sysctl lets us
+	 * bring up the panel manually for debug.
+	 */
+	igen_edid_to_mode(sc->cached_edid + 54, &m);
+	return (igen_gen9_panel_on(sc, &m));
+}
+
 /* --------------------------- sysctl registration ------------------------- */
 
 void
@@ -564,6 +851,23 @@ igen_hsw_pipe_register_sysctls(struct igen_softc *sc)
 	struct sysctl_ctx_list *ctx = &sc->re_sysctl_ctx;
 	struct sysctl_oid_list *children =
 	    SYSCTL_CHILDREN(sc->re_sysctl_tree);
+
+	/* Gen-agnostic pipe-off — always registered.  Uses register
+	 * offsets/bits shared HSW..KBL. */
+	SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "pipe_a_off",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, igen_sysctl_pipe_a_off, "I",
+	    "write 1 to disable primary plane + cursor + pipe A (safe"
+	    " pre-flight for gt_first_batch_submit / i915_dispatch_enable)");
+
+	if (sc->gen == IGEN_GEN_SKL) {
+		SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "gen9_panel_on",
+		    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE |
+		    CTLFLAG_NEEDGIANT,
+		    sc, 0, igen_sysctl_gen9_panel_on, "I",
+		    "write 1 to bring up gen9 pipe A from cached EDID"
+		    " preferred DTD (transcoder timing + PIPE_CONF)");
+	}
 
 	if (sc->gen != IGEN_GEN_HSW)
 		return;

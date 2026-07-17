@@ -233,6 +233,92 @@ igen_test_fb_alloc(struct igen_softc *sc,
 	return (0);
 }
 
+/*
+ * Bind a GEM object into GGTT at a caller-supplied byte address (softpin
+ * target).  Used by the EXECBUFFER2 handler for each obj[i] before the
+ * batch is dispatched: it writes one PTE per backing page pointing at
+ * the GEM's wired pages, so the engine's BB_START jumps into real BO
+ * content instead of scratch.
+ *
+ * `ggtt_byte_addr` must be page-aligned.  Ranges collide-checked against
+ * our reserved render engine slots (ring / LRC / HWSP at
+ * IGT_GTT_FIRST_RCS_RING..HWSP+PAGES) so a bad softpin from userspace
+ * can't stomp on ring buffers that live in the same GGTT.
+ *
+ * Idempotent — repeatedly binding the same BO at the same address just
+ * re-writes the same PTEs.  Callers do not need to unbind first.
+ *
+ * Cache coherency: same reason as bind_user_fb — GEM pages are WB-cached
+ * on x86, GPU reads via GGTT bypass CPU cache, so we invalidate the
+ * cache lines for the BO before the engine sees them.
+ *
+ * Returns 0 on success, or an errno (EINVAL for alignment / overlap,
+ * ENOSPC if the range is past our GGTT size).
+ */
+int
+igen_gtt_bind_gem_at(struct igen_softc *sc, struct drm_gem_object *obj,
+    uint64_t ggtt_byte_addr)
+{
+	/*
+	 * Engine-reserved GGTT window.  Ring + LRC + HWSP live at
+	 * IGT_GTT_FIRST_RCS_RING = 0x80800, private to igen_gt.c.  Reserve
+	 * 32 pages (128 KB) generously here so future growth (a second
+	 * engine's ring, guc scratch, etc.) doesn't need a re-sync.
+	 * Userspace softpin refused if it overlaps.
+	 */
+	const uint32_t rsv_start = 0x80800;
+	const uint32_t rsv_end = 0x80820;
+
+	if (obj == NULL || obj->pages == NULL || obj->npages == 0)
+		return (EINVAL);
+	if ((ggtt_byte_addr & (PAGE_SIZE - 1)) != 0)
+		return (EINVAL);
+
+	uint32_t first_idx = (uint32_t)(ggtt_byte_addr / PAGE_SIZE);
+	uint32_t bind_end = first_idx + (uint32_t)obj->npages;
+	if (first_idx < rsv_end && bind_end > rsv_start) {
+		device_printf(sc->dev,
+		    "gtt_bind_gem_at: softpin range [0x%x..0x%x)"
+		    " overlaps engine reservation [0x%x..0x%x)\n",
+		    first_idx, bind_end, rsv_start, rsv_end);
+		return (EINVAL);
+	}
+
+	pmap_invalidate_cache_pages(obj->pages, obj->npages);
+	for (size_t i = 0; i < obj->npages; i++) {
+		vm_paddr_t pa = VM_PAGE_TO_PHYS(obj->pages[i]);
+		/*
+		 * PTE bit 7 selects PPAT index 4 (WB | LLC+eLLC | Age 0)
+		 * — coherent with CPU cache.  See igen_gt_init_ppat() in
+		 * igen_gt.c for the PPAT table setup.  Without bit 7 the
+		 * PTE resolves to PPAT[0] whose contents are firmware-
+		 * dependent — safest to be explicit for user softpin BOs
+		 * which have to round-trip CPU<->GPU cleanly.
+		 */
+		uint64_t pte = (pa & ~0xfffULL) | GTT_PTE_VALID |
+		    GTT_PTE_WRITEABLE | 0x80ULL;
+		igen_gtt_write(sc, first_idx + i, pte);
+	}
+	vm_paddr_t pa0 = VM_PAGE_TO_PHYS(obj->pages[0]);
+	uint32_t *kva0 = (uint32_t *)PHYS_TO_DMAP(pa0);
+	device_printf(sc->dev,
+	    "gtt_bind_gem_at: %zu page(s), softpin=0x%llx (slot 0x%x), "
+	    "pa[0]=0x%llx, pte[0]=0x%llx, readback=0x%llx\n",
+	    obj->npages, (unsigned long long)ggtt_byte_addr, first_idx,
+	    (unsigned long long)pa0,
+	    (unsigned long long)((pa0 & ~0xfffULL) | GTT_PTE_VALID |
+	        GTT_PTE_WRITEABLE),
+	    (unsigned long long)igen_gtt_read(sc, first_idx));
+	device_printf(sc->dev,
+	    "gtt_bind_gem_at: BO[0..7]  = %08x %08x %08x %08x %08x %08x %08x %08x\n",
+	    kva0[0], kva0[1], kva0[2], kva0[3],
+	    kva0[4], kva0[5], kva0[6], kva0[7]);
+	device_printf(sc->dev,
+	    "gtt_bind_gem_at: BO[0x40] = %08x  (post-execbuffer2 store target)\n",
+	    kva0[0x40]);
+	return (0);
+}
+
 void
 igen_test_fb_free(struct igen_softc *sc,
     struct igen_test_fb *fb)

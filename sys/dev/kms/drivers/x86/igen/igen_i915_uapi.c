@@ -23,6 +23,10 @@
 #include <sys/malloc.h>
 #include <sys/proc.h>
 
+#include <vm/vm.h>
+#include <vm/vm_page.h>
+#include <vm/pmap.h>
+
 #include <kms/drm_device.h>
 #include <kms/drm_file.h>
 #include <kms/drm_gem.h>
@@ -62,6 +66,7 @@
 
 #define	EXEC_OBJECT_PINNED			(1u << 4)
 #define	I915_EXEC_FENCE_OUT			(1ull << 17)
+#define	I915_EXEC_BATCH_FIRST			(1ull << 18)
 
 #define	DRM_I915_QUERY_TOPOLOGY_INFO		1
 #define	DRM_I915_QUERY_ENGINE_INFO		2
@@ -946,6 +951,7 @@ static int
 igen_i915_gem_execbuffer2(struct drm_file *file,
     struct drm_i915_gem_execbuffer2 *eb)
 {
+	struct igen_softc *sc = file->dev->driver_priv;
 	struct drm_i915_gem_exec_object2 *objs;
 	struct drm_gem_object **gem_refs;
 	uint32_t i;
@@ -968,14 +974,35 @@ igen_i915_gem_execbuffer2(struct drm_file *file,
 
 	/*
 	 * Lookup pass: every handle has to resolve, otherwise the batch is
-	 * malformed and the request is rejected as a whole.  We don't bind
-	 * pages to the softpin offset yet; iris's first batch after
-	 * bufmgr_create will exercise this path and we can iterate.
+	 * malformed and the request is rejected as a whole.
 	 */
 	for (i = 0; i < eb->buffer_count; i++) {
 		gem_refs[i] = kms_gem_handle_lookup(file, objs[i].handle);
 		if (gem_refs[i] == NULL) {
 			error = ENOENT;
+			goto out;
+		}
+	}
+
+	/*
+	 * Softpin bind pass: for every BO in the exec list, program GGTT
+	 * PTEs pointing at the BO's backing pages at the userspace-supplied
+	 * offset.  This makes obj->offset a real address that BB_START,
+	 * MI_STORE_DATA_IMM, and every other GPU-side dereference sees as
+	 * the caller's BO.  Idempotent (repeat calls rewrite same PTEs).
+	 * We do not unbind after dispatch — real userspace (iris, and our
+	 * test client) reuses the same offsets across many execbuffer2s.
+	 */
+	for (i = 0; i < eb->buffer_count; i++) {
+		int berr = igen_gtt_bind_gem_at(sc, gem_refs[i],
+		    objs[i].offset);
+		if (berr != 0) {
+			DPRINTF(sc, 1,
+			    "execbuffer2: softpin bind obj[%u] handle=%u"
+			    " @offset=0x%llx -> %d\n",
+			    i, objs[i].handle,
+			    (unsigned long long)objs[i].offset, berr);
+			error = berr;
 			goto out;
 		}
 	}
@@ -991,7 +1018,69 @@ igen_i915_gem_execbuffer2(struct drm_file *file,
 	if (error != 0)
 		goto out;
 
-	/* TODO: program render-engine execlist port for actual dispatch. */
+	/*
+	 * Dispatch — Phase B.  Skipped by default: `dispatch_enable` is a
+	 * runtime sysctl the operator has to flip on.  Reasons to keep it
+	 * off in the default build:
+	 *   (a) softpin BOs are not yet bound to their userspace GTT
+	 *       addresses in this driver; the batch will run against
+	 *       zeroed pages and either wedge the CS or silently no-op
+	 *   (b) the sysctl smoke test needs to prove HEAD==TAIL first on
+	 *       this specific silicon before we let compositor batches
+	 *       reach the render engine
+	 *   (c) with a live scanout pipe the wedge risk is non-zero
+	 *
+	 * When enabled and safe: pick the batch BO per the standard i915
+	 * convention (I915_EXEC_BATCH_FIRST controls which end of objs[]),
+	 * take its softpin offset + batch_start_offset, and hand to the
+	 * GT layer which composes a ring that jumps there and submits.
+	 */
+	if (sc->i915_dispatch_enable) {
+		uint32_t batch_idx = (eb->flags & I915_EXEC_BATCH_FIRST)
+		    ? 0 : (eb->buffer_count - 1);
+		uint64_t batch_ggtt = objs[batch_idx].offset +
+		    eb->batch_start_offset;
+		int rerr = igen_gt_submit_user_batch(sc, batch_ggtt,
+		    /* force */ (sc->i915_dispatch_enable >= 2));
+		if (rerr != 0)
+			DPRINTF(sc, 1,
+			    "execbuffer2: submit_user_batch(0x%llx) -> %d\n",
+			    (unsigned long long)batch_ggtt, rerr);
+		/* Do not propagate submit errors to userspace yet — iris
+		 * would tear down the context on the first miss.  Log and
+		 * carry on. */
+
+		/*
+		 * Post-dispatch readback of the batch BO from the kernel-
+		 * mapped view: proves via dmesg whether the engine's
+		 * MI_STORE_DWORD_IMM (or similar side-effect) actually
+		 * landed in the physical pages we bound.  The value at
+		 * offset 0x100 is the current proof target for
+		 * exec2_test.c.  Cleaned up once softpin proof is signed
+		 * off.
+		 */
+		{
+			struct drm_gem_object *bo = gem_refs[batch_idx];
+			if (bo != NULL && bo->pages != NULL && bo->npages > 0) {
+				vm_paddr_t pa = VM_PAGE_TO_PHYS(bo->pages[0]);
+				uint32_t *kva = (uint32_t *)PHYS_TO_DMAP(pa);
+				/* Kernel direct-map is WB.  GPU writes with UC
+				 * PTE go straight to RAM and bypass CPU cache
+				 * — flush the direct-map cache lines before
+				 * reading so we see what the engine actually
+				 * left in the page.  wbinvd is heavy but this
+				 * path is a diagnostic. */
+				wbinvd();
+				device_printf(sc->dev,
+				    "execbuffer2: post BO[0..7] = %08x %08x %08x %08x %08x %08x %08x %08x\n",
+				    kva[0], kva[1], kva[2], kva[3],
+				    kva[4], kva[5], kva[6], kva[7]);
+				device_printf(sc->dev,
+				    "execbuffer2: post BO[0x40] = %08x  (STORE_DWORD_IMM target)\n",
+				    kva[0x40]);
+			}
+		}
+	}
 
 out:
 	for (i = 0; i < eb->buffer_count; i++) {

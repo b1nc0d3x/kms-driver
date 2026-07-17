@@ -127,6 +127,26 @@ struct igen_softc {
 	/* Debug verbosity level (0 = silent except errors). */
 	int			 sc_debug;
 
+	/*
+	 * User-batch dispatch gate for EXECBUFFER2.
+	 *   0 = ignore (validate + return, submit no ring work) — default.
+	 *   1 = submit only when the display pipe is idle.
+	 *   2 = force-submit even if pipe is active (bring-up smoke tests
+	 *       — likely to disturb scanout; use with pipe pre-off).
+	 * Runtime knob: dev.igen.<n>.re.i915_dispatch_enable (CTLFLAG_RWTUN).
+	 */
+	int			 i915_dispatch_enable;
+
+	/*
+	 * gen9 DDI cold bring-up gate.  0 = default, safe: gen9_panel_on
+	 * writes only transcoder timing + PIPE_CONF ENABLE.  1 = also
+	 * writes TRANS_CLK_SEL, TRANS_DDI_FUNC_CTL, DDI_BUF_CTL enable
+	 * bits.  Setting to 1 without a warm port PLL wedges the box —
+	 * live-verified 5th wedge 2026-07-16 — so it stays OFF unless the
+	 * operator understands the PLL prerequisites.
+	 */
+	int			 gen9_ddi_enable;
+
 	/* Minimal KMS topology — one of each, all stubs. */
 	struct drm_crtc		 crtc;
 	struct drm_plane	 primary;
@@ -155,6 +175,16 @@ struct igen_softc {
 	struct igen_test_fb	*scanout_fb;
 	uint32_t		 scanout_prev_surf;
 	bool			 scanout_held;
+
+	/*
+	 * Serializes atomic_commit and cursor_move.  Both touch pipe A
+	 * MMIO registers (PLANE_SURF, CUR_POS_A, CUR_BASE_A, CUR_CTL_A)
+	 * and, without this, a mouse motion event racing an atomic frame
+	 * commit lets both writers hit the pipe between vblanks, tearing
+	 * the scanout.  sx (not mtx) because we call igen_wait_vblank
+	 * under it — that path pauses.
+	 */
+	struct sx		 scanout_lock;
 
 	/* Animation kthread. */
 	struct thread		*anim_td;
@@ -230,6 +260,14 @@ struct igen_softc {
 #define	PLANE_STRIDE(p)		(0x70188 + (p) * 0x1000)
 #define	PLANE_SIZE(p)		(0x70190 + (p) * 0x1000)
 #define	PLANE_SURF(p)		(0x7019c + (p) * 0x1000)
+
+#define	CUR_CTL_A		0x70080
+#define	CUR_BASE_A		0x70084
+#define	CUR_POS_A		0x70088
+#define	  CUR_MODE_DISABLE	0x00u
+#define	  CUR_MODE_64_ARGB	0x07u
+#define	  CUR_MODE_128_ARGB	0x22u
+#define	  CUR_MODE_256_ARGB	0x27u
 
 #define	DDI_BUF_CTL(d)		(0x64000 + (d) * 0x100)
 #define	  DDI_BUF_CTL_ENABLE_BIT		(1u << 31)
@@ -313,6 +351,15 @@ void	igen_phy_register_sysctls(struct igen_softc *sc);
 void	igen_gt_register_sysctls(struct igen_softc *sc);
 
 /*
+ * EXECBUFFER2 entry point.  Composes a private ring that jumps to
+ * `batch_ggtt`, live-submits via ELSP.  `force` overrides the pipe-
+ * active refusal (destructive — only safe when the compositor has
+ * no visible surface, e.g. headless boot).
+ */
+int	igen_gt_submit_user_batch(struct igen_softc *sc,
+	    uint64_t batch_ggtt, bool force);
+
+/*
  * igen_gtt.c — GTT introspection + RW helpers, 8 MiB scratch FB allocator,
  * per-FB GTT slot cache for ADDFB2 dumb buffers, persistent scanout
  * buffer (scanout_hold), animation kthread.  &igen_owned_fb_funcs is
@@ -325,6 +372,8 @@ uint32_t igen_gtt_bind_user_fb(struct igen_softc *sc,
 	    struct drm_framebuffer *fb);
 uint32_t igen_gtt_bind_cursor(struct igen_softc *sc,
 	    struct drm_gem_object *obj);
+int	igen_gtt_bind_gem_at(struct igen_softc *sc,
+	    struct drm_gem_object *obj, uint64_t ggtt_byte_addr);
 int	igen_i915_ioctl(struct drm_file *file, u_long cmd, void *data);
 uint64_t igen_gtt_read(struct igen_softc *sc, uint32_t entry_idx);
 void	igen_gtt_write(struct igen_softc *sc, uint32_t entry_idx,
@@ -344,6 +393,10 @@ void	igen_gtt_detach(struct igen_softc *sc);
  * call it unconditionally.
  */
 int	igen_hsw_panel_on(struct igen_softc *sc);
+int	igen_gen9_panel_on(struct igen_softc *sc,
+	    const struct drm_display_mode *m);
+int	igen_pipe_a_off(struct igen_softc *sc);
+void	igen_edid_to_mode(const uint8_t *dtd, struct drm_display_mode *m);
 void	igen_hsw_pipe_register_sysctls(struct igen_softc *sc);
 
 #endif /* _IGEN_INTERNAL_H_ */
