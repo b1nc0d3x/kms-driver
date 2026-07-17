@@ -1346,7 +1346,7 @@ igen_publish_cea_extension(struct igen_softc *sc, const uint8_t *ext,
  * GMBus (HDMI) and AUX (DP/eDP) EDID acquisition paths so the parse
  * logic doesn't fork.
  */
-static int
+int
 igen_publish_edid(struct igen_softc *sc, const uint8_t *edid, size_t len)
 {
 	int published = 0;

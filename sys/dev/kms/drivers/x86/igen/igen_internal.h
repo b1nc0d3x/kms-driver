@@ -339,6 +339,8 @@ void	igen_wait_vblank(struct igen_softc *sc, int pipe);
 #define	GMBUS_PIN_DDI_B		5	/* SKL+ canonical pin map: DDI_B */
 #define	EDID_SLAVE		0x50
 
+int	igen_publish_edid(struct igen_softc *sc, const uint8_t *edid,
+	    size_t len);
 int	igen_gmbus_read_block(struct igen_softc *sc, uint32_t pin,
 	    uint8_t slave, uint8_t offset, uint8_t *buf, size_t len);
 void	igen_gmbus_register_sysctls(struct igen_softc *sc);

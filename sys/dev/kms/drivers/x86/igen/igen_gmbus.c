@@ -378,6 +378,66 @@ igen_sysctl_edid_read_b(SYSCTL_HANDLER_ARGS)
  * Register the GMBus-driven sysctls under dev.igen.<n>.re.  Called
  * from igen_re_sysctls_init in igen.c.
  */
+/*
+ * Try a single 256-byte read at offset 0 to fetch the base block +
+ * the first extension block in one GMBus transaction.  This avoids
+ * both (a) our previous wedgy two-transaction approach and (b) the
+ * E-DDC segment protocol we don't yet implement.  On monitors that
+ * respond to a >128-byte read this succeeds; on monitors that stop
+ * ACKing after byte 128 we get a partial return and a NAK error.
+ *
+ * On success the CEA-861 parser inside igen_publish_edid picks up
+ * the extension block (SVDs + extra DTDs) automatically.
+ *
+ * Manual trigger only — NOT wired into attach.  Two prior wedges
+ * (2026-07-17) taught us to keep new GMBus paths behind a sysctl
+ * until proven safe on the target hardware.
+ */
+static int
+igen_sysctl_edid_read_b_ext(SYSCTL_HANDLER_ARGS)
+{
+	struct igen_softc *sc = arg1;
+	uint8_t edid[256];
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+
+	if (error || req->newptr == NULL || trigger == 0)
+		return (error);
+
+	memset(edid, 0, sizeof(edid));
+	error = igen_gmbus_read_block(sc, GMBUS_PIN_DDI_B, EDID_SLAVE,
+	    0, edid, sizeof(edid));
+	if (error != 0) {
+		device_printf(sc->dev,
+		    "edid_read_b_ext: gmbus 256-byte read failed (%d) — "
+		    "monitor may cap at 128 bytes per transaction; falling"
+		    " back to two-transaction path would need E-DDC segment"
+		    " support first\n", error);
+		return (0);
+	}
+	device_printf(sc->dev,
+	    "edid_read_b_ext: 256 bytes read; base header %s, "
+	    "extension tag=0x%02x rev=%u\n",
+	    (edid[0] == 0 && edid[1] == 0xff) ? "OK" : "BAD",
+	    edid[128], edid[129]);
+
+	/*
+	 * Only publish if base looks right AND byte 126 says an
+	 * extension exists AND the extension header is CEA-861 (0x02).
+	 * Otherwise we'd be shoving noise into the connector's mode list.
+	 */
+	if (edid[0] != 0 || edid[1] != 0xff)
+		return (EINVAL);
+	if (edid[126] == 0 || edid[128] != 0x02) {
+		device_printf(sc->dev,
+		    "edid_read_b_ext: no CEA extension present"
+		    " (byte126=%u tag=0x%02x) — not republishing\n",
+		    edid[126], edid[128]);
+		return (0);
+	}
+	return (igen_publish_edid(sc, edid, sizeof(edid)));
+}
+
 void
 igen_gmbus_register_sysctls(struct igen_softc *sc)
 {
@@ -389,4 +449,10 @@ igen_gmbus_register_sysctls(struct igen_softc *sc)
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
 	    sc, 0, igen_sysctl_edid_read_b, "I",
 	    "write 1 to GMBus-read 128 bytes of EDID block 0 from DDI_B");
+	SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "edid_read_b_ext",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, igen_sysctl_edid_read_b_ext, "I",
+	    "write 1 to GMBus-read 256 bytes (base + CEA extension) in a"
+	    " single transaction on DDI_B and re-publish the mode list."
+	    "  Manual test — not called at attach.");
 }
