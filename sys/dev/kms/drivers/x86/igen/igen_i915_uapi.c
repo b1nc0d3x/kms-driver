@@ -985,25 +985,37 @@ igen_i915_gem_execbuffer2(struct drm_file *file,
 	}
 
 	/*
-	 * Softpin bind pass: for every BO in the exec list, program GGTT
-	 * PTEs pointing at the BO's backing pages at the userspace-supplied
-	 * offset.  This makes obj->offset a real address that BB_START,
-	 * MI_STORE_DATA_IMM, and every other GPU-side dereference sees as
-	 * the caller's BO.  Idempotent (repeat calls rewrite same PTEs).
-	 * We do not unbind after dispatch — real userspace (iris, and our
-	 * test client) reuses the same offsets across many execbuffer2s.
+	 * Softpin bind pass: gated behind i915_dispatch_enable.
+	 *
+	 * Why gated: iris + kwin issue EXECBUFFER2 constantly for GL
+	 * rendering.  Every batch has multiple BOs at softpin offsets iris
+	 * picks from its private VMA allocator.  Those offsets can and do
+	 * overlap with our display's PLANE_SURF GGTT bindings — writing
+	 * PTEs there clobbers the display engine's own view of the
+	 * framebuffer and wedges the box.  Live-verified 2026-07-16 as the
+	 * passive-wedge-during-normal-use bug: kwin+iris ran, submitted
+	 * batches for hours before eventually rewriting a GGTT PTE that
+	 * pipe A was reading.
+	 *
+	 * If dispatch_enable == 0, we validate handles + echo offsets and
+	 * return without touching GGTT.  iris sees `r=0` (success) and
+	 * assumes the batch ran; our smoke test (exec2_test.c) enables the
+	 * gate manually.
 	 */
-	for (i = 0; i < eb->buffer_count; i++) {
-		int berr = igen_gtt_bind_gem_at(sc, gem_refs[i],
-		    objs[i].offset);
-		if (berr != 0) {
-			DPRINTF(sc, 1,
-			    "execbuffer2: softpin bind obj[%u] handle=%u"
-			    " @offset=0x%llx -> %d\n",
-			    i, objs[i].handle,
-			    (unsigned long long)objs[i].offset, berr);
-			error = berr;
-			goto out;
+	if (sc->i915_dispatch_enable != 0) {
+		for (i = 0; i < eb->buffer_count; i++) {
+			int berr = igen_gtt_bind_gem_at(sc, gem_refs[i],
+			    objs[i].offset);
+			if (berr != 0) {
+				DPRINTF(sc, 1,
+				    "execbuffer2: softpin bind obj[%u] handle=%u"
+				    " @offset=0x%llx -> %d\n",
+				    i, objs[i].handle,
+				    (unsigned long long)objs[i].offset,
+				    berr);
+				error = berr;
+				goto out;
+			}
 		}
 	}
 

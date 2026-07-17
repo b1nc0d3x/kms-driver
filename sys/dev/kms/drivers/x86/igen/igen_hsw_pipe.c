@@ -670,6 +670,134 @@ igen_sysctl_pipe_a_off(SYSCTL_HANDLER_ARGS)
 	return (igen_pipe_a_off(sc));
 }
 
+/* --------------- gen9 display-state diagnostic dump (read-only) ---------- */
+
+/*
+ * Full read-only snapshot of every gen9 display-side register we could
+ * possibly need to reconstruct a working panel bring-up on a boot where
+ * firmware hands us a dark pipe.  Triggered by `re.gen9_display_dump=1`
+ * (write-only sysctl).  Prints straight to dmesg.
+ *
+ * ZERO WRITE risk: this only reads.  Use while GUI is up + working to
+ * capture the "known-good baseline" that firmware programmed.  Then
+ * hard-code those values in gen9_panel_on so cold-boot cases can adopt
+ * them.
+ */
+
+/* Clocks + PLL infrastructure (BSpec vol 12: display registers). */
+#define	CDCLK_CTL			0x00046000
+#define	LCPLL1_CTL			0x00046010
+#define	LCPLL2_CTL			0x00046014
+#define	DPLL_STATUS			0x0006c060
+#define	DPLL_CTRL1			0x0006c058
+#define	DPLL_CTRL2			0x0006c05c
+#define	DPLL1_CFGCR1			0x0006c040
+#define	DPLL1_CFGCR2			0x0006c044
+#define	DPLL2_CFGCR1			0x0006c048
+#define	DPLL2_CFGCR2			0x0006c04c
+#define	DPLL3_CFGCR1			0x0006c050
+#define	DPLL3_CFGCR2			0x0006c054
+
+/* Pipe M/N stuffer for the DP encoder. */
+#define	PIPEA_DATA_M			0x00060030
+#define	PIPEA_DATA_N			0x00060034
+#define	PIPEA_LINK_M			0x00060040
+#define	PIPEA_LINK_N			0x00060044
+
+/* Panel power (eDP). */
+#define	PP_STATUS			0x000c7200
+#define	PP_CONTROL			0x000c7204
+
+static int
+igen_sysctl_gen9_display_dump(SYSCTL_HANDLER_ARGS)
+{
+	struct igen_softc *sc = arg1;
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+
+	if (error || req->newptr == NULL || trigger == 0)
+		return (error);
+	if (sc->gen != IGEN_GEN_SKL)
+		return (EOPNOTSUPP);
+
+	device_printf(sc->dev, "=== gen9 display-state dump ===\n");
+
+	device_printf(sc->dev,
+	    "CLOCKS   CDCLK_CTL=0x%08x  LCPLL1_CTL=0x%08x  LCPLL2_CTL=0x%08x\n",
+	    igen_r32(sc, CDCLK_CTL),
+	    igen_r32(sc, LCPLL1_CTL),
+	    igen_r32(sc, LCPLL2_CTL));
+
+	device_printf(sc->dev,
+	    "DPLL     STATUS=0x%08x  CTRL1=0x%08x  CTRL2=0x%08x\n",
+	    igen_r32(sc, DPLL_STATUS),
+	    igen_r32(sc, DPLL_CTRL1),
+	    igen_r32(sc, DPLL_CTRL2));
+
+	device_printf(sc->dev,
+	    "DPLL1    CFGCR1=0x%08x  CFGCR2=0x%08x\n",
+	    igen_r32(sc, DPLL1_CFGCR1), igen_r32(sc, DPLL1_CFGCR2));
+	device_printf(sc->dev,
+	    "DPLL2    CFGCR1=0x%08x  CFGCR2=0x%08x\n",
+	    igen_r32(sc, DPLL2_CFGCR1), igen_r32(sc, DPLL2_CFGCR2));
+	device_printf(sc->dev,
+	    "DPLL3    CFGCR1=0x%08x  CFGCR2=0x%08x\n",
+	    igen_r32(sc, DPLL3_CFGCR1), igen_r32(sc, DPLL3_CFGCR2));
+
+	device_printf(sc->dev,
+	    "PIPE_A   CONF=0x%08x  SRCSZ=0x%08x  HTOTAL=0x%08x  HBLANK=0x%08x\n",
+	    igen_r32(sc, PIPE_CONF(0)),
+	    igen_r32(sc, PIPE_SRCSZ(0)),
+	    igen_r32(sc, TRANS_HTOTAL(0)),
+	    igen_r32(sc, TRANS_HBLANK(0)));
+	device_printf(sc->dev,
+	    "PIPE_A   HSYNC=0x%08x  VTOTAL=0x%08x  VBLANK=0x%08x  VSYNC=0x%08x\n",
+	    igen_r32(sc, TRANS_HSYNC(0)),
+	    igen_r32(sc, TRANS_VTOTAL(0)),
+	    igen_r32(sc, TRANS_VBLANK(0)),
+	    igen_r32(sc, TRANS_VSYNC(0)));
+
+	device_printf(sc->dev,
+	    "PIPE_A   DATA_M=0x%08x  DATA_N=0x%08x  LINK_M=0x%08x  LINK_N=0x%08x\n",
+	    igen_r32(sc, PIPEA_DATA_M),
+	    igen_r32(sc, PIPEA_DATA_N),
+	    igen_r32(sc, PIPEA_LINK_M),
+	    igen_r32(sc, PIPEA_LINK_N));
+
+	device_printf(sc->dev,
+	    "TRANS_A  DDI_FUNC_CTL=0x%08x  CLK_SEL=0x%08x\n",
+	    igen_r32(sc, TRANS_DDI_FUNC_CTL(0)),
+	    igen_r32(sc, 0x00046140));
+
+	device_printf(sc->dev,
+	    "DDI_BUF  A=0x%08x  B=0x%08x  C=0x%08x  D=0x%08x  E=0x%08x\n",
+	    igen_r32(sc, DDI_BUF_CTL(0)),
+	    igen_r32(sc, DDI_BUF_CTL(1)),
+	    igen_r32(sc, DDI_BUF_CTL(2)),
+	    igen_r32(sc, DDI_BUF_CTL(3)),
+	    igen_r32(sc, DDI_BUF_CTL(4)));
+
+	device_printf(sc->dev,
+	    "PLANE_A  CTL=0x%08x  STRIDE=0x%08x  SURF=0x%08x\n",
+	    igen_r32(sc, PLANE_CTL(0)),
+	    igen_r32(sc, PLANE_STRIDE(0)),
+	    igen_r32(sc, PLANE_SURF(0)));
+
+	device_printf(sc->dev,
+	    "HPD/FUSE SFUSE_STRAP=0x%08x  SHOTPLUG_CTL_DDI=0x%08x  SDEISR=0x%08x\n",
+	    igen_r32(sc, SFUSE_STRAP),
+	    igen_r32(sc, SHOTPLUG_CTL_DDI),
+	    igen_r32(sc, SDEISR));
+
+	device_printf(sc->dev,
+	    "PANEL_PWR PP_STATUS=0x%08x  PP_CONTROL=0x%08x\n",
+	    igen_r32(sc, PP_STATUS),
+	    igen_r32(sc, PP_CONTROL));
+
+	device_printf(sc->dev, "=== end gen9 display-state dump ===\n");
+	return (0);
+}
+
 /* ------------------- gen9 (SKL/KBL) pipe-A cold bring-up ------------------ */
 
 /*
@@ -815,6 +943,240 @@ igen_gen9_panel_on(struct igen_softc *sc, const struct drm_display_mode *m)
 	return ((pconf & PIPE_CONF_STATE) ? 0 : ETIMEDOUT);
 }
 
+/*
+ * Full cold pipe-A bring-up for gen9 (SKL/KBL) on a Kabylake-S desktop
+ * with HDMI on DDI B (Dell OptiPlex 5040 / fbsdx86).
+ *
+ * Hardcoded values captured 2026-07-17 from a live 1920x1080@60 session
+ * via `re.gen9_display_dump=1`:
+ *   CDCLK_CTL     = 0x0c000544  (untouched — firmware default)
+ *   LCPLL1_CTL    = 0xc0000000  (enable + lock — untouched)
+ *   LCPLL2_CTL    = 0x80000000  (enable — untouched)
+ *   DPLL_CTRL1    = 0x00000845
+ *   DPLL_CTRL2    = 0x00a00018
+ *   DPLL1_CFGCR1  = 0x80400173  (148.5 MHz pixel clock config)
+ *   DPLL1_CFGCR2  = 0x000003a5
+ *   TRANS_CLK_SEL = 0x40000000  (DDI B clock)
+ *   TRANS_DDI_FUNC_CTL = 0x90030000 (ENABLE | DDI_B | HDMI | 8bpc |
+ *                                    PHSYNC | PVSYNC)
+ *   DDI_BUF_CTL_B = 0x80000000  (ENABLE, x1 port width)
+ *   PLANE_CTL     = 0x84000000  (ENABLE | ARGB8888 | linear)
+ *   PIPE_CONF     = 0xc0000000  (ENABLE + STATE running)
+ *
+ * Safety: read LCPLL1_CTL + DPLL_STATUS first.  If underlying
+ * oscillators aren't up (LCPLL bit 31 clear or DPLL1 not locked),
+ * bail out — bringing up LCPLL / CDCLK from scratch needs work we
+ * don't yet do.
+ *
+ * Assumption: firmware left the raw clock/PLL infrastructure programmed
+ * (CDCLK, LCPLLs) but reset the transcoder/DDI wiring on the way out.
+ * That matches what we've seen — LCPLL always reads back enabled even
+ * on "dark" boots.  If firmware ever truly resets the PLLs cold, we'll
+ * see it in gen9_display_dump and add PLL programming here.
+ */
+#define	CDCLK_CTL			0x00046000
+#define	LCPLL1_CTL			0x00046010
+#define	LCPLL2_CTL			0x00046014
+#define	DPLL_STATUS			0x0006c060
+#define	DPLL_CTRL1			0x0006c058
+#define	DPLL_CTRL2			0x0006c05c
+#define	DPLL1_CFGCR1			0x0006c040
+#define	DPLL1_CFGCR2			0x0006c044
+#define	TRANS_CLK_SEL_A			0x00046140
+
+/*
+ * DPLL_STATUS layout on gen9: one LOCK bit per PLL at stride 4.
+ *   bit 0 = DPLL0 (LCPLL1 / CDCLK — DO NOT REPROGRAM)
+ *   bit 4 = DPLL1 (our port PLL for DDI B)
+ *   bit 8 = DPLL2
+ *   bit 12 = DPLL3
+ */
+#define	LCPLL_ENABLE_BIT		(1u << 31)
+#define	DPLL1_LOCK_BIT			(1u << 4)
+
+/*
+ * DPLL_CTRL1 layout: 6 bits per PLL.
+ *   DPLL0 [5:0], DPLL1 [11:6], DPLL2 [17:12], DPLL3 [23:18].
+ * DPLL_CTRL2 layout: 3 bits per DDI (override + 2-bit PLL select).
+ *   DDI A [2:0], DDI B [5:3], DDI C [8:6], DDI D [11:9], DDI E [14:12].
+ * ALL WRITES MUST BE RMW — DPLL0 field in CTRL1 controls LCPLL1 which
+ * serves CDCLK.  Clobbering DPLL0 bits breaks CDCLK and cascade-wedges
+ * the display fabric AND the kernel (6th wedge in the 2026-07-16/17
+ * session — see feedback_igen_no_force_submit_pipe_active.md).
+ */
+#define	DPLL_CTRL1_DPLL1_MASK		0x00000FC0	/* bits [11:6] */
+#define	DPLL_CTRL1_DPLL1_VAL		0x00000840	/* mode + SSC set */
+#define	DPLL_CTRL2_DDI_B_MASK		0x00000038	/* bits [5:3] */
+#define	DPLL_CTRL2_DDI_B_VAL		0x00000018	/* override + PLL1 */
+
+int
+igen_gen9_full_bringup(struct igen_softc *sc,
+    const struct drm_display_mode *m)
+{
+	uint32_t lcpll1, dpll_status, pconf, ctrl1, ctrl2;
+	int spin;
+
+	if (sc->gen != IGEN_GEN_SKL)
+		return (EOPNOTSUPP);
+	if (m == NULL || m->hdisplay == 0 || m->vdisplay == 0)
+		return (EINVAL);
+
+	/* Log everything we're about to touch BEFORE writing anything. */
+	lcpll1 = igen_r32(sc, LCPLL1_CTL);
+	dpll_status = igen_r32(sc, DPLL_STATUS);
+	ctrl1 = igen_r32(sc, DPLL_CTRL1);
+	ctrl2 = igen_r32(sc, DPLL_CTRL2);
+	device_printf(sc->dev,
+	    "gen9_full_bringup: pre-write state:"
+	    " LCPLL1=0x%08x DPLL_STATUS=0x%08x DPLL_CTRL1=0x%08x"
+	    " DPLL_CTRL2=0x%08x\n",
+	    lcpll1, dpll_status, ctrl1, ctrl2);
+
+	if ((lcpll1 & LCPLL_ENABLE_BIT) == 0) {
+		device_printf(sc->dev,
+		    "gen9_full_bringup: REFUSE — LCPLL1 disabled;"
+		    " cold LCPLL bring-up not implemented\n");
+		return (ENXIO);
+	}
+
+	/*
+	 * If DPLL1 is already locked, don't touch DPLL config at all —
+	 * firmware left it programmed (which is the common case even on
+	 * boots where the pipe is dark).  Skipping this saves us from
+	 * accidentally clobbering DPLL0 via a mistaken RMW mask.
+	 */
+	if ((dpll_status & DPLL1_LOCK_BIT) != 0) {
+		device_printf(sc->dev,
+		    "gen9_full_bringup: DPLL1 already locked — skipping"
+		    " DPLL config, only touching DDI + transcoder + pipe\n");
+	} else {
+		/*
+		 * Cold path: DPLL1 needs programming.  RMW so DPLL0 (CDCLK
+		 * source) is preserved bit-for-bit.
+		 */
+		device_printf(sc->dev,
+		    "gen9_full_bringup: DPLL1 unlocked — programming\n");
+		igen_w32(sc, DPLL1_CFGCR1, 0x80400173);
+		igen_w32(sc, DPLL1_CFGCR2, 0x000003a5);
+
+		ctrl1 &= ~DPLL_CTRL1_DPLL1_MASK;
+		ctrl1 |= DPLL_CTRL1_DPLL1_VAL;
+		igen_w32(sc, DPLL_CTRL1, ctrl1);
+
+		ctrl2 &= ~DPLL_CTRL2_DDI_B_MASK;
+		ctrl2 |= DPLL_CTRL2_DDI_B_VAL;
+		igen_w32(sc, DPLL_CTRL2, ctrl2);
+		(void)igen_r32(sc, DPLL_CTRL2);
+
+		/* Wait for DPLL1 lock (bit 4). */
+		for (spin = 0; spin < 100; spin++) {
+			if (igen_r32(sc, DPLL_STATUS) & DPLL1_LOCK_BIT)
+				break;
+			DELAY(100);
+		}
+		if ((igen_r32(sc, DPLL_STATUS) & DPLL1_LOCK_BIT) == 0) {
+			device_printf(sc->dev,
+			    "gen9_full_bringup: DPLL1 didn't lock after"
+			    " 10 ms (STATUS=0x%08x) — aborting before"
+			    " DDI enable\n",
+			    igen_r32(sc, DPLL_STATUS));
+			return (ETIMEDOUT);
+		}
+		device_printf(sc->dev,
+		    "gen9_full_bringup: DPLL1 locked after %d us\n",
+		    spin * 100);
+	}
+
+	/* Step 2: transcoder timing (from EDID / caller-supplied mode). */
+	igen_w32(sc, TRANS_HTOTAL(0),
+	    (((uint32_t)m->htotal - 1) << 16) |
+	    ((uint32_t)m->hdisplay - 1));
+	igen_w32(sc, TRANS_HBLANK(0),
+	    (((uint32_t)m->htotal - 1) << 16) |
+	    ((uint32_t)m->hdisplay - 1));
+	igen_w32(sc, TRANS_HSYNC(0),
+	    (((uint32_t)m->hsync_end - 1) << 16) |
+	    ((uint32_t)m->hsync_start - 1));
+	igen_w32(sc, TRANS_VTOTAL(0),
+	    (((uint32_t)m->vtotal - 1) << 16) |
+	    ((uint32_t)m->vdisplay - 1));
+	igen_w32(sc, TRANS_VBLANK(0),
+	    (((uint32_t)m->vtotal - 1) << 16) |
+	    ((uint32_t)m->vdisplay - 1));
+	igen_w32(sc, TRANS_VSYNC(0),
+	    (((uint32_t)m->vsync_end - 1) << 16) |
+	    ((uint32_t)m->vsync_start - 1));
+
+	/* Step 3: route DDI B clock to transcoder A. */
+	igen_w32(sc, TRANS_CLK_SEL_A, 0x40000000);
+
+	/* Step 4: enable transcoder A -> DDI B in HDMI mode, 8bpc. */
+	igen_w32(sc, TRANS_DDI_FUNC_CTL(0), 0x90030000);
+
+	/* Step 5: enable DDI B buffer. */
+	igen_w32(sc, DDI_BUF_CTL(1), 0x80000000);
+	(void)igen_r32(sc, DDI_BUF_CTL(1));
+	DELAY(600);	/* BSpec: wait ~518us for buffer up */
+
+	/* Step 6: pipe source size + primary plane setup. */
+	igen_w32(sc, PIPE_SRCSZ(0),
+	    (((uint32_t)m->hdisplay - 1) << 16) |
+	    ((uint32_t)m->vdisplay - 1));
+
+	if (sc->scanout_fb != NULL && sc->scanout_fb->mapped) {
+		igen_w32(sc, PLANE_STRIDE(0),
+		    sc->scanout_fb->stride / 64);
+		igen_w32(sc, PLANE_SURF(0),
+		    sc->scanout_fb->gtt_first_idx * PAGE_SIZE);
+	}
+	/* Enable primary plane, ARGB8888, linear (untiled). */
+	igen_w32(sc, PLANE_CTL(0), 0x84000000);
+
+	/* Step 7: enable pipe. */
+	pconf = igen_r32(sc, PIPE_CONF(0));
+	igen_w32(sc, PIPE_CONF(0), pconf | PIPE_CONF_ENABLE);
+
+	/* Wait for pipe active (PIPE_STATE bit 30). */
+	for (spin = 0; spin < 200; spin++) {
+		if (igen_r32(sc, PIPE_CONF(0)) & PIPE_CONF_STATE)
+			break;
+		pause("gen9brup", hz / 1000);
+	}
+	pconf = igen_r32(sc, PIPE_CONF(0));
+
+	device_printf(sc->dev,
+	    "gen9_full_bringup: pipe A %s after %d ms  PIPE_CONF=0x%08x"
+	    "  DDI_BUF_B=0x%08x  mode=%ux%u  clock=%d kHz\n",
+	    (pconf & PIPE_CONF_STATE) ? "LIVE" : "STALL",
+	    spin, pconf,
+	    igen_r32(sc, DDI_BUF_CTL(1)),
+	    m->hdisplay, m->vdisplay, m->clock);
+
+	return ((pconf & PIPE_CONF_STATE) ? 0 : ETIMEDOUT);
+}
+
+static int
+igen_sysctl_gen9_full_bringup(SYSCTL_HANDLER_ARGS)
+{
+	struct igen_softc *sc = arg1;
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+	struct drm_display_mode m;
+
+	if (error || req->newptr == NULL || trigger == 0)
+		return (error);
+	if (sc->gen != IGEN_GEN_SKL)
+		return (EOPNOTSUPP);
+	if (sc->cached_edid_len < 128) {
+		device_printf(sc->dev,
+		    "gen9_full_bringup: no cached EDID — run edid_read_b"
+		    " first\n");
+		return (ENOENT);
+	}
+	igen_edid_to_mode(sc->cached_edid + 54, &m);
+	return (igen_gen9_full_bringup(sc, &m));
+}
+
 static int
 igen_sysctl_gen9_panel_on(SYSCTL_HANDLER_ARGS)
 {
@@ -867,6 +1229,21 @@ igen_hsw_pipe_register_sysctls(struct igen_softc *sc)
 		    sc, 0, igen_sysctl_gen9_panel_on, "I",
 		    "write 1 to bring up gen9 pipe A from cached EDID"
 		    " preferred DTD (transcoder timing + PIPE_CONF)");
+		SYSCTL_ADD_PROC(ctx, children, OID_AUTO,
+		    "gen9_display_dump",
+		    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE |
+		    CTLFLAG_NEEDGIANT,
+		    sc, 0, igen_sysctl_gen9_display_dump, "I",
+		    "write 1 to dump every gen9 display-side register"
+		    " (read-only, safe)");
+		SYSCTL_ADD_PROC(ctx, children, OID_AUTO,
+		    "gen9_full_bringup_now",
+		    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE |
+		    CTLFLAG_NEEDGIANT,
+		    sc, 0, igen_sysctl_gen9_full_bringup, "I",
+		    "write 1 to force full DPLL+DDI+pipe cold bring-up"
+		    " from cached EDID (uses hardcoded HDMI-on-DDI-B"
+		    " baseline)");
 	}
 
 	if (sc->gen != IGEN_GEN_HSW)

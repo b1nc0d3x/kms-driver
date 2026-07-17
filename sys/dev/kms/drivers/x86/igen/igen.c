@@ -511,6 +511,22 @@ igen_re_sysctls_init(struct igen_softc *sc)
 	    "gen9_panel_on writes TRANS_CLK_SEL + TRANS_DDI_FUNC_CTL +"
 	    " DDI_BUF_CTL enables (0=off, 1=on — DANGER without PLL)");
 
+	/*
+	 * gen9 FULL cold-boot pipe-A bring-up.  Default off — atomic_commit
+	 * falls back to the safer transcoder-timing-only gen9_panel_on.
+	 * Setting to 1 makes atomic_commit call igen_gen9_full_bringup on
+	 * the "firmware handed us a dark pipe" path.  Live-verified on
+	 * this Dell OptiPlex 5040; other boards need their own captured
+	 * baseline before enabling.
+	 */
+	SYSCTL_ADD_INT(&sc->re_sysctl_ctx, children,
+	    OID_AUTO, "gen9_full_bringup", CTLFLAG_RWTUN,
+	    &sc->gen9_full_bringup, 0,
+	    "atomic_commit uses full DPLL+DDI+pipe cold bring-up when"
+	    " firmware boots dark (0=off, 1=on — only fires when pipe"
+	    " is dark; safe check on LCPLL/DPLL state before touching"
+	    " anything)");
+
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "mmio_snapshot_save",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
@@ -851,6 +867,9 @@ igen_sysctl_vbt_dump(SYSCTL_HANDLER_ARGS)
 #define	PIPE_CONF(p)		(0x70008 + (p) * 0x1000)
 #define	  PIPE_CONF_ENABLE	(1u << 31)
 #define	  PIPE_CONF_STATE	(1u << 30)
+/* DDI_BUF_CTL — 0x100 stride; DDI B = port 1 → 0x64100.  Bit 31 = ENABLE. */
+#define	DDI_BUF_CTL_REG(p)	(0x64000 + (p) * 0x100)
+#define	  DDI_BUF_CTL_EN	(1u << 31)
 
 /*
  * SKL+ universal-plane primary registers (plane 1 of each pipe).
@@ -1845,23 +1864,47 @@ igen_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 		    i == 0) {
 			/*
 			 * "Needs bring-up" is broader than "PIPE_CONF bits
-			 * clear."  On our KBL, firmware routinely hands us
-			 * PIPE_CONF = 0xc0000000 (ENABLE + STATE set) but
-			 * TRANS_HTOTAL / TRANS_VTOTAL are zero — so the pipe
-			 * is "scanning" but the transcoder produces a null
-			 * frame and read_pipe_mode reports 1x1.  Trigger the
-			 * cold bring-up whenever the live pipe timing is
-			 * clearly bogus (hdisplay < 32) regardless of what
-			 * PIPE_CONF says.
+			 * clear."  Two live-verified handoff shapes:
+			 *
+			 *  1. Cold physical boot: PIPE_CONF=0xc0000000
+			 *     (ENABLE + STATE set) but TRANS_HTOTAL/VTOTAL
+			 *     are zero — the pipe is "scanning" but the
+			 *     transcoder produces a null frame and
+			 *     read_pipe_mode reports 1x1.
+			 *
+			 *  2. Warm/software reboot: TRANS_HTOTAL/VTOTAL
+			 *     survive stale valid (probe reports 1920x1080)
+			 *     but DDI_BUF_CTL(B) got cleared and/or
+			 *     PIPE_CONF STATE dropped during teardown, so
+			 *     HDMI is dark even though timing regs look OK.
+			 *
+			 * Cover both: bring-up when (a) probe timing is
+			 * bogus, OR (b) PIPE_CONF STATE bit is clear, OR
+			 * (c) DDI B buffer isn't enabled.  Any one of those
+			 * means no pixels are reaching the panel.
 			 */
 			struct drm_display_mode probe;
+			uint32_t pconf_live = igen_r32(sc, PIPE_CONF(0));
+			uint32_t ddi_b_live = igen_r32(sc, DDI_BUF_CTL_REG(1));
 			igen_read_pipe_mode(sc, 0, &probe);
 			bool needs_bringup = (probe.hdisplay < 32 ||
-			    probe.vdisplay < 32);
+			    probe.vdisplay < 32 ||
+			    (pconf_live & PIPE_CONF_STATE) == 0 ||
+			    (ddi_b_live & DDI_BUF_CTL_EN) == 0);
+			if (needs_bringup)
+				device_printf(sc->dev,
+				    "atomic_commit: bring-up trigger"
+				    " probe=%ux%u PIPE_CONF=0x%08x"
+				    " DDI_BUF_B=0x%08x\n",
+				    probe.hdisplay, probe.vdisplay,
+				    pconf_live, ddi_b_live);
 			if (needs_bringup) {
 				int perr;
 				if (sc->gen == IGEN_GEN_HSW)
 					perr = igen_hsw_panel_on(sc);
+				else if (sc->gen9_full_bringup != 0)
+					perr = igen_gen9_full_bringup(sc,
+					    &cs->mode);
 				else
 					perr = igen_gen9_panel_on(sc,
 					    &cs->mode);
@@ -2162,6 +2205,13 @@ igen_attach(device_t dev)
 	 * works, it just sees a connector with no detected sink.
 	 */
 	(void)igen_attach_edid_modes(sc);
+
+	/*
+	 * Attach-time auto-fire of gen9_full_bringup was tried but produced
+	 * a delayed session wedge (2026-07-17, 8th wedge in the KMS session).
+	 * Reverted.  Rely on the atomic_commit trigger widened to also fire
+	 * when DDI_BUF_CTL(B) or PIPE_CONF STATE is clear.
+	 */
 
 	device_printf(dev, "attached: PCI 8086:%04x gen%d as /dev/dri/card%d\n",
 	    sc->pci_id, sc->gen, sc->drm_dev->minor);

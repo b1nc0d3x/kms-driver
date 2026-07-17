@@ -147,6 +147,20 @@ struct igen_softc {
 	 */
 	int			 gen9_ddi_enable;
 
+	/*
+	 * gen9 FULL cold-boot pipe-A bring-up gate.  0 = default, safe:
+	 * standard atomic_commit path.  1 = when firmware boots dark,
+	 * atomic_commit calls igen_gen9_full_bringup() which programs
+	 * DPLL_CTRL1/2, DPLL1_CFGCR1/2, all TRANS_*, TRANS_CLK_SEL,
+	 * TRANS_DDI_FUNC_CTL, DDI_BUF_CTL(B), PLANE_*, and PIPE_CONF —
+	 * hardcoded values captured from a live 1920x1080@60 HDMI on
+	 * DDI B session on this specific Dell OptiPlex 5040 (fbsdx86).
+	 * The sequence checks LCPLL1/DPLL_STATUS first and refuses if
+	 * the underlying oscillators aren't up.  Set via sysctl:
+	 *   dev.igen.<n>.re.gen9_full_bringup=1
+	 */
+	int			 gen9_full_bringup;
+
 	/* Minimal KMS topology — one of each, all stubs. */
 	struct drm_crtc		 crtc;
 	struct drm_plane	 primary;
@@ -394,6 +408,8 @@ void	igen_gtt_detach(struct igen_softc *sc);
  */
 int	igen_hsw_panel_on(struct igen_softc *sc);
 int	igen_gen9_panel_on(struct igen_softc *sc,
+	    const struct drm_display_mode *m);
+int	igen_gen9_full_bringup(struct igen_softc *sc,
 	    const struct drm_display_mode *m);
 int	igen_pipe_a_off(struct igen_softc *sc);
 void	igen_edid_to_mode(const uint8_t *dtd, struct drm_display_mode *m);
