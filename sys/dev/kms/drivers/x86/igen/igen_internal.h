@@ -182,7 +182,7 @@ struct igen_softc {
 	 * when it programs the transcoder.  Length is 128 on a successful
 	 * read, 0 if we never got a valid EDID.
 	 */
-	uint8_t			 cached_edid[128];
+	uint8_t			 cached_edid[256];
 	size_t			 cached_edid_len;
 
 	/* Driver-owned scanout buffer (scanout_hold sysctl). */

@@ -1211,6 +1211,136 @@ igen_publish_standard_timings(struct igen_softc *sc, const uint8_t *edid,
 }
 
 /*
+ * CEA-861 Video Identification Codes (VIC) — subset covering the modes
+ * we have exact timings for in igen_stock_modes[].  A VIC from an EDID
+ * Video Data Block that maps here becomes a published mode.  VICs
+ * outside this table (usually CEA-861-D/E/F additions or region-
+ * specific NTSC/PAL variants) are logged and skipped — adding one is
+ * a stock-table + this table row.
+ */
+struct igen_vic_map {
+	uint8_t		vic;
+	uint16_t	hd, vd, refresh;
+};
+static const struct igen_vic_map igen_vic_table[] = {
+	{  1,  640,  480, 60 },
+	{  4, 1280,  720, 60 },
+	{ 16, 1920, 1080, 60 },
+	{ 93, 3840, 2160, 24 },
+	{ 94, 3840, 2160, 25 },
+	{ 95, 3840, 2160, 30 },
+	{ 97, 3840, 2160, 60 },
+};
+
+static void
+igen_publish_cea_svd(struct igen_softc *sc, uint8_t svd, int *published)
+{
+	uint8_t vic = svd & 0x7f;	/* bit 7 = "native" flag */
+
+	for (size_t i = 0; i < nitems(igen_vic_table); i++) {
+		if (igen_vic_table[i].vic != vic)
+			continue;
+		const struct igen_stock_mode *sm = igen_stock_lookup(
+		    igen_vic_table[i].hd, igen_vic_table[i].vd,
+		    igen_vic_table[i].refresh);
+		if (sm == NULL)
+			return;
+		struct drm_display_mode *m = kms_mode_create();
+		if (m == NULL)
+			return;
+		igen_stock_to_mode(sm, m);
+		kms_connector_add_mode(&sc->connector, m);
+		(*published)++;
+		device_printf(sc->dev,
+		    "edid/cea: added VIC %u -> mode %s @%u kHz  %u Hz\n",
+		    vic, m->name, m->clock, m->vrefresh);
+		return;
+	}
+	DPRINTF(sc, 1, "edid/cea: VIC %u not in stock table — skipped\n",
+	    vic);
+}
+
+/*
+ * Parse the CEA-861 extension block (offset 128 in a 256-byte EDID).
+ * Layout per CEA-861-E:
+ *   byte 0:   0x02 (CEA extension tag)
+ *   byte 1:   revision (usually 3)
+ *   byte 2:   byte offset from start of block to DTDs (0 = no DTDs)
+ *   byte 3:   flags + native-DTD count in low nibble
+ *   bytes 4..(byte2-1): Data Block Collection — variable-length blocks:
+ *       header byte: [7:5] = tag, [4:0] = payload length
+ *       payload
+ *     tag 2 = Video Data Block, payload = list of 1-byte SVDs (VICs)
+ *   bytes (byte2)..126: DTDs, 18 bytes each
+ *   byte 127: checksum
+ *
+ * We parse: Video Data Block SVDs (via igen_publish_cea_svd), and
+ * extension-block DTDs (via igen_edid_to_mode).  Other block types
+ * (audio, speaker, HDMI VSDB) are ignored for mode enumeration.
+ */
+static void
+igen_publish_cea_extension(struct igen_softc *sc, const uint8_t *ext,
+    int *published)
+{
+	uint8_t rev, dtd_offset, i;
+
+	if (ext[0] != 0x02) {
+		device_printf(sc->dev,
+		    "edid/cea: extension tag 0x%02x != 0x02 — skipping\n",
+		    ext[0]);
+		return;
+	}
+	rev = ext[1];
+	dtd_offset = ext[2];
+	DPRINTF(sc, 1,
+	    "edid/cea: CTA-861 rev %u  dtd_offset=%u  flags=0x%02x\n",
+	    rev, dtd_offset, ext[3]);
+
+	if (rev < 3) {
+		device_printf(sc->dev,
+		    "edid/cea: revision %u < 3, DBC layout unknown — skipping\n",
+		    rev);
+		return;
+	}
+
+	if (dtd_offset > 4 && dtd_offset <= 127) {
+		i = 4;
+		while (i < dtd_offset) {
+			uint8_t tag = (ext[i] >> 5) & 0x7;
+			uint8_t plen = ext[i] & 0x1f;
+			if (i + 1 + plen > dtd_offset)
+				break;
+			if (tag == 2) {	/* Video Data Block */
+				for (uint8_t j = 0; j < plen; j++)
+					igen_publish_cea_svd(sc,
+					    ext[i + 1 + j], published);
+			}
+			i += 1 + plen;
+		}
+	}
+
+	/*
+	 * DTDs from bytes (dtd_offset) to 126 in 18-byte strides.  Zero
+	 * pixel clock (bytes 0/1 both 0) = end-of-list sentinel.
+	 */
+	if (dtd_offset >= 4 && dtd_offset <= 126) {
+		for (int off = dtd_offset; off + 18 <= 127; off += 18) {
+			if (ext[off] == 0 && ext[off + 1] == 0)
+				break;
+			struct drm_display_mode *m = kms_mode_create();
+			if (m == NULL)
+				return;
+			igen_edid_to_mode(&ext[off], m);
+			kms_connector_add_mode(&sc->connector, m);
+			(*published)++;
+			device_printf(sc->dev,
+			    "edid/cea-dtd: added mode %s @%u kHz  %u Hz\n",
+			    m->name, m->clock, m->vrefresh);
+		}
+	}
+}
+
+/*
  * Walk the populated EDID buffer's 4 DTD slots, build drm_display_mode
  * entries, and publish them on the connector.  Shared between the
  * GMBus (HDMI) and AUX (DP/eDP) EDID acquisition paths so the parse
@@ -1245,6 +1375,14 @@ igen_publish_edid(struct igen_softc *sc, const uint8_t *edid, size_t len)
 	 */
 	igen_publish_established_timings(sc, edid, &published);
 	igen_publish_standard_timings(sc, edid, &published);
+	/*
+	 * CEA-861 extension block (when we successfully read 256 bytes
+	 * and the base block declared an extension).  Adds SVDs from
+	 * the Video Data Block + additional DTDs the base block can't
+	 * fit — typically 720p / 1080p / 4K variants on HDMI monitors.
+	 */
+	if (len >= 256 && edid[126] >= 1)
+		igen_publish_cea_extension(sc, edid + 128, &published);
 	(void)kms_connector_update_edid(&sc->connector, edid, len);
 	/*
 	 * NOTE: kms_connector_hotplug tried here 2026-07-17 and wedged the
@@ -1260,9 +1398,9 @@ igen_publish_edid(struct igen_softc *sc, const uint8_t *edid, size_t len)
 	 * re-parse the preferred DTD when programming the transcoder
 	 * without going back through the framework property store.
 	 */
-	if (len >= sizeof(sc->cached_edid)) {
-		memcpy(sc->cached_edid, edid, sizeof(sc->cached_edid));
-		sc->cached_edid_len = sizeof(sc->cached_edid);
+	if (len <= sizeof(sc->cached_edid)) {
+		memcpy(sc->cached_edid, edid, len);
+		sc->cached_edid_len = len;
 	}
 	return (published > 0 ? 0 : ENOENT);
 }
@@ -1316,8 +1454,9 @@ igen_attach_edid_modes_aux_a(struct igen_softc *sc)
 static int
 igen_attach_edid_modes_gmbus_b(struct igen_softc *sc)
 {
-	uint8_t edid[128];
+	uint8_t edid[256];
 	int error = EIO;
+	size_t len = 128;
 
 	/*
 	 * Cold-boot state of GMBus often leaves INUSE/SW_CLR_INT stale
@@ -1326,7 +1465,7 @@ igen_attach_edid_modes_gmbus_b(struct igen_softc *sc)
 	 */
 	for (int try = 0; try < 4; try++) {
 		error = igen_gmbus_read_block(sc, GMBUS_PIN_DDI_B,
-		    EDID_SLAVE, 0, edid, sizeof(edid));
+		    EDID_SLAVE, 0, edid, 128);
 		if (error == 0)
 			break;
 		DPRINTF(sc, 1,
@@ -1336,7 +1475,29 @@ igen_attach_edid_modes_gmbus_b(struct igen_softc *sc)
 	}
 	if (error != 0)
 		return (error);
-	return (igen_publish_edid(sc, edid, sizeof(edid)));
+	/*
+	 * Base block byte 126 = extension block count.  For each declared
+	 * extension, read the next 128-byte block at offset 128*(N+1).
+	 * We cap at one extension (CEA-861 is the common one) — most HDMI
+	 * monitors report count=1, and the second block gives us SVDs +
+	 * additional DTDs the base block can't fit.
+	 */
+	if (edid[126] >= 1) {
+		int xerr = igen_gmbus_read_block(sc, GMBUS_PIN_DDI_B,
+		    EDID_SLAVE, 128, edid + 128, 128);
+		if (xerr == 0) {
+			len = 256;
+			DPRINTF(sc, 1,
+			    "edid/gmbus: extension block read OK"
+			    " (tag=0x%02x rev=%u)\n",
+			    edid[128], edid[129]);
+		} else {
+			device_printf(sc->dev,
+			    "edid/gmbus: extension read failed (%d)"
+			    " — using base block only\n", xerr);
+		}
+	}
+	return (igen_publish_edid(sc, edid, len));
 }
 
 static int
