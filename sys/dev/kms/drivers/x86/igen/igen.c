@@ -1940,27 +1940,61 @@ igen_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 		 */
 		if (cs->mode.hdisplay != live.hdisplay ||
 		    cs->mode.vdisplay != live.vdisplay) {
+			int perr;
+
 			/*
-			 * Size-mismatch modeset was implemented (c46e9bc) via
-			 * gen9_pipe_full_off + gen9_full_bringup, then reverted
-			 * (2026-07-17) after the DPLL disable step in
-			 * pipe_full_off was found to wedge the box.  Until we
-			 * have a safe DPLL1 disable primitive, arbitrary
-			 * clock changes can't work — same-clock size changes
-			 * still can't take a shortcut through this path
-			 * because the disable primitive is now a signal-cut
-			 * only.  Refuse for now, revisit when the DPLL
-			 * handshake is understood.
+			 * Full modeset — pipe/DDI teardown → DPLL1 reprogram
+			 * for the new pixel clock → pipe/DDI back up.  Uses
+			 * the Linux-ordered DPLL cycle (see
+			 * project_igen_dpll_reprogram_working_2026_07_17.md
+			 * for the wedge history and the working sequence).
+			 * Gated behind gen9_full_bringup as before.
 			 */
+			if (sc->gen != IGEN_GEN_SKL ||
+			    sc->gen9_full_bringup == 0) {
+				device_printf(sc->dev,
+				    "atomic_commit: requested %ux%u != live"
+				    " %ux%u; set gen9_full_bringup=1 to"
+				    " enable modeset\n",
+				    cs->mode.hdisplay, cs->mode.vdisplay,
+				    live.hdisplay, live.vdisplay);
+				error = ENOTSUP;
+				goto out;
+			}
+
 			device_printf(sc->dev,
-			    "atomic_commit: requested %ux%u != live %ux%u;"
-			    " full modeset requires safe DPLL1 disable"
-			    " (see feedback_igen_no_force_submit_pipe_active"
-			    ".md for open wedge)\n",
+			    "atomic_commit: modeset %ux%u @%d kHz ->"
+			    " %ux%u @%d kHz\n",
+			    live.hdisplay, live.vdisplay, live.clock,
 			    cs->mode.hdisplay, cs->mode.vdisplay,
-			    live.hdisplay, live.vdisplay);
-			error = ENOTSUP;
-			goto out;
+			    cs->mode.clock);
+
+			perr = igen_gen9_pipe_full_off(sc);
+			if (perr != 0) {
+				device_printf(sc->dev,
+				    "atomic_commit: pipe_full_off failed:"
+				    " %d\n", perr);
+				error = perr;
+				goto out;
+			}
+			perr = igen_gen9_dpll1_reprogram(sc,
+			    (uint32_t)cs->mode.clock);
+			if (perr != 0) {
+				device_printf(sc->dev,
+				    "atomic_commit: dpll1_reprogram failed:"
+				    " %d\n", perr);
+				error = perr;
+				goto out;
+			}
+			perr = igen_gen9_full_bringup(sc, &cs->mode);
+			if (perr != 0) {
+				device_printf(sc->dev,
+				    "atomic_commit: gen9_full_bringup failed"
+				    " after modeset: %d\n", perr);
+				error = perr;
+				goto out;
+			}
+			igen_read_pipe_mode(sc, 0, &live);
 		}
 		if (cs->mode.htotal != live.htotal ||
 		    cs->mode.vtotal != live.vtotal) {

@@ -1386,7 +1386,7 @@ igen_sysctl_gen9_pipe_full_off(SYSCTL_HANDLER_ARGS)
  * gen9_full_bringup with the target mode.  Or use gen9_modeset_test_now
  * for a self-contained round-trip.
  */
-static int
+int
 igen_gen9_dpll1_reprogram(struct igen_softc *sc, uint32_t clock_khz)
 {
 	uint32_t cfgcr1, cfgcr2, ctrl1, ctrl2, lcpll2;
