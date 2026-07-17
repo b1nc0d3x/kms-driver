@@ -1476,27 +1476,15 @@ igen_attach_edid_modes_gmbus_b(struct igen_softc *sc)
 	if (error != 0)
 		return (error);
 	/*
-	 * Base block byte 126 = extension block count.  For each declared
-	 * extension, read the next 128-byte block at offset 128*(N+1).
-	 * We cap at one extension (CEA-861 is the common one) — most HDMI
-	 * monitors report count=1, and the second block gives us SVDs +
-	 * additional DTDs the base block can't fit.
+	 * Base block byte 126 = extension block count.  Reading the
+	 * extension via GMBus at offset 128 wedged the box at boot
+	 * (2026-07-17) — the GMBus offset-128 read either hangs or
+	 * needs the E-DDC segment protocol we don't implement.
+	 * Reverted to base-block-only for now.  CEA extension parsing
+	 * (igen_publish_cea_extension) is still wired for len >= 256
+	 * so a future GMBus fix or a hand-populated 256-byte EDID
+	 * exercises it.
 	 */
-	if (edid[126] >= 1) {
-		int xerr = igen_gmbus_read_block(sc, GMBUS_PIN_DDI_B,
-		    EDID_SLAVE, 128, edid + 128, 128);
-		if (xerr == 0) {
-			len = 256;
-			DPRINTF(sc, 1,
-			    "edid/gmbus: extension block read OK"
-			    " (tag=0x%02x rev=%u)\n",
-			    edid[128], edid[129]);
-		} else {
-			device_printf(sc->dev,
-			    "edid/gmbus: extension read failed (%d)"
-			    " — using base block only\n", xerr);
-		}
-	}
 	return (igen_publish_edid(sc, edid, len));
 }
 
