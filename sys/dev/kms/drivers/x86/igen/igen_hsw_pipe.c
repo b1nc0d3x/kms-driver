@@ -1221,6 +1221,143 @@ igen_sysctl_gen9_panel_on(SYSCTL_HANDLER_ARGS)
 	return (igen_gen9_panel_on(sc, &m));
 }
 
+/* ------------------------ gen9 full pipe teardown ------------------------ */
+
+/*
+ * Full teardown of the pipe A → transcoder A → DDI B → DPLL1 chain on
+ * gen9 (SKL/KBL).  Extends igen_pipe_a_off() (plane + cursor + pipe
+ * disable) with the transcoder / DDI / DPLL disable steps needed
+ * before we can reprogram DPLL1 for a different pixel clock.
+ *
+ * BSpec-derived order (SKL vol 12 pipe-disable + PLL-disable sequences):
+ *   1. igen_pipe_a_off  — plane off (armed on vblank), cursor off,
+ *                         PIPE_CONF ENABLE clear, poll PIPE_STATE clear
+ *   2. TRANS_DDI_FUNC_CTL(A) — clear bit 31 (transcoder function disable)
+ *   3. DDI_BUF_CTL(B) — clear bit 31 (buffer enable), poll IDLE_STATUS
+ *   4. LCPLL2_CTL — clear bit 31 (DPLL1 enable), poll DPLL_STATUS bit 4
+ *      clear (DPLL1 unlock)
+ *   5. DPLL_CTRL2 — clear DDI_B SEL + OVERRIDE (return routing to
+ *      "no PLL selected"), set DDI_B OFF bit
+ *
+ * Idempotent: if pipe A is already off / DDI B is already parked /
+ * DPLL1 is already unlocked, each step no-ops with a log line and
+ * we continue to the next.
+ *
+ * NOT gated behind a per-write sysctl — this whole function is behind
+ * the gen9_pipe_full_off_now trigger sysctl (default 0).  Users have
+ * to opt in explicitly.
+ */
+#define	LCPLL2_CTL_REG			0x00046014
+#define	LCPLL2_CTL_ENABLE		(1u << 31)
+/*
+ * DPLL_CTRL2 CLK_OFF bit for DDI B.  Per Linux i915 SKL layout:
+ *   DPLL_CTRL2_DDI_CLK_OFF(port) = 1 << (port + 15)
+ * DDI B = port 1 -> bit 16.  (Not the same as the misnamed
+ * DPLL_CTRL2_DDI_B_OFF at (1u<<4) in igen_internal.h — that value is
+ * inside the DDI B SEL field and doesn't mean "clock off".)
+ */
+#define	DPLL_CTRL2_DDI_B_CLK_OFF	(1u << 16)
+
+int
+igen_gen9_pipe_full_off(struct igen_softc *sc)
+{
+	uint32_t fctl, ddi_b, lcpll2, dpll_status, ctrl2;
+	int spin;
+	int err;
+
+	if (sc->gen != IGEN_GEN_SKL)
+		return (EOPNOTSUPP);
+
+	/* Step 1: plane + cursor + pipe disable. */
+	err = igen_pipe_a_off(sc);
+	if (err != 0) {
+		device_printf(sc->dev,
+		    "gen9_pipe_full_off: pipe_a_off failed (%d),"
+		    " aborting teardown\n", err);
+		return (err);
+	}
+
+	sx_xlock(&sc->scanout_lock);
+
+	/* Step 2: transcoder A DDI function disable. */
+	fctl = igen_r32(sc, TRANS_DDI_FUNC_CTL(0));
+	if (fctl & (1u << 31)) {
+		device_printf(sc->dev,
+		    "gen9_pipe_full_off: TRANS_DDI_FUNC_A disable"
+		    " (was 0x%08x)\n", fctl);
+		igen_w32(sc, TRANS_DDI_FUNC_CTL(0), fctl & ~(1u << 31));
+	} else {
+		device_printf(sc->dev,
+		    "gen9_pipe_full_off: TRANS_DDI_FUNC_A already disabled"
+		    " (0x%08x)\n", fctl);
+	}
+
+	/* Step 3: DDI B buffer disable + IDLE poll. */
+	ddi_b = igen_r32(sc, DDI_BUF_CTL(1));
+	if (ddi_b & (1u << 31)) {
+		igen_w32(sc, DDI_BUF_CTL(1), ddi_b & ~(1u << 31));
+		for (spin = 0; spin < 100; spin++) {
+			if (igen_r32(sc, DDI_BUF_CTL(1)) & (1u << 7))
+				break;
+			DELAY(100);
+		}
+		device_printf(sc->dev,
+		    "gen9_pipe_full_off: DDI_BUF_B disable  spin=%d/100"
+		    "  IDLE=%d  DDI_BUF_B=0x%08x\n",
+		    spin, !!(igen_r32(sc, DDI_BUF_CTL(1)) & (1u << 7)),
+		    igen_r32(sc, DDI_BUF_CTL(1)));
+	} else {
+		device_printf(sc->dev,
+		    "gen9_pipe_full_off: DDI_BUF_B already parked"
+		    " (0x%08x)\n", ddi_b);
+	}
+
+	/* Step 4: DPLL1 disable via LCPLL2_CTL + LOCK-clear poll. */
+	lcpll2 = igen_r32(sc, LCPLL2_CTL_REG);
+	dpll_status = igen_r32(sc, DPLL_STATUS);
+	if (lcpll2 & LCPLL2_CTL_ENABLE) {
+		igen_w32(sc, LCPLL2_CTL_REG, lcpll2 & ~LCPLL2_CTL_ENABLE);
+		for (spin = 0; spin < 100; spin++) {
+			if ((igen_r32(sc, DPLL_STATUS) & DPLL1_LOCK_BIT) == 0)
+				break;
+			DELAY(100);
+		}
+		device_printf(sc->dev,
+		    "gen9_pipe_full_off: DPLL1 disable  spin=%d/100"
+		    "  DPLL_STATUS=0x%08x\n",
+		    spin, igen_r32(sc, DPLL_STATUS));
+	} else {
+		device_printf(sc->dev,
+		    "gen9_pipe_full_off: DPLL1 already disabled"
+		    "  LCPLL2_CTL=0x%08x  DPLL_STATUS=0x%08x\n",
+		    lcpll2, dpll_status);
+	}
+
+	/* Step 5: DPLL_CTRL2 — clear DDI B routing, set OFF bit. */
+	ctrl2 = igen_r32(sc, DPLL_CTRL2);
+	ctrl2 &= ~DPLL_CTRL2_DDI_B_MASK;
+	ctrl2 |= DPLL_CTRL2_DDI_B_CLK_OFF;
+	igen_w32(sc, DPLL_CTRL2, ctrl2);
+	device_printf(sc->dev,
+	    "gen9_pipe_full_off: DPLL_CTRL2 = 0x%08x  (DDI_B unrouted)\n",
+	    igen_r32(sc, DPLL_CTRL2));
+
+	sx_xunlock(&sc->scanout_lock);
+	return (0);
+}
+
+static int
+igen_sysctl_gen9_pipe_full_off(SYSCTL_HANDLER_ARGS)
+{
+	struct igen_softc *sc = arg1;
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+
+	if (error || req->newptr == NULL || trigger == 0)
+		return (error);
+	return (igen_gen9_pipe_full_off(sc));
+}
+
 /* --------------------------- sysctl registration ------------------------- */
 
 void
@@ -1260,6 +1397,16 @@ igen_hsw_pipe_register_sysctls(struct igen_softc *sc)
 		    "write 1 to force full DPLL+DDI+pipe cold bring-up"
 		    " from cached EDID (uses hardcoded HDMI-on-DDI-B"
 		    " baseline)");
+		SYSCTL_ADD_PROC(ctx, children, OID_AUTO,
+		    "gen9_pipe_full_off_now",
+		    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE |
+		    CTLFLAG_NEEDGIANT,
+		    sc, 0, igen_sysctl_gen9_pipe_full_off, "I",
+		    "write 1 to tear down the entire pipe A output chain:"
+		    " primary plane + cursor + PIPE_CONF + TRANS_DDI_FUNC"
+		    " + DDI_BUF_B + DPLL1 (LCPLL2_CTL) + DPLL_CTRL2 DDI-B"
+		    " routing.  Use before gen9_full_bringup_now to force"
+		    " a DPLL reprogram on a different pixel clock.");
 	}
 
 	if (sc->gen != IGEN_GEN_HSW)

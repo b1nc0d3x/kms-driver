@@ -411,6 +411,7 @@ int	igen_gen9_panel_on(struct igen_softc *sc,
 	    const struct drm_display_mode *m);
 int	igen_gen9_full_bringup(struct igen_softc *sc,
 	    const struct drm_display_mode *m);
+int	igen_gen9_pipe_full_off(struct igen_softc *sc);
 int	igen_pipe_a_off(struct igen_softc *sc);
 void	igen_edid_to_mode(const uint8_t *dtd, struct drm_display_mode *m);
 void	igen_hsw_pipe_register_sysctls(struct igen_softc *sc);
