@@ -571,6 +571,34 @@ igen_wrpll_encode_cfgcr2(uint8_t p0, uint8_t p1, uint8_t p2,
 	return (true);
 }
 
+/*
+ * Public: solve + encode DPLL CFGCR1/CFGCR2 for an arbitrary HDMI pixel
+ * clock in kHz.  Same math as the wrpll_calc / wrpll_program sysctls
+ * but wrapped for the modeset path — callers get the two register values
+ * and don't need to touch the internal (p0, p1, p2, dco_int, dco_frac,
+ * vco) tuple.  DPLL1/DPLL2/DPLL3 all use the same CFGCR encoding, so
+ * this helper works for any of them.
+ *
+ * Returns false when the solver has no VCO solution for the target (e.g.
+ * clock outside the valid HDMI range).
+ */
+bool
+igen_dpll_compute_cfgcr(uint32_t pixel_khz, uint32_t *out_cfgcr1,
+    uint32_t *out_cfgcr2)
+{
+	uint8_t p0, p1, p2;
+	uint16_t dco_int, dco_frac;
+	uint64_t vco;
+
+	if (!igen_wrpll_solve(pixel_khz, &p0, &p1, &p2,
+	    &dco_int, &dco_frac, &vco))
+		return (false);
+	*out_cfgcr1 = igen_wrpll_encode_cfgcr1(dco_int, dco_frac);
+	if (!igen_wrpll_encode_cfgcr2(p0, p1, p2, vco, out_cfgcr2))
+		return (false);
+	return (true);
+}
+
 static void
 igen_wrpll_decode_cfgcr(uint32_t cfgcr1, uint32_t cfgcr2,
     device_t dev)

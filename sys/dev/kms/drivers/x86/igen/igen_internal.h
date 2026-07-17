@@ -415,4 +415,14 @@ int	igen_pipe_a_off(struct igen_softc *sc);
 void	igen_edid_to_mode(const uint8_t *dtd, struct drm_display_mode *m);
 void	igen_hsw_pipe_register_sysctls(struct igen_softc *sc);
 
+/*
+ * igen_dpll.c — DPLL/CFGCR encoding.
+ *
+ * igen_dpll_compute_cfgcr solves the SKL+ WRPLL-style DPLL for an HDMI
+ * pixel clock and returns the two CFGCR register values ready for
+ * DPLL{1,2,3}_CFGCR{1,2}.  Returns false when no VCO solution exists.
+ */
+bool	igen_dpll_compute_cfgcr(uint32_t pixel_khz, uint32_t *out_cfgcr1,
+	    uint32_t *out_cfgcr2);
+
 #endif /* _IGEN_INTERNAL_H_ */

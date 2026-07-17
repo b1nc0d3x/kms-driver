@@ -1052,12 +1052,28 @@ igen_gen9_full_bringup(struct igen_softc *sc,
 	} else {
 		/*
 		 * Cold path: DPLL1 needs programming.  RMW so DPLL0 (CDCLK
-		 * source) is preserved bit-for-bit.
+		 * source) is preserved bit-for-bit.  CFGCR values come from
+		 * the SKL WRPLL solver (see igen_dpll_compute_cfgcr) so we
+		 * can accept arbitrary HDMI pixel clocks, not just 148.5 MHz.
+		 * For the firmware-programmed 1080p60 boot the solver returns
+		 * the same 0x80400173 / 0x000003a5 pair that used to be
+		 * hardcoded here — verified live 2026-07-17.
 		 */
+		uint32_t cfgcr1, cfgcr2;
+
+		if (!igen_dpll_compute_cfgcr((uint32_t)m->clock,
+		    &cfgcr1, &cfgcr2)) {
+			device_printf(sc->dev,
+			    "gen9_full_bringup: no DPLL solution for"
+			    " %d kHz — aborting\n", m->clock);
+			return (EINVAL);
+		}
 		device_printf(sc->dev,
-		    "gen9_full_bringup: DPLL1 unlocked — programming\n");
-		igen_w32(sc, DPLL1_CFGCR1, 0x80400173);
-		igen_w32(sc, DPLL1_CFGCR2, 0x000003a5);
+		    "gen9_full_bringup: DPLL1 unlocked — programming"
+		    " %d kHz  CFGCR1=0x%08x  CFGCR2=0x%08x\n",
+		    m->clock, cfgcr1, cfgcr2);
+		igen_w32(sc, DPLL1_CFGCR1, cfgcr1);
+		igen_w32(sc, DPLL1_CFGCR2, cfgcr2);
 
 		ctrl1 &= ~DPLL_CTRL1_DPLL1_MASK;
 		ctrl1 |= DPLL_CTRL1_DPLL1_VAL;
