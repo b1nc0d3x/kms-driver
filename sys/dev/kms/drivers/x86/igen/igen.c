@@ -1053,6 +1053,164 @@ igen_edid_to_mode(const uint8_t *d, struct drm_display_mode *m)
 }
 
 /*
+ * Table of well-known modes with exact timings.  Established Timings +
+ * Standard Timings only carry (resolution, refresh) — no exact H/V
+ * totals, sync widths, or pixel clock — so we can't compute a mode
+ * from them directly.  Instead we match to this table and copy the
+ * exact fields.  Values sourced from VESA DMT / CEA-861 spec.
+ * Adding a mode here immediately makes it selectable if the monitor
+ * advertises it via ET1 or ST.
+ */
+struct igen_stock_mode {
+	uint16_t	hd, vd;
+	uint16_t	refresh;
+	uint32_t	clock_khz;
+	uint16_t	hs_start, hs_end, htotal;
+	uint16_t	vs_start, vs_end, vtotal;
+	uint32_t	flags;
+};
+static const struct igen_stock_mode igen_stock_modes[] = {
+	/* VESA DMT — hpol/vpol per DMT spec.  0x1=nvsync/nhsync, 0x5=nhsync/pvsync,
+	 * 0x9=phsync/nvsync, 0xa=phsync/pvsync (see KMS_MODE_FLAG_[NP][HV]SYNC bits). */
+	{  640,  480, 60,  25175,  656,  752,  800, 490,  492,  525, 0x5 },
+	{  640,  480, 72,  31500,  664,  704,  832, 489,  492,  520, 0x5 },
+	{  640,  480, 75,  31500,  656,  720,  840, 481,  484,  500, 0x5 },
+	{  800,  600, 56,  36000,  824,  896, 1024, 601,  603,  625, 0xa },
+	{  800,  600, 60,  40000,  840,  968, 1056, 601,  605,  628, 0xa },
+	{  800,  600, 72,  50000,  856,  976, 1040, 637,  643,  666, 0xa },
+	{  800,  600, 75,  49500,  816,  896, 1056, 601,  604,  625, 0xa },
+	{ 1024,  768, 60,  65000, 1048, 1184, 1344, 771,  777,  806, 0x5 },
+	{ 1152,  864, 75, 108000, 1216, 1344, 1600, 865,  868,  900, 0xa },
+	{ 1152,  864, 60,  81624, 1216, 1336, 1520, 865,  869,  895, 0x6 }, /* CVT-RB */
+	{ 1280,  720, 60,  74250, 1390, 1430, 1650, 725,  730,  750, 0xa }, /* CEA VIC 4 */
+	{ 1280,  800, 60,  83500, 1352, 1480, 1680, 803,  809,  831, 0x5 },
+	{ 1280, 1024, 60, 108000, 1328, 1440, 1688,1025, 1028, 1066, 0xa },
+	{ 1440,  900, 60, 106500, 1520, 1672, 1904, 903,  909,  934, 0x5 },
+	{ 1600,  900, 60, 108000, 1624, 1704, 1800, 901,  904,  1000, 0xa }, /* CVT-RB */
+	{ 1680, 1050, 60, 146250, 1784, 1960, 2240,1053, 1059, 1089, 0x5 },
+	{ 1920, 1080, 60, 148500, 2008, 2052, 2200,1084, 1089, 1125, 0xa }, /* CEA VIC 16 */
+	{ 1920, 1200, 60, 154000, 1968, 2000, 2080,1203, 1209, 1235, 0x5 }, /* CVT-RB */
+	{ 2560, 1440, 60, 241500, 2608, 2640, 2720,1443, 1448, 1481, 0x5 }, /* CVT-RB */
+	{ 3840, 2160, 60, 594000, 4016, 4104, 4400,2168, 2178, 2250, 0xa }, /* CEA VIC 97 */
+	{ 3840, 2160, 30, 297000, 4016, 4104, 4400,2168, 2178, 2250, 0xa }, /* CEA VIC 95 */
+};
+
+static const struct igen_stock_mode *
+igen_stock_lookup(uint16_t hd, uint16_t vd, uint16_t refresh)
+{
+	for (size_t i = 0; i < nitems(igen_stock_modes); i++) {
+		if (igen_stock_modes[i].hd == hd &&
+		    igen_stock_modes[i].vd == vd &&
+		    igen_stock_modes[i].refresh == refresh)
+			return (&igen_stock_modes[i]);
+	}
+	return (NULL);
+}
+
+static void
+igen_stock_to_mode(const struct igen_stock_mode *sm, struct drm_display_mode *m)
+{
+	m->clock       = sm->clock_khz;
+	m->hdisplay    = sm->hd;
+	m->hsync_start = sm->hs_start;
+	m->hsync_end   = sm->hs_end;
+	m->htotal      = sm->htotal;
+	m->vdisplay    = sm->vd;
+	m->vsync_start = sm->vs_start;
+	m->vsync_end   = sm->vs_end;
+	m->vtotal      = sm->vtotal;
+	m->flags       = sm->flags;
+	m->type        = KMS_MODE_TYPE_DRIVER;
+	m->vrefresh    = kms_mode_vrefresh(m);
+	kms_mode_set_name(m);
+}
+
+/*
+ * Established Timings 1 (EDID byte 35) — bitmap of 8 legacy modes.
+ * Order matches VESA E-EDID.  Zero-refresh entries are non-timings
+ * (aspect ratio hints) that we skip.
+ */
+struct igen_et_bit { uint16_t hd, vd, refresh; };
+static const struct igen_et_bit igen_et1_bits[8] = {
+	{  800,  600, 60 },  /* bit 0 */
+	{  800,  600, 56 },  /* bit 1 */
+	{  640,  480, 75 },  /* bit 2 */
+	{  640,  480, 72 },  /* bit 3 */
+	{  640,  480, 67 },  /* bit 4 — Apple Mac II timing; not in stock table */
+	{  640,  480, 60 },  /* bit 5 */
+	{  720,  400, 88 },  /* bit 6 — not in stock table */
+	{  720,  400, 70 },  /* bit 7 — not in stock table */
+};
+
+static void
+igen_publish_established_timings(struct igen_softc *sc, const uint8_t *edid,
+    int *published)
+{
+	uint8_t et1 = edid[35];
+
+	for (int b = 0; b < 8; b++) {
+		if ((et1 & (1u << b)) == 0)
+			continue;
+		const struct igen_et_bit *e = &igen_et1_bits[b];
+		const struct igen_stock_mode *sm =
+		    igen_stock_lookup(e->hd, e->vd, e->refresh);
+		if (sm == NULL)
+			continue;
+		struct drm_display_mode *m = kms_mode_create();
+		if (m == NULL)
+			return;
+		igen_stock_to_mode(sm, m);
+		kms_connector_add_mode(&sc->connector, m);
+		(*published)++;
+		device_printf(sc->dev,
+		    "edid/est1: added mode %s @%u kHz  %u Hz\n",
+		    m->name, m->clock, m->vrefresh);
+	}
+}
+
+/*
+ * Standard Timings (EDID bytes 38..53, 8 * 2 bytes).  Encoding:
+ *   byte 0: horizontal resolution = (byte + 31) * 8
+ *   byte 1: bits 7:6 = aspect ratio, bits 5:0 = refresh - 60
+ *     aspect: 00=16:10 (EDID >=1.3, else 1:1), 01=4:3, 10=5:4, 11=16:9
+ * (byte 0 == 0x01 && byte 1 == 0x01) is the unused-slot sentinel.
+ */
+static void
+igen_publish_standard_timings(struct igen_softc *sc, const uint8_t *edid,
+    int *published)
+{
+	for (int i = 0; i < 8; i++) {
+		uint8_t b0 = edid[38 + i * 2];
+		uint8_t b1 = edid[39 + i * 2];
+		if (b0 == 0x01 && b1 == 0x01)
+			continue;
+		uint16_t hd = (b0 + 31) * 8;
+		uint16_t vd;
+		switch ((b1 >> 6) & 0x3) {
+		case 0: vd = (hd * 10) / 16; break;	/* 16:10 */
+		case 1: vd = (hd * 3) / 4; break;	/* 4:3   */
+		case 2: vd = (hd * 4) / 5; break;	/* 5:4   */
+		case 3: vd = (hd * 9) / 16; break;	/* 16:9  */
+		default: continue;
+		}
+		uint16_t refresh = (b1 & 0x3f) + 60;
+		const struct igen_stock_mode *sm =
+		    igen_stock_lookup(hd, vd, refresh);
+		if (sm == NULL)
+			continue;
+		struct drm_display_mode *m = kms_mode_create();
+		if (m == NULL)
+			return;
+		igen_stock_to_mode(sm, m);
+		kms_connector_add_mode(&sc->connector, m);
+		(*published)++;
+		device_printf(sc->dev,
+		    "edid/std: added mode %s @%u kHz  %u Hz\n",
+		    m->name, m->clock, m->vrefresh);
+	}
+}
+
+/*
  * Walk the populated EDID buffer's 4 DTD slots, build drm_display_mode
  * entries, and publish them on the connector.  Shared between the
  * GMBus (HDMI) and AUX (DP/eDP) EDID acquisition paths so the parse
@@ -1080,6 +1238,13 @@ igen_publish_edid(struct igen_softc *sc, const uint8_t *edid, size_t len)
 		    "edid: added mode %s @%u kHz  %u Hz  flags=0x%x\n",
 		    m->name, m->clock, m->vrefresh, m->flags);
 	}
+	/*
+	 * Established + Standard timings on the base block.  These give
+	 * the compositor real choices without needing to also parse the
+	 * CEA extension block (bytes 128+) yet.
+	 */
+	igen_publish_established_timings(sc, edid, &published);
+	igen_publish_standard_timings(sc, edid, &published);
 	(void)kms_connector_update_edid(&sc->connector, edid, len);
 	sc->connector.status = connector_status_connected;
 	/*
