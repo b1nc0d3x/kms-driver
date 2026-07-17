@@ -1247,15 +1247,14 @@ igen_publish_edid(struct igen_softc *sc, const uint8_t *edid, size_t len)
 	igen_publish_standard_timings(sc, edid, &published);
 	(void)kms_connector_update_edid(&sc->connector, edid, len);
 	/*
-	 * Emit a hotplug event on the connected transition.  This wakes up
-	 * any drm_files that were already listening (kwin, mutter, sddm-
-	 * greeter, etc.) so they re-query modes + adapt.  For userspace
-	 * that opens the fd after this point, GETCONNECTOR returns the
-	 * fresh state directly.  kms_connector_hotplug is a no-op if the
-	 * status is already what we're setting it to, so re-running
-	 * edid_read_b won't spam events.
+	 * NOTE: kms_connector_hotplug tried here 2026-07-17 and wedged the
+	 * box during boot — the mode_config.mutex + dev_lock acquisition
+	 * inside hotplug interacts badly with something in the attach-time
+	 * path.  Reverted to bare status assign.  A safer approach is to
+	 * fire the hotplug event later (from a rc.d post-attach hook, or
+	 * from a runtime sysctl) after the drm_device is fully initialized.
 	 */
-	kms_connector_hotplug(&sc->connector, connector_status_connected);
+	sc->connector.status = connector_status_connected;
 	/*
 	 * Cache the base block locally so the HSW bring-up path can
 	 * re-parse the preferred DTD when programming the transcoder
