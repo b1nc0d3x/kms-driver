@@ -1940,56 +1940,27 @@ igen_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 		 */
 		if (cs->mode.hdisplay != live.hdisplay ||
 		    cs->mode.vdisplay != live.vdisplay) {
-			int perr;
-
 			/*
-			 * Requested mode differs from live — do a full modeset.
-			 * Gated behind gen9_full_bringup (default 0): the same
-			 * opt-in the cold bring-up path uses, so hosts that
-			 * haven't validated gen9_full_bringup on their board
-			 * still get the safe ENOTSUP fallback.
+			 * Size-mismatch modeset was implemented (c46e9bc) via
+			 * gen9_pipe_full_off + gen9_full_bringup, then reverted
+			 * (2026-07-17) after the DPLL disable step in
+			 * pipe_full_off was found to wedge the box.  Until we
+			 * have a safe DPLL1 disable primitive, arbitrary
+			 * clock changes can't work — same-clock size changes
+			 * still can't take a shortcut through this path
+			 * because the disable primitive is now a signal-cut
+			 * only.  Refuse for now, revisit when the DPLL
+			 * handshake is understood.
 			 */
-			if (sc->gen != IGEN_GEN_SKL ||
-			    sc->gen9_full_bringup == 0) {
-				device_printf(sc->dev,
-				    "atomic_commit: requested %ux%u != live"
-				    " %ux%u; set gen9_full_bringup=1 to"
-				    " enable modeset (or leave 0 for safe"
-				    " no-op)\n",
-				    cs->mode.hdisplay, cs->mode.vdisplay,
-				    live.hdisplay, live.vdisplay);
-				error = ENOTSUP;
-				goto out;
-			}
-
 			device_printf(sc->dev,
-			    "atomic_commit: modeset %ux%u @%d kHz ->"
-			    " %ux%u @%d kHz\n",
-			    live.hdisplay, live.vdisplay, live.clock,
+			    "atomic_commit: requested %ux%u != live %ux%u;"
+			    " full modeset requires safe DPLL1 disable"
+			    " (see feedback_igen_no_force_submit_pipe_active"
+			    ".md for open wedge)\n",
 			    cs->mode.hdisplay, cs->mode.vdisplay,
-			    cs->mode.clock);
-
-			perr = igen_gen9_pipe_full_off(sc);
-			if (perr != 0) {
-				device_printf(sc->dev,
-				    "atomic_commit: pipe_full_off failed:"
-				    " %d\n", perr);
-				error = perr;
-				goto out;
-			}
-			perr = igen_gen9_full_bringup(sc, &cs->mode);
-			if (perr != 0) {
-				device_printf(sc->dev,
-				    "atomic_commit: gen9_full_bringup failed"
-				    " after modeset teardown: %d\n", perr);
-				error = perr;
-				goto out;
-			}
-			/*
-			 * Refresh live so the downstream htotal/vtotal warn
-			 * block observes the newly-programmed timing.
-			 */
-			igen_read_pipe_mode(sc, 0, &live);
+			    live.hdisplay, live.vdisplay);
+			error = ENOTSUP;
+			goto out;
 		}
 		if (cs->mode.htotal != live.htotal ||
 		    cs->mode.vtotal != live.vtotal) {

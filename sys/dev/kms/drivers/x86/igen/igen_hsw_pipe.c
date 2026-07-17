@@ -1312,35 +1312,34 @@ igen_gen9_pipe_full_off(struct igen_softc *sc)
 		    " (0x%08x)\n", ddi_b);
 	}
 
-	/* Step 4: DPLL1 disable via LCPLL2_CTL + LOCK-clear poll. */
-	lcpll2 = igen_r32(sc, LCPLL2_CTL_REG);
-	dpll_status = igen_r32(sc, DPLL_STATUS);
-	if (lcpll2 & LCPLL2_CTL_ENABLE) {
-		igen_w32(sc, LCPLL2_CTL_REG, lcpll2 & ~LCPLL2_CTL_ENABLE);
-		for (spin = 0; spin < 100; spin++) {
-			if ((igen_r32(sc, DPLL_STATUS) & DPLL1_LOCK_BIT) == 0)
-				break;
-			DELAY(100);
-		}
-		device_printf(sc->dev,
-		    "gen9_pipe_full_off: DPLL1 disable  spin=%d/100"
-		    "  DPLL_STATUS=0x%08x\n",
-		    spin, igen_r32(sc, DPLL_STATUS));
-	} else {
-		device_printf(sc->dev,
-		    "gen9_pipe_full_off: DPLL1 already disabled"
-		    "  LCPLL2_CTL=0x%08x  DPLL_STATUS=0x%08x\n",
-		    lcpll2, dpll_status);
-	}
-
-	/* Step 5: DPLL_CTRL2 — clear DDI B routing, set OFF bit. */
-	ctrl2 = igen_r32(sc, DPLL_CTRL2);
-	ctrl2 &= ~DPLL_CTRL2_DDI_B_MASK;
-	ctrl2 |= DPLL_CTRL2_DDI_B_CLK_OFF;
-	igen_w32(sc, DPLL_CTRL2, ctrl2);
-	device_printf(sc->dev,
-	    "gen9_pipe_full_off: DPLL_CTRL2 = 0x%08x  (DDI_B unrouted)\n",
-	    igen_r32(sc, DPLL_CTRL2));
+	/*
+	 * Steps 4 + 5 (DPLL1 disable via LCPLL2_CTL + DPLL_CTRL2 CLK_OFF)
+	 * REMOVED 2026-07-17.
+	 *
+	 * The full disable sequence wedges the box: after clearing
+	 * LCPLL2_CTL bit 31 and writing DPLL_CTRL2 with DDI B CLK_OFF,
+	 * subsequent MMIO reads on the display fabric (including
+	 * gen9_full_bringup's `pre-write state` snapshot) hang the CPU on
+	 * the memory transaction.  Verified twice on 2026-07-17 —
+	 * physical power-cycle required each time.
+	 *
+	 * Root cause is not yet understood.  Candidates: (a) DPLL1 doesn't
+	 * unlock on this board, so the DPLL_STATUS poll spins forever;
+	 * (b) unrouting DDI B without another consumer breaks a bus
+	 * arbiter; (c) power-well auto-collapse on unused clock domain.
+	 *
+	 * pipe_full_off (this function) is now "signal cut" only:
+	 * plane + cursor + PIPE_CONF + TRANS_DDI_FUNC + DDI_BUF_CTL(B).
+	 * DPLL stays running.  Consequence: gen9_full_bringup can only
+	 * re-enable at the *existing* pixel clock (its "DPLL1 already
+	 * locked — skipping DPLL config" path).  Same-clock modeset
+	 * works, different-clock does not.  atomic_commit's size-
+	 * mismatch modeset path is reverted to ENOTSUP until we have a
+	 * safe DPLL disable primitive.
+	 */
+	(void)lcpll2;
+	(void)dpll_status;
+	(void)ctrl2;
 
 	sx_xunlock(&sc->scanout_lock);
 	return (0);
@@ -1402,11 +1401,12 @@ igen_hsw_pipe_register_sysctls(struct igen_softc *sc)
 		    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE |
 		    CTLFLAG_NEEDGIANT,
 		    sc, 0, igen_sysctl_gen9_pipe_full_off, "I",
-		    "write 1 to tear down the entire pipe A output chain:"
-		    " primary plane + cursor + PIPE_CONF + TRANS_DDI_FUNC"
-		    " + DDI_BUF_B + DPLL1 (LCPLL2_CTL) + DPLL_CTRL2 DDI-B"
-		    " routing.  Use before gen9_full_bringup_now to force"
-		    " a DPLL reprogram on a different pixel clock.");
+		    "write 1 to tear down the entire pipe A output chain."
+		    " WARNING: after this fires, do NOT read display"
+		    " MMIO (PIPE_CONF, DDI_BUF, PLANE_*) until gen9_full_"
+		    "bringup_now brings the fabric back up — reads hang"
+		    " the CPU on the memory transaction and wedge the"
+		    " box (verified 2026-07-17).");
 	}
 
 	if (sc->gen != IGEN_GEN_HSW)
