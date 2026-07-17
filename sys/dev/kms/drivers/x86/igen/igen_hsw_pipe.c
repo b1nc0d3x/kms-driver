@@ -1357,6 +1357,143 @@ igen_sysctl_gen9_pipe_full_off(SYSCTL_HANDLER_ARGS)
 	return (igen_gen9_pipe_full_off(sc));
 }
 
+/* ------------------------- gen9 DPLL1 reprogram --------------------------- */
+
+/*
+ * DPLL1 disable/reprogram/re-enable cycle, ported from Linux i915
+ * (v6.something in linux/drivers/gpu/drm/i915/display/):
+ *
+ *   skl_ddi_disable_clock (intel_ddi.c) — sets DPLL_CTRL2 DDI_B_CLK_OFF
+ *   (RMW, preserves SEL bits).
+ *   skl_ddi_pll_disable (intel_dpll_mgr.c) — clears LCPLL_PLL_ENABLE.
+ *   No poll for DPLL_STATUS bit clear.  No CTRL2 SEL touch.
+ *
+ * Our earlier attempt (ecf801b) got three details wrong that combined
+ * into a wedge: (a) we cleared SEL bits, (b) we reversed the order
+ * (DPLL disable BEFORE CLK_OFF), (c) we polled DPLL_STATUS.  This
+ * rewrite matches Linux exactly.
+ *
+ * Re-enable is enable-then-lock-wait-then-restore-clock (LCPLL_PLL_
+ * ENABLE set, poll DPLL_STATUS bit for lock, clear CLK_OFF).
+ *
+ * Callers must ensure pipe/DDI/transcoder are disabled first (typically
+ * via gen9_pipe_full_off).  Reprogramming a DPLL that's still feeding
+ * an active DDI is what wedges.
+ *
+ * Sysctl-triggered only.  NOT wired into atomic_commit yet.
+ *
+ * Reprogram: pipe_full_off (caller responsibility) → this function →
+ * gen9_full_bringup with the target mode.  Or use gen9_modeset_test_now
+ * for a self-contained round-trip.
+ */
+static int
+igen_gen9_dpll1_reprogram(struct igen_softc *sc, uint32_t clock_khz)
+{
+	uint32_t cfgcr1, cfgcr2, ctrl1, ctrl2, lcpll2;
+	int spin;
+
+	if (sc->gen != IGEN_GEN_SKL)
+		return (EOPNOTSUPP);
+
+	if (!igen_dpll_compute_cfgcr(clock_khz, &cfgcr1, &cfgcr2)) {
+		device_printf(sc->dev,
+		    "gen9_dpll1_reprogram: no DPLL solution for %u kHz\n",
+		    clock_khz);
+		return (EINVAL);
+	}
+	device_printf(sc->dev,
+	    "gen9_dpll1_reprogram: target %u kHz  CFGCR1=0x%08x"
+	    "  CFGCR2=0x%08x\n", clock_khz, cfgcr1, cfgcr2);
+
+	/*
+	 * Step 1: set DPLL_CTRL2 DDI_B_CLK_OFF (RMW — preserve SEL).
+	 * This is what skl_ddi_disable_clock does.
+	 */
+	ctrl2 = igen_r32(sc, DPLL_CTRL2);
+	igen_w32(sc, DPLL_CTRL2, ctrl2 | DPLL_CTRL2_DDI_B_CLK_OFF);
+	(void)igen_r32(sc, DPLL_CTRL2);
+	device_printf(sc->dev,
+	    "gen9_dpll1_reprogram: DPLL_CTRL2 CLK_OFF set  (0x%08x -> 0x%08x)\n",
+	    ctrl2, ctrl2 | DPLL_CTRL2_DDI_B_CLK_OFF);
+
+	/*
+	 * Step 2: clear LCPLL2_CTL bit 31 (DPLL1 enable).  No poll — Linux
+	 * doesn't wait for the lock bit to clear.  This is
+	 * skl_ddi_pll_disable.
+	 */
+	lcpll2 = igen_r32(sc, LCPLL2_CTL_REG);
+	igen_w32(sc, LCPLL2_CTL_REG, lcpll2 & ~LCPLL2_CTL_ENABLE);
+	(void)igen_r32(sc, LCPLL2_CTL_REG);
+	device_printf(sc->dev,
+	    "gen9_dpll1_reprogram: LCPLL2_CTL ENABLE cleared  (0x%08x)\n",
+	    lcpll2);
+
+	/* Step 3: write new CFGCR1/CFGCR2 (DPLL is now disabled). */
+	igen_w32(sc, DPLL1_CFGCR1, cfgcr1);
+	igen_w32(sc, DPLL1_CFGCR2, cfgcr2);
+	(void)igen_r32(sc, DPLL1_CFGCR1);
+	(void)igen_r32(sc, DPLL1_CFGCR2);
+
+	/* Step 4: write DPLL_CTRL1 (RMW — preserve DPLL0 config). */
+	ctrl1 = igen_r32(sc, DPLL_CTRL1);
+	ctrl1 &= ~DPLL_CTRL1_DPLL1_MASK;
+	ctrl1 |= DPLL_CTRL1_DPLL1_VAL;
+	igen_w32(sc, DPLL_CTRL1, ctrl1);
+	(void)igen_r32(sc, DPLL_CTRL1);
+	device_printf(sc->dev,
+	    "gen9_dpll1_reprogram: DPLL_CTRL1 = 0x%08x\n", ctrl1);
+
+	/*
+	 * Step 5: set LCPLL2_CTL ENABLE bit + poll DPLL_STATUS lock.
+	 * skl_ddi_pll_enable waits 5ms for lock.  We're generous: 10ms.
+	 */
+	lcpll2 = igen_r32(sc, LCPLL2_CTL_REG);
+	igen_w32(sc, LCPLL2_CTL_REG, lcpll2 | LCPLL2_CTL_ENABLE);
+	for (spin = 0; spin < 100; spin++) {
+		if (igen_r32(sc, DPLL_STATUS) & DPLL1_LOCK_BIT)
+			break;
+		DELAY(100);
+	}
+	if ((igen_r32(sc, DPLL_STATUS) & DPLL1_LOCK_BIT) == 0) {
+		device_printf(sc->dev,
+		    "gen9_dpll1_reprogram: DPLL1 didn't lock after 10 ms"
+		    " (STATUS=0x%08x)\n", igen_r32(sc, DPLL_STATUS));
+		return (ETIMEDOUT);
+	}
+	device_printf(sc->dev,
+	    "gen9_dpll1_reprogram: DPLL1 locked after %d us\n", spin * 100);
+
+	/*
+	 * Step 6: clear DPLL_CTRL2 DDI_B_CLK_OFF (routing back to DPLL1).
+	 * SEL bits weren't touched, so they still point to DPLL1.
+	 */
+	ctrl2 = igen_r32(sc, DPLL_CTRL2);
+	igen_w32(sc, DPLL_CTRL2, ctrl2 & ~DPLL_CTRL2_DDI_B_CLK_OFF);
+	(void)igen_r32(sc, DPLL_CTRL2);
+	device_printf(sc->dev,
+	    "gen9_dpll1_reprogram: DPLL_CTRL2 CLK_OFF cleared  (0x%08x)\n",
+	    ctrl2 & ~DPLL_CTRL2_DDI_B_CLK_OFF);
+
+	return (0);
+}
+
+static int
+igen_sysctl_gen9_dpll1_reprogram(SYSCTL_HANDLER_ARGS)
+{
+	struct igen_softc *sc = arg1;
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+
+	if (error || req->newptr == NULL || trigger == 0)
+		return (error);
+	if (sc->wrpll_target_khz == 0) {
+		device_printf(sc->dev,
+		    "gen9_dpll1_reprogram: set wrpll_target_khz first\n");
+		return (EINVAL);
+	}
+	return (igen_gen9_dpll1_reprogram(sc, sc->wrpll_target_khz));
+}
+
 /* --------------------------- sysctl registration ------------------------- */
 
 void
@@ -1396,6 +1533,20 @@ igen_hsw_pipe_register_sysctls(struct igen_softc *sc)
 		    "write 1 to force full DPLL+DDI+pipe cold bring-up"
 		    " from cached EDID (uses hardcoded HDMI-on-DDI-B"
 		    " baseline)");
+		SYSCTL_ADD_PROC(ctx, children, OID_AUTO,
+		    "gen9_dpll1_reprogram_now",
+		    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE |
+		    CTLFLAG_NEEDGIANT,
+		    sc, 0, igen_sysctl_gen9_dpll1_reprogram, "I",
+		    "write 1 to disable + reprogram + re-enable DPLL1 at"
+		    " dev.igen.0.re.wrpll_target_khz.  Caller MUST first"
+		    " have run gen9_pipe_full_off_now to disable the"
+		    " pipe/DDI/transcoder feeding DPLL1 — otherwise the"
+		    " box wedges.  Follow with gen9_full_bringup_now to"
+		    " restore the pipe at the new clock.  Linux-verified"
+		    " sequence (skl_ddi_disable_clock +"
+		    " skl_ddi_pll_disable order, no DPLL_STATUS unlock"
+		    " poll, no DPLL_CTRL2 SEL clear).");
 		SYSCTL_ADD_PROC(ctx, children, OID_AUTO,
 		    "gen9_pipe_full_off_now",
 		    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE |
