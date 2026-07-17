@@ -1812,6 +1812,42 @@ igen_legacy_set_config(struct drm_mode_set *set)
 		return (0);
 	}
 
+	/*
+	 * On gen9 with gen9_full_bringup enabled, route mode-changing
+	 * SETCRTC through the modeset chain (pipe_full_off →
+	 * dpll1_reprogram → full_bringup).  Otherwise legacy SETCRTC
+	 * only swapped the plane fb, leaving pipe/DPLL at the old mode —
+	 * so tools that only speak legacy DRM (like our modeset_test)
+	 * could never actually change resolution.
+	 */
+	if (sc->gen == IGEN_GEN_SKL && sc->gen9_full_bringup != 0) {
+		struct drm_display_mode live;
+		igen_read_pipe_mode(sc, 0, &live);
+		if (set->mode->hdisplay != live.hdisplay ||
+		    set->mode->vdisplay != live.vdisplay) {
+			int perr;
+
+			device_printf(sc->dev,
+			    "legacy_set_config: modeset %ux%u -> %ux%u"
+			    " @%d kHz\n",
+			    live.hdisplay, live.vdisplay,
+			    set->mode->hdisplay, set->mode->vdisplay,
+			    set->mode->clock);
+			perr = igen_gen9_pipe_full_off(sc);
+			if (perr == 0)
+				perr = igen_gen9_dpll1_reprogram(sc,
+				    (uint32_t)set->mode->clock);
+			if (perr == 0)
+				perr = igen_gen9_full_bringup(sc, set->mode);
+			if (perr != 0) {
+				device_printf(sc->dev,
+				    "legacy_set_config: modeset failed"
+				    " (%d)\n", perr);
+				return (perr);
+			}
+		}
+	}
+
 	crtc->mode = *set->mode;
 	crtc->mode_valid = 1;
 	crtc->enabled = true;
