@@ -1246,7 +1246,16 @@ igen_publish_edid(struct igen_softc *sc, const uint8_t *edid, size_t len)
 	igen_publish_established_timings(sc, edid, &published);
 	igen_publish_standard_timings(sc, edid, &published);
 	(void)kms_connector_update_edid(&sc->connector, edid, len);
-	sc->connector.status = connector_status_connected;
+	/*
+	 * Emit a hotplug event on the connected transition.  This wakes up
+	 * any drm_files that were already listening (kwin, mutter, sddm-
+	 * greeter, etc.) so they re-query modes + adapt.  For userspace
+	 * that opens the fd after this point, GETCONNECTOR returns the
+	 * fresh state directly.  kms_connector_hotplug is a no-op if the
+	 * status is already what we're setting it to, so re-running
+	 * edid_read_b won't spam events.
+	 */
+	kms_connector_hotplug(&sc->connector, connector_status_connected);
 	/*
 	 * Cache the base block locally so the HSW bring-up path can
 	 * re-parse the preferred DTD when programming the transcoder
@@ -2217,6 +2226,7 @@ igen_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 			 */
 			uint32_t new_surf = igen_gtt_bind_user_fb(sc,
 			    ps->fb);
+			uint32_t new_stride = ps->fb->pitches[0] / 64;
 			if (new_surf == 0) {
 				device_printf(sc->dev,
 				    "atomic_commit: FB_ID %u has no GEM"
@@ -2227,7 +2237,22 @@ igen_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 				sc->scanout_prev_surf =
 				    igen_r32(sc, PLANE_SURF(0));
 			igen_wait_vblank(sc, 0);
+			/*
+			 * Update STRIDE + SURF together.  Modeset changes the
+			 * fb size + pitch; setting SURF alone left the OLD
+			 * stride latched (from gen9_full_bringup's boot-fb),
+			 * so the scanout read the new fb with the wrong
+			 * pitch and produced garbled output ("rendering goes
+			 * haywire" post-modeset — user report 2026-07-17).
+			 */
+			igen_w32(sc, PLANE_STRIDE(0), new_stride);
 			igen_w32(sc, PLANE_SURF(0), new_surf);
+			DPRINTF(sc, 1,
+			    "atomic_commit: plane FB_ID %u -> PLANE_SURF="
+			    "0x%08x  STRIDE=%u  (%ux%u pitch=%u)\n",
+			    ps->fb->base.id, new_surf, new_stride,
+			    ps->fb->width, ps->fb->height,
+			    ps->fb->pitches[0]);
 			sc->scanout_held = true;
 		} else if (ps->fb == NULL && sc->scanout_held) {
 			igen_wait_vblank(sc, 0);
