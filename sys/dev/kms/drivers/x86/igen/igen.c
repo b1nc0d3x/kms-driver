@@ -1940,13 +1940,56 @@ igen_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 		 */
 		if (cs->mode.hdisplay != live.hdisplay ||
 		    cs->mode.vdisplay != live.vdisplay) {
+			int perr;
+
+			/*
+			 * Requested mode differs from live — do a full modeset.
+			 * Gated behind gen9_full_bringup (default 0): the same
+			 * opt-in the cold bring-up path uses, so hosts that
+			 * haven't validated gen9_full_bringup on their board
+			 * still get the safe ENOTSUP fallback.
+			 */
+			if (sc->gen != IGEN_GEN_SKL ||
+			    sc->gen9_full_bringup == 0) {
+				device_printf(sc->dev,
+				    "atomic_commit: requested %ux%u != live"
+				    " %ux%u; set gen9_full_bringup=1 to"
+				    " enable modeset (or leave 0 for safe"
+				    " no-op)\n",
+				    cs->mode.hdisplay, cs->mode.vdisplay,
+				    live.hdisplay, live.vdisplay);
+				error = ENOTSUP;
+				goto out;
+			}
+
 			device_printf(sc->dev,
-			    "atomic_commit: requested %ux%u != live %ux%u;"
-			    " full modeset not yet implemented\n",
+			    "atomic_commit: modeset %ux%u @%d kHz ->"
+			    " %ux%u @%d kHz\n",
+			    live.hdisplay, live.vdisplay, live.clock,
 			    cs->mode.hdisplay, cs->mode.vdisplay,
-			    live.hdisplay, live.vdisplay);
-			error = ENOTSUP;
-			goto out;
+			    cs->mode.clock);
+
+			perr = igen_gen9_pipe_full_off(sc);
+			if (perr != 0) {
+				device_printf(sc->dev,
+				    "atomic_commit: pipe_full_off failed:"
+				    " %d\n", perr);
+				error = perr;
+				goto out;
+			}
+			perr = igen_gen9_full_bringup(sc, &cs->mode);
+			if (perr != 0) {
+				device_printf(sc->dev,
+				    "atomic_commit: gen9_full_bringup failed"
+				    " after modeset teardown: %d\n", perr);
+				error = perr;
+				goto out;
+			}
+			/*
+			 * Refresh live so the downstream htotal/vtotal warn
+			 * block observes the newly-programmed timing.
+			 */
+			igen_read_pipe_mode(sc, 0, &live);
 		}
 		if (cs->mode.htotal != live.htotal ||
 		    cs->mode.vtotal != live.vtotal) {
