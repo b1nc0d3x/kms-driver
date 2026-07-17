@@ -2047,9 +2047,33 @@ igen_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 		if (cs == NULL || !cs->mode_changed)
 			continue;
 		if (!cs->active) {
-			/* Pipe-off: also TODO, but logging is harmless. */
-			DPRINTF(sc, 1,
-			    "atomic_commit: pipe %u off-request (no-op)\n", i);
+			/*
+			 * Pipe-off request.  On gen9 pipe 0, walk the tear-
+			 * down chain (plane + cursor + PIPE_CONF + TRANS_DDI_
+			 * FUNC + DDI_BUF_CTL disable) via igen_gen9_pipe_full_
+			 * off.  Leaves DPLL1 running — that's fine, matches
+			 * Linux i915 which only tears DPLL down on final
+			 * shutdown / suspend.
+			 *
+			 * On other pipes / gens we no-op with a log line;
+			 * gen9 modeset support for pipe B/C hasn't landed yet.
+			 */
+			if (sc->gen == IGEN_GEN_SKL && i == 0) {
+				int perr = igen_gen9_pipe_full_off(sc);
+				if (perr != 0) {
+					device_printf(sc->dev,
+					    "atomic_commit: pipe %u off"
+					    " failed: %d\n", i, perr);
+					error = perr;
+					goto out;
+				}
+				device_printf(sc->dev,
+				    "atomic_commit: pipe %u off\n", i);
+			} else {
+				DPRINTF(sc, 1,
+				    "atomic_commit: pipe %u off-request"
+				    " (no-op on gen %d)\n", i, sc->gen);
+			}
 			continue;
 		}
 
