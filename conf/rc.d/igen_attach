@@ -39,9 +39,19 @@ stop_cmd=":"
 
 igen_attach_start()
 {
+    # Cold-boot PCI settle: without this, igen_attach wedges roughly
+    # 1 boot in 6 (verified 2026-07-17).  vgapci0 hasn't fully
+    # quiesced when we detach it, and the racing kldload igen hits
+    # it mid-transition.  A 1-second sleep is negligible on boot
+    # time (~50 s baseline) but reliably crosses the settle window.
+    sleep 1
     devctl detach vgapci0
     kldload /boot/modules/kms.ko
     kldload /boot/modules/igen.ko
+    # Second settle before rescan — same rationale, driver attach
+    # needs to complete its BAR mapping before we tell devd to probe
+    # again.
+    sleep 1
     devctl rescan pci0
     sysctl dev.igen.0.re.gen9_full_bringup_now=1
     mkdir -p /var/run/xdg/admin
