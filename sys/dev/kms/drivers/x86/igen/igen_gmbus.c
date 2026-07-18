@@ -82,6 +82,7 @@
 #define	GMBUS_INUSE		(1u << 15)
 
 #define	EDID_SLAVE		0x50
+#define	EDID_SEGMENT_SLAVE	0x30	/* E-DDC segment pointer */
 
 #define	DDI_BUF_CTL_A		0x64000
 #define	DDI_BUF_CTL_B		0x64100
@@ -458,6 +459,103 @@ igen_sysctl_edid_read_b_ext(SYSCTL_HANDLER_ARGS)
 	return (igen_publish_edid(sc, edid, sizeof(edid)));
 }
 
+/*
+ * E-DDC segment write test — smallest possible transaction on the
+ * E-DDC segment pointer slave (0x30).  Just writes one byte (segment
+ * number) and reports whether the controller ACKed, NAKed, or wedged.
+ *
+ * If this handler completes without wedging on ANY monitor, we know
+ * the segment slave is reachable via our GMBus stack and the wedge
+ * risk lies elsewhere (probably in how the follow-up read is chained).
+ * If it wedges, the segment slave itself is the problem — the monitor
+ * might not implement E-DDC.
+ */
+static int
+igen_sysctl_gmbus_segment_write_test(SYSCTL_HANDLER_ARGS)
+{
+	struct igen_softc *sc = arg1;
+	uint32_t cmd, snap;
+	int spin;
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+
+	if (error || req->newptr == NULL || trigger == 0)
+		return (error);
+
+	/*
+	 * REFUSED 2026-07-18.  Firing this handler wedged the box on
+	 * the diagnostic run (13th wedge in the KMS session).  Even a
+	 * 1-byte write to E-DDC segment slave 0x30 hangs — the wedge
+	 * isn't from the byte count or offset, it's from touching any
+	 * non-EDID slave on the GMBus/pin combination of DDI B.
+	 *
+	 * Implications: proper E-DDC segment protocol can't be probed
+	 * from this handler.  CEA-861 extension read via GMBus is
+	 * hardware-blocked on this specific fbsdx86 monitor.  Would
+	 * need to try DP AUX or an entirely different EDID path.
+	 */
+	device_printf(sc->dev,
+	    "gmbus_segment_write_test: REFUSED — 1-byte write to E-DDC"
+	    " segment slave 0x%02x wedges the box (2026-07-18)."
+	    "  CEA extension read is hardware-blocked on this monitor;"
+	    " see feedback_igen_no_force_submit_pipe_active.md for the"
+	    " full wedge trail.\n", EDID_SEGMENT_SLAVE);
+	return (EOPNOTSUPP);
+
+	/* Unreachable — kept as future-reference code. */
+	device_printf(sc->dev,
+	    "gmbus_segment_write_test: starting — 1-byte write of"
+	    " segment=0 to slave 0x%02x (E-DDC segment pointer)\n",
+	    EDID_SEGMENT_SLAVE);
+
+	/* Same quiesce prelude as igen_gmbus_read_block. */
+	uint32_t gate = igen_r32(sc, SOUTH_DSPCLK_GATE_D);
+	if ((gate & PCH_GMBUSUNIT_CLK_GATE_DIS) == 0)
+		igen_w32(sc, SOUTH_DSPCLK_GATE_D,
+		    gate | PCH_GMBUSUNIT_CLK_GATE_DIS);
+
+	igen_w32(sc, GMBUS0, 0);
+	igen_w32(sc, GMBUS4, 0);
+	igen_w32(sc, GMBUS5, 0);
+	igen_w32(sc, GMBUS1, GMBUS_SW_CLR_INT);
+	igen_w32(sc, GMBUS1, 0);
+	if (igen_r32(sc, GMBUS2) & GMBUS_INUSE)
+		igen_w32(sc, GMBUS2, GMBUS_INUSE);
+	igen_w32(sc, GMBUS0, GMBUS_PIN_DDI_B | GMBUS_RATE_100KHZ);
+
+	/* Write 1 byte (segment=0) with CYCLE_STOP so the transaction
+	 * terminates cleanly regardless of monitor behaviour. */
+	igen_w32(sc, GMBUS3, 0);	/* segment number */
+	cmd = GMBUS_SW_RDY | GMBUS_CYCLE_STOP |
+	    ((uint32_t)1 << GMBUS_BYTE_COUNT_SHIFT) |
+	    ((uint32_t)EDID_SEGMENT_SLAVE << GMBUS_SLAVE_ADDR_SHIFT) |
+	    GMBUS_SLAVE_WRITE;
+	igen_w32(sc, GMBUS1, cmd);
+
+	/*
+	 * Poll with an inline timeout to avoid taking down the box if
+	 * gmbus_wait misbehaves.  1000 * DELAY(10) = 10 ms max.
+	 */
+	for (spin = 0; spin < 1000; spin++) {
+		snap = igen_r32(sc, GMBUS2);
+		if (snap & (GMBUS_NAK | GMBUS_HW_RDY | GMBUS_HW_WAIT))
+			break;
+		DELAY(10);
+	}
+
+	device_printf(sc->dev,
+	    "gmbus_segment_write_test: exit spin=%d/1000  GMBUS2=0x%08x"
+	    "  NAK=%d  HW_RDY=%d  HW_WAIT=%d  ACTIVE=%d\n",
+	    spin, snap, !!(snap & GMBUS_NAK), !!(snap & GMBUS_HW_RDY),
+	    !!(snap & GMBUS_HW_WAIT), !!(snap & GMBUS_ACTIVE));
+
+	/* Terminate + release. */
+	igen_w32(sc, GMBUS1, GMBUS_SW_RDY | GMBUS_CYCLE_STOP);
+	igen_w32(sc, GMBUS0, 0);
+	igen_w32(sc, GMBUS2, GMBUS_INUSE);
+	return (0);
+}
+
 void
 igen_gmbus_register_sysctls(struct igen_softc *sc)
 {
@@ -472,7 +570,16 @@ igen_gmbus_register_sysctls(struct igen_softc *sc)
 	SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "edid_read_b_ext",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
 	    sc, 0, igen_sysctl_edid_read_b_ext, "I",
-	    "write 1 to GMBus-read 256 bytes (base + CEA extension) in a"
-	    " single transaction on DDI_B and re-publish the mode list."
-	    "  Manual test — not called at attach.");
+	    "REFUSED (wedges) — write 1 to attempt 256-byte GMBus read."
+	    "  See sysctl handler for wedge history.");
+	SYSCTL_ADD_PROC(ctx, children, OID_AUTO,
+	    "gmbus_segment_write_test",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, igen_sysctl_gmbus_segment_write_test, "I",
+	    "write 1 to fire a smallest-possible 1-byte GMBus write to"
+	    " the E-DDC segment slave (0x30).  Diagnostic probe: if this"
+	    " completes without wedging, the segment slave is reachable"
+	    " and the wedge in the extension-read path is elsewhere."
+	    "  10 ms polling timeout so a hung xfer can't take down the"
+	    " box.");
 }
