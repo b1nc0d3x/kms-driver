@@ -2419,7 +2419,7 @@ igen_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 			igen_wait_vblank(sc, 0);
 			igen_w32(sc, PLANE_SURF(0), new_surf);
 			sc->scanout_held = true;
-			DPRINTF(sc, 1,
+			DPRINTF(sc, 3,
 			    "atomic_commit: plane FB_ID %u -> PLANE_SURF=0x%08x\n",
 			    ps->fb->base.id, new_surf);
 		} else if (ps->fb != NULL) {
@@ -2455,7 +2455,7 @@ igen_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 			 */
 			igen_w32(sc, PLANE_STRIDE(0), new_stride);
 			igen_w32(sc, PLANE_SURF(0), new_surf);
-			DPRINTF(sc, 1,
+			DPRINTF(sc, 3,
 			    "atomic_commit: plane FB_ID %u -> PLANE_SURF="
 			    "0x%08x  STRIDE=%u  (%ux%u pitch=%u)\n",
 			    ps->fb->base.id, new_surf, new_stride,
