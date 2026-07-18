@@ -404,6 +404,26 @@ igen_sysctl_edid_read_b_ext(SYSCTL_HANDLER_ARGS)
 	if (error || req->newptr == NULL || trigger == 0)
 		return (error);
 
+	/*
+	 * REFUSED 2026-07-18.  Firing this handler wedged the box
+	 * on 2026-07-17 — the 256-byte GMBus read at offset 0
+	 * hangs (either the byte-count field can't exceed 128 on
+	 * this HW, or the monitor NAKs and our controller doesn't
+	 * recover from the mid-transaction NAK).  Neutralised until
+	 * proper E-DDC segment protocol lands in
+	 * igen_gmbus_read_block (write segment register 0x30 for
+	 * offsets >= 128).  Sysctl still registered so the
+	 * refuse-message documents the state.
+	 */
+	device_printf(sc->dev,
+	    "edid_read_b_ext: REFUSED — 256-byte GMBus read wedges"
+	    " this HW (2026-07-17).  E-DDC segment protocol needed;"
+	    " see project_igen_dpll_reprogram_working_2026_07_17.md"
+	    " for the wedge trail.\n");
+	return (EOPNOTSUPP);
+
+	/* Unreachable — kept for future re-enable once the segment
+	 * protocol lands. */
 	memset(edid, 0, sizeof(edid));
 	error = igen_gmbus_read_block(sc, GMBUS_PIN_DDI_B, EDID_SLAVE,
 	    0, edid, sizeof(edid));
