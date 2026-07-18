@@ -38,8 +38,46 @@ static void
 usage(void)
 {
 	fprintf(stderr,
-	    "usage: modeset_test [-d /dev/dri/card0] [-l | -m <index>]\n");
+	    "usage: modeset_test [-d /dev/dri/card0] "
+	    "[-l | -m <index> | -w W -h H -c CLOCK_kHz]\n"
+	    "  -l           list connector modes\n"
+	    "  -m <index>   set mode at connector-list index\n"
+	    "  -w W -h H -c CLOCK  synthesize a CVT-RB-ish mode at that size\n"
+	    "                       (bypasses connector mode list — use to force\n"
+	    "                       4K etc. into the modeset chain even when\n"
+	    "                       EDID doesn't advertise them)\n");
 	exit(2);
+}
+
+/*
+ * CVT-RB (reduced blanking) v1-ish timing generator.  Not spec-perfect
+ * but close enough for the driver's DPLL solver + transcoder programming
+ * to accept.  Used with -w -h -c to force off-list modes.
+ */
+static void
+synth_cvt_rb(uint32_t hd, uint32_t vd, uint32_t clock_khz,
+    struct drm_mode_modeinfo *m)
+{
+	uint32_t hblank = 160;
+	uint32_t vblank = 26;
+	uint32_t hsync = 32;
+	uint32_t hoff = 48;
+	uint32_t vsync = 8;
+	uint32_t voff = 3;
+
+	memset(m, 0, sizeof(*m));
+	m->clock = clock_khz;
+	m->hdisplay = hd;
+	m->hsync_start = hd + hoff;
+	m->hsync_end = hd + hoff + hsync;
+	m->htotal = hd + hblank;
+	m->vdisplay = vd;
+	m->vsync_start = vd + voff;
+	m->vsync_end = vd + voff + vsync;
+	m->vtotal = vd + vblank;
+	m->flags = 0xa;	/* +hsync +vsync — CVT-RB uses positive sync */
+	m->vrefresh = (clock_khz * 1000ULL) / (m->htotal * m->vtotal);
+	snprintf(m->name, sizeof(m->name), "%ux%u", hd, vd);
 }
 
 int
@@ -47,7 +85,8 @@ main(int argc, char **argv)
 {
 	const char *devnode = "/dev/dri/card0";
 	int list = 0;
-	int mode_index = 0;
+	int mode_index = -1;
+	int custom_w = 0, custom_h = 0, custom_c = 0;
 	int ch, fd;
 	struct drm_mode_card_res res;
 	uint32_t crtc_ids[8], enc_ids[16], conn_ids[16], fb_ids[16];
@@ -60,14 +99,19 @@ main(int argc, char **argv)
 	uint32_t conn_array[1];
 	uint32_t chosen_conn, chosen_crtc;
 
-	while ((ch = getopt(argc, argv, "d:lm:")) != -1) {
+	while ((ch = getopt(argc, argv, "d:lm:w:h:c:")) != -1) {
 		switch (ch) {
 		case 'd': devnode = optarg; break;
 		case 'l': list = 1; break;
 		case 'm': mode_index = atoi(optarg); break;
+		case 'w': custom_w = atoi(optarg); break;
+		case 'h': custom_h = atoi(optarg); break;
+		case 'c': custom_c = atoi(optarg); break;
 		default:  usage();
 		}
 	}
+	if (mode_index == -1 && custom_w == 0 && !list)
+		mode_index = 0;
 
 	fd = open(devnode, O_RDWR | O_CLOEXEC);
 	if (fd < 0)
@@ -125,18 +169,28 @@ main(int argc, char **argv)
 		return (0);
 	}
 
-	if ((uint32_t)mode_index >= conn.count_modes)
-		errx(1, "mode index %d out of range (0..%u)",
-		    mode_index, conn.count_modes - 1);
+	struct drm_mode_modeinfo chosen_mode;
 
-	printf("setting mode [%d] %ux%u @ %u kHz\n",
-	    mode_index, modes[mode_index].hdisplay,
-	    modes[mode_index].vdisplay, modes[mode_index].clock);
+	if (custom_w != 0) {
+		if (custom_h == 0 || custom_c == 0)
+			errx(1, "-w requires -h and -c");
+		synth_cvt_rb(custom_w, custom_h, custom_c, &chosen_mode);
+		printf("setting SYNTH mode %ux%u @ %u kHz (CVT-RB-ish)\n",
+		    custom_w, custom_h, custom_c);
+	} else {
+		if ((uint32_t)mode_index >= conn.count_modes)
+			errx(1, "mode index %d out of range (0..%u)",
+			    mode_index, conn.count_modes - 1);
+		chosen_mode = modes[mode_index];
+		printf("setting mode [%d] %ux%u @ %u kHz\n",
+		    mode_index, chosen_mode.hdisplay,
+		    chosen_mode.vdisplay, chosen_mode.clock);
+	}
 
 	/* Dumb fb sized for chosen mode. */
 	memset(&cd, 0, sizeof(cd));
-	cd.width = modes[mode_index].hdisplay;
-	cd.height = modes[mode_index].vdisplay;
+	cd.width = chosen_mode.hdisplay;
+	cd.height = chosen_mode.vdisplay;
 	cd.bpp = 32;
 	if (ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &cd) != 0)
 		err(1, "CREATE_DUMB");
@@ -159,7 +213,7 @@ main(int argc, char **argv)
 	setcrtc.crtc_id = chosen_crtc;
 	setcrtc.fb_id = fbcmd.fb_id;
 	setcrtc.mode_valid = 1;
-	setcrtc.mode = modes[mode_index];
+	setcrtc.mode = chosen_mode;
 	if (ioctl(fd, DRM_IOCTL_MODE_SETCRTC, &setcrtc) != 0)
 		err(1, "SETCRTC");
 	printf("SETCRTC OK — check dmesg for the atomic_commit path\n");
