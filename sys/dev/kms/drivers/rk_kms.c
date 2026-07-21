@@ -2903,6 +2903,15 @@ rk_kms_vop_program_cursor(struct rk_kms_softc *sc, vm_paddr_t pa,
 	if (y < 0) y = 0;
 	stride_words = (w * 4u) / 4u;	/* ARGB8888 → 4B/pixel */
 
+	/*
+	 * Zero WIN2_CTRL1 + areas 1/2/3 MSTs.  WIN2 has four sub-area
+	 * scan-out slots (MST0..MST3); we only use area 0 for cursor but
+	 * VOP will happily DMA from areas 1/2/3 too if their enables (in
+	 * CTRL1 upper bits) or MST fields carry stale garbage from POR
+	 * or a prior run — which is our leading hypothesis for the
+	 * "WIN2 enable wedges WIN0" behaviour observed on the XYM panel.
+	 */
+	vop_big_write(sc, VOP_REG_WIN2_CTRL1, 0);
 	vop_big_write(sc, VOP_REG_WIN2_VIR0_1, stride_words & 0x1fff);
 	vop_big_write(sc, VOP_REG_WIN2_MST0, (uint32_t)pa);
 	vop_big_write(sc, VOP_REG_WIN2_DSP_INFO0,
@@ -3572,12 +3581,13 @@ rk_kms_attach(device_t dev)
 	    "Enable DP hotplug event dispatch (default off — "
 	    "kms_connector_hotplug's per-fd events have wedged Xorg's "
 	    "atomic probe path on boot)");
-	sc->hw_cursor_enable = 0;
+	sc->hw_cursor_enable = 1;
 	SYSCTL_ADD_INT(device_get_sysctl_ctx(dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 	    "hw_cursor", CTLFLAG_RW, &sc->hw_cursor_enable, 0,
-	    "Enable HW cursor plane (VOP WIN2, default off — DP display "
-	    "drops signal on the XYM W156F1 panel with WIN2 alpha writes)");
+	    "Enable HW cursor plane (VOP WIN2 area 0, default on — "
+	    "returns ENOTTY when off so Xorg draws a SW cursor into the "
+	    "primary fb)");
 	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 	    "usbc_bringup_now",
