@@ -477,14 +477,22 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 		 * buffers — DSB SY drains any pending userspace stores on
 		 * this CPU, then DC CVAC over the fb pages via DMAP makes
 		 * absolutely sure DRAM has the freshest content before we
-		 * ack.  Ignore the clip list — whole-fb sweep of an 8 MB
-		 * scanout is cheaper than walking 60 Hz-rate clip rects.
+		 * ack.
+		 *
+		 * Clip-rect fast path: when Xorg passes clip rects, walk
+		 * only the pages those rects touch instead of the whole
+		 * fb.  Typical damage from mouse moves or single-window
+		 * repaints is a tiny fraction of the 8 MB scanout, so we
+		 * flush far fewer cache lines at the same 60 Hz cadence.
+		 * Fall back to whole-fb sweep when no clips are supplied
+		 * (num_clips == 0) or when a clip resolves to more pages
+		 * than the fb itself (bogus input).
 		 */
 		{
 		struct drm_mode_fb_dirty_cmd *dc = (struct drm_mode_fb_dirty_cmd *)data;
 		struct drm_mode_object *obj;
 		struct drm_framebuffer *fb;
-		struct drm_gem_object *gem;
+		struct drm_gem_object *gem = NULL;
 		uint32_t i;
 
 		obj = kms_mode_object_find(file->dev, dc->fb_id,
@@ -494,8 +502,57 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 		fb = __containerof(obj, struct drm_framebuffer, base);
 #ifdef __aarch64__
 		__asm__ volatile("dsb sy" ::: "memory");
-		if (fb->gem_objs[0] != NULL) {
-			gem = fb->gem_objs[0];
+		gem = (fb->gem_objs[0] != NULL &&
+		    fb->gem_objs[0]->pages != NULL &&
+		    fb->gem_objs[0]->npages > 0) ? fb->gem_objs[0] : NULL;
+		if (gem == NULL) {
+			kms_mode_object_put(obj);
+			return (0);
+		}
+		if (dc->num_clips > 0 && dc->clips_ptr != 0 &&
+		    fb->pitches[0] > 0) {
+			/*
+			 * Copy clip list from userspace, then translate
+			 * each rect into a byte range within the fb and
+			 * flush only those pages.  Cap at 64 clips to
+			 * bound stack use and worst-case CPU per call.
+			 */
+			struct drm_clip_rect clips[64];
+			uint32_t nclips = dc->num_clips;
+			uint32_t pitch = fb->pitches[0];
+			int err;
+
+			if (nclips > nitems(clips))
+				nclips = nitems(clips);
+			err = copyin((void *)(uintptr_t)dc->clips_ptr, clips,
+			    nclips * sizeof(clips[0]));
+			if (err != 0) {
+				kms_mode_object_put(obj);
+				return (err);
+			}
+			for (i = 0; i < nclips; i++) {
+				uint32_t y1 = clips[i].y1;
+				uint32_t y2 = clips[i].y2;
+				uint32_t off_lo, off_hi, p_lo, p_hi, p;
+
+				if (y2 <= y1 || y1 >= fb->height)
+					continue;
+				if (y2 > fb->height)
+					y2 = fb->height;
+				off_lo = y1 * pitch;
+				off_hi = y2 * pitch;
+				p_lo = off_lo / PAGE_SIZE;
+				p_hi = (off_hi + PAGE_SIZE - 1) / PAGE_SIZE;
+				if (p_hi > gem->npages)
+					p_hi = gem->npages;
+				for (p = p_lo; p < p_hi; p++) {
+					vm_paddr_t ppa =
+					    VM_PAGE_TO_PHYS(gem->pages[p]);
+					void *va = (void *)PHYS_TO_DMAP(ppa);
+					cpu_dcache_wb_range(va, PAGE_SIZE);
+				}
+			}
+		} else {
 			for (i = 0; i < gem->npages; i++) {
 				vm_paddr_t ppa =
 				    VM_PAGE_TO_PHYS(gem->pages[i]);
