@@ -136,6 +136,7 @@ int	rk_cdn_dp_enable_mode(uint32_t clock, uint16_t hdisplay,
 	    uint16_t vdisplay, uint16_t vsync_start, uint16_t vsync_end,
 	    uint16_t vtotal, uint32_t flags);
 int	rk_cdn_dp_set_video_active_first(bool active);
+int	rk_cdn_dp_get_cached_edid(device_t dev, uint8_t *buf, size_t len);
 
 /*
  * fusb302 helpers — declared in <dev/iicbus/usb/fusb302_var.h>, but
@@ -784,6 +785,14 @@ struct rk_kms_softc {
 	 * comment above the gate for rationale.
 	 */
 	int				 hotplug_enable;
+
+	/*
+	 * EDID probe latch — set once the first successful
+	 * rk_cdn_dp_get_cached_edid parse pushes the blob into the
+	 * DRM connector property.  get_modes re-checks this every call
+	 * so we retry cheaply until cdn_dp reaches stage 19.
+	 */
+	bool				 edid_probed;
 	bool				 usbc_poll_armed;
 
 	/*
@@ -888,13 +897,95 @@ static const struct rk_kms_advertised_mode rk_kms_mode_table[] = {
 	  KMS_MODE_FLAG_PHSYNC | KMS_MODE_FLAG_PVSYNC, false },
 };
 
+/*
+ * EDID probe.  Pulls the 128-byte block cdn_dp cached during link
+ * training via rk_cdn_dp_get_cached_edid, validates the header, and
+ * publishes:
+ *   - physical dimensions (mm_width / mm_height) from EDID bytes
+ *     0x15 (h_size cm) and 0x16 (v_size cm) so Xorg reports correct DPI.
+ *   - the raw blob to the DRM connector's EDID property via
+ *     kms_connector_update_edid, so xrandr / xdpyinfo / desktop
+ *     display settings can identify the panel and its supported modes.
+ *
+ * We do NOT synthesize new mode table entries from EDID DTDs — the
+ * XYM W156F1 panel we validate against advertises a preferred timing
+ * that trips dp_force_mode's compat path.  Advertising the panel's
+ * exact DTD would just make Xorg pick a mode that we then override
+ * inside vop_program_timing.  Keeping the hand-tuned mode table +
+ * publishing EDID metadata is the least-surprising combination.
+ *
+ * Returns 0 on success (probe complete or already probed), non-zero
+ * on transient failure (cdn_dp not up yet — safe to retry later).
+ */
+static int
+rk_kms_probe_edid(struct rk_kms_softc *sc)
+{
+	device_t cdev;
+	devclass_t cdc;
+	uint8_t edid[512];		/* base block + up to 3 extensions */
+	size_t used;
+	int error;
+
+	if (sc->edid_probed)
+		return (0);
+	cdc = devclass_find("rk_cdn_dp");
+	if (cdc == NULL) {
+		DPRINTF(sc, "EDID: rk_cdn_dp devclass not found\n");
+		return (ENXIO);
+	}
+	cdev = devclass_get_device(cdc, 0);
+	if (cdev == NULL) {
+		DPRINTF(sc, "EDID: rk_cdn_dp device_t not found\n");
+		return (ENXIO);
+	}
+	error = rk_cdn_dp_get_cached_edid(cdev, edid, sizeof(edid));
+	if (error != 0) {
+		DPRINTF(sc, "EDID: get_cached_edid rc=%d\n", error);
+		return (error);
+	}
+	/* EDID header magic: 00 FF FF FF FF FF FF 00. */
+	if (edid[0] != 0x00 || edid[1] != 0xff || edid[2] != 0xff ||
+	    edid[3] != 0xff || edid[4] != 0xff || edid[5] != 0xff ||
+	    edid[6] != 0xff || edid[7] != 0x00) {
+		DPRINTF(sc, "EDID: bad header magic (%02x %02x ...)\n",
+		    edid[0], edid[1]);
+		return (EINVAL);
+	}
+	/* Physical dimensions (cm). */
+	if (edid[0x15] != 0 && edid[0x16] != 0) {
+		sc->connector.mm_width = (uint32_t)edid[0x15] * 10u;
+		sc->connector.mm_height = (uint32_t)edid[0x16] * 10u;
+	}
+	/*
+	 * Publish the blob so DRM_PROP_EDID readers see it.  Silently
+	 * ignore failure — the property may not exist on stub-built
+	 * connectors.  Not a hard error either way.  Publish the actual
+	 * used length (base 128 + 128 per extension block, capped at
+	 * sizeof(edid)) so xrandr sees the full descriptor set.
+	 */
+	used = 128u + 128u * (size_t)edid[126];
+	if (used > sizeof(edid))
+		used = sizeof(edid);
+	(void)kms_connector_update_edid(&sc->connector, edid, used);
+	sc->edid_probed = true;
+	DPRINTF(sc, "EDID: probed OK; mfg=%02x%02x prod=0x%02x%02x mm=%ux%u\n",
+	    edid[8], edid[9], edid[0x0b], edid[0x0a],
+	    sc->connector.mm_width, sc->connector.mm_height);
+	return (0);
+}
+
 static int
 rk_kms_get_modes(struct drm_connector *connector)
 {
+	struct rk_kms_softc *sc = __containerof(connector,
+	    struct rk_kms_softc, connector);
 	struct drm_display_mode *mode;
 	unsigned int i;
 	int added = 0;
 
+	/* Best-effort EDID probe on every re-probe pass (cheap when
+	 * already cached — early-out on edid_probed flag). */
+	(void)rk_kms_probe_edid(sc);
 	if (connector->mode_count > 0)
 		return (0);
 	for (i = 0; i < nitems(rk_kms_mode_table); i++) {
