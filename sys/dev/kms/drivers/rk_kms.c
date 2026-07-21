@@ -233,6 +233,21 @@ static void rk_kms_usbc_poll(void *arg);
 #define	VOP_DSP_CTRL1_DP_DCLK_POL	(1u << 19)
 #define	VOP_DSP_CTRL1_HDMI_PIN_POL_MASK	(0x7u << 20)
 #define	VOP_DSP_CTRL1_HDMI_DCLK_POL	(1u << 23)
+
+/*
+ * Gamma LUT (RK3399 VOP_BIG):
+ *   DSP_CTRL1[0]     dsp_lut_en           1 = enable LUT (blocks pixels)
+ *   DSP_CTRL1[7]     update_gamma_lut     1 = pending write
+ *   GAMMA_LUT_ADDR   0x2000 + n*4         1024-entry table, each 32-bit
+ *                                          packed as R:G:B[9:0] each
+ *   DBG_POST_REG1[1] lut_buffer_index     toggles on double-buffer swap
+ */
+#define	VOP_DSP_CTRL1_LUT_EN		(1u << 0)
+#define	VOP_DSP_CTRL1_UPDATE_LUT	(1u << 7)
+#define	VOP_REG_GAMMA_LUT		0x2000
+#define	VOP_REG_DBG_POST_REG1		0x036c
+#define	VOP_DBG_POST_LUT_BUF_IDX	(1u << 1)
+#define	VOP_GAMMA_LUT_ENTRIES		1024
 #define	VOP_REG_POST_SCL_CTRL		0x0180
 #define	VOP_REG_DSP_BG			0x0018
 
@@ -303,9 +318,31 @@ static void rk_kms_usbc_poll(void *arg);
 #define	VOP_REG_WIN2_MST0	0x00c0
 #define	VOP_REG_WIN2_DSP_INFO0	0x00c4
 #define	VOP_REG_WIN2_DSP_ST0	0x00c8
+#define	VOP_REG_WIN2_SRC_ALPHA_CTRL 0x00dc
+#define	VOP_REG_WIN2_DST_ALPHA_CTRL 0x00ec
 #define	VOP_WIN2_CTRL0_ENABLE	(1u << 4)
 #define	VOP_WIN2_CTRL0_GATE	(1u << 0)
 #define	VOP_WIN2_CTRL0_FMT_ARGB	(0u << 1)
+/*
+ * Per-pixel alpha blend for the cursor plane.  Values decoded from
+ * Linux drm/rockchip vop_plane_atomic_update on RK3288+ WIN2:
+ *   src_alpha_ctl:
+ *     [0]   SRC_ALPHA_EN    = 1     (use per-pixel src alpha)
+ *     [1]   SRC_COLOR_M0    = 0     (ALPHA_SRC_PRE_MUL)
+ *     [2]   SRC_ALPHA_M0    = 0     (ALPHA_STRAIGHT)
+ *     [4:3] SRC_BLEND_M0    = 1     (ALPHA_PER_PIX)
+ *     [5]   SRC_ALPHA_CAL_M0= 0     (ALPHA_NO_SATURATION)
+ *     [8:6] SRC_FACTOR_M0   = 1     (ALPHA_ONE — pass src through)
+ *   = 0x49
+ *   dst_alpha_ctl:
+ *     [8:6] DST_FACTOR_M0   = 3     (ALPHA_SRC_INVERSE — 1 - src_alpha
+ *                                    blends the underlying primary
+ *                                    fb wherever the cursor is
+ *                                    transparent)
+ *   = 0xc0
+ */
+#define	VOP_WIN2_SRC_ALPHA_STD	0x00000049u
+#define	VOP_WIN2_DST_ALPHA_STD	0x000000c0u
 #define	VOP_REG_POST_DSP_HACT	0x0170
 #define	VOP_REG_POST_DSP_VACT	0x0174
 
@@ -833,6 +870,15 @@ struct rk_kms_softc {
 	int32_t				 cursor_hot_y;
 	int32_t				 cursor_x;
 	int32_t				 cursor_y;
+
+	/*
+	 * HW cursor default OFF — enabling it caused the DP display to
+	 * drop signal on the XYM W156F1 panel (WIN2 alpha_ctl writes
+	 * appear to disturb WIN0's blend against DP framer somehow).
+	 * Set dev.rk_kms.0.hw_cursor=1 to try after the primary display
+	 * is up and stable.
+	 */
+	int				 hw_cursor_enable;
 	bool				 usbc_poll_armed;
 
 	/*
@@ -2845,6 +2891,13 @@ rk_kms_vop_program_cursor(struct rk_kms_softc *sc, vm_paddr_t pa,
 	    (((h - 1u) & 0xfff) << 16) | ((w - 1u) & 0xfff));
 	vop_big_write(sc, VOP_REG_WIN2_DSP_ST0,
 	    (((uint32_t)y & 0x1fff) << 16) | ((uint32_t)x & 0x1fff));
+	/*
+	 * Per-pixel alpha blend — without this the transparent regions
+	 * of the cursor bitmap render as opaque black instead of showing
+	 * the underlying primary fb through.
+	 */
+	vop_big_write(sc, VOP_REG_WIN2_SRC_ALPHA_CTRL, VOP_WIN2_SRC_ALPHA_STD);
+	vop_big_write(sc, VOP_REG_WIN2_DST_ALPHA_CTRL, VOP_WIN2_DST_ALPHA_STD);
 	vop_big_write(sc, VOP_REG_WIN2_CTRL0,
 	    VOP_WIN2_CTRL0_GATE | VOP_WIN2_CTRL0_FMT_ARGB |
 	    VOP_WIN2_CTRL0_ENABLE);
@@ -2863,6 +2916,8 @@ rk_kms_cursor_set(struct drm_crtc *crtc, struct drm_file *file,
 
 	if (!sc->hw_attached)
 		return (0);
+	if (sc->hw_cursor_enable == 0)
+		return (ENOTTY);	/* signal Xorg to draw SW cursor */
 	if (handle == 0 || width == 0 || height == 0) {
 		/* Disable path — release any pinned BO and blank WIN2. */
 		if (sc->cursor_bo != NULL) {
@@ -2911,6 +2966,8 @@ rk_kms_cursor_move(struct drm_crtc *crtc, int32_t x, int32_t y)
 
 	if (!sc->hw_attached)
 		return (0);
+	if (sc->hw_cursor_enable == 0)
+		return (ENOTTY);	/* signal Xorg to draw SW cursor */
 	sc->cursor_x = x;
 	sc->cursor_y = y;
 	if (sc->cursor_bo == NULL || sc->cursor_width == 0)
@@ -3497,6 +3554,12 @@ rk_kms_attach(device_t dev)
 	    "Enable DP hotplug event dispatch (default off — "
 	    "kms_connector_hotplug's per-fd events have wedged Xorg's "
 	    "atomic probe path on boot)");
+	sc->hw_cursor_enable = 0;
+	SYSCTL_ADD_INT(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "hw_cursor", CTLFLAG_RW, &sc->hw_cursor_enable, 0,
+	    "Enable HW cursor plane (VOP WIN2, default off — DP display "
+	    "drops signal on the XYM W156F1 panel with WIN2 alpha writes)");
 	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 	    "usbc_bringup_now",
