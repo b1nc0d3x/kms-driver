@@ -282,6 +282,30 @@ static void rk_kms_usbc_poll(void *arg);
 #define	VOP_WIN0_SCL_MODE_UP	1
 #define	VOP_WIN0_SCL_MODE_DOWN	2
 #define	VOP_WIN0_SCL_VSU_BIC	1
+
+/*
+ * WIN2 (area/cursor plane).  RK3288/RK3399 VOP_BIG has WIN2 as a
+ * simpler area window with four subareas; we use area 0 only for
+ * cursor blit.  Register layout mirrors rk3288_win23_data from Linux
+ * drm/rockchip/rockchip_vop_reg.c.
+ *   CTRL0[0]    = area0 gate  (1 = ungated)
+ *   CTRL0[3:1]  = format0     (0=ARGB8888)
+ *   CTRL0[4]    = area0 enable
+ *   CTRL0[12]   = rb_swap
+ *   DSP_INFO0   = (h-1)<<16 | (w-1)  (12+12 bits masked 0x0fff0fff)
+ *   DSP_ST0     = y<<16 | x          (13+13 bits masked 0x1fff1fff)
+ *   MST0        = fb pa (32-bit)
+ *   VIR0_1[12:0]= area0 stride (words)
+ */
+#define	VOP_REG_WIN2_CTRL0	0x00b0
+#define	VOP_REG_WIN2_CTRL1	0x00b4
+#define	VOP_REG_WIN2_VIR0_1	0x00b8
+#define	VOP_REG_WIN2_MST0	0x00c0
+#define	VOP_REG_WIN2_DSP_INFO0	0x00c4
+#define	VOP_REG_WIN2_DSP_ST0	0x00c8
+#define	VOP_WIN2_CTRL0_ENABLE	(1u << 4)
+#define	VOP_WIN2_CTRL0_GATE	(1u << 0)
+#define	VOP_WIN2_CTRL0_FMT_ARGB	(0u << 1)
 #define	VOP_REG_POST_DSP_HACT	0x0170
 #define	VOP_REG_POST_DSP_VACT	0x0174
 
@@ -793,6 +817,22 @@ struct rk_kms_softc {
 	 * so we retry cheaply until cdn_dp reaches stage 19.
 	 */
 	bool				 edid_probed;
+
+	/*
+	 * Hardware cursor plane state (VOP WIN2 area 0).  cursor_bo
+	 * pins the current cursor GEM object so its pages don't get
+	 * freed while VOP is scanning them; NULL when the cursor is
+	 * disabled.  cursor_hot_x / _y let cursor_move translate the
+	 * userspace hotspot-relative coordinate into a top-left screen
+	 * position for WIN2_DSP_ST0.
+	 */
+	struct drm_gem_object		*cursor_bo;
+	uint32_t			 cursor_width;
+	uint32_t			 cursor_height;
+	int32_t				 cursor_hot_x;
+	int32_t				 cursor_hot_y;
+	int32_t				 cursor_x;
+	int32_t				 cursor_y;
 	bool				 usbc_poll_armed;
 
 	/*
@@ -2777,6 +2817,112 @@ rk_kms_vblank_stop(struct rk_kms_softc *sc)
 }
 
 /*
+ * Program VOP WIN2 area 0 as a hardware cursor.  pa == 0 disables
+ * the plane; otherwise binds the (w x h) ARGB8888 bitmap at pa and
+ * positions it at (x, y) on the output.  Callers must hold enough
+ * state that cursor_bo pages stay pinned while VOP DMA is active.
+ */
+static void
+rk_kms_vop_program_cursor(struct rk_kms_softc *sc, vm_paddr_t pa,
+    uint32_t w, uint32_t h, int32_t x, int32_t y)
+{
+	uint32_t stride_words;
+
+	if (pa == 0 || w == 0 || h == 0) {
+		vop_big_write(sc, VOP_REG_WIN2_CTRL0, 0);
+		return;
+	}
+	/* Clamp negative on-screen coords to 0; WIN2 DSP_ST0 is
+	 * unsigned 13-bit fields.  Off-screen cursor is legal — we
+	 * simply won't program a negative position. */
+	if (x < 0) x = 0;
+	if (y < 0) y = 0;
+	stride_words = (w * 4u) / 4u;	/* ARGB8888 → 4B/pixel */
+
+	vop_big_write(sc, VOP_REG_WIN2_VIR0_1, stride_words & 0x1fff);
+	vop_big_write(sc, VOP_REG_WIN2_MST0, (uint32_t)pa);
+	vop_big_write(sc, VOP_REG_WIN2_DSP_INFO0,
+	    (((h - 1u) & 0xfff) << 16) | ((w - 1u) & 0xfff));
+	vop_big_write(sc, VOP_REG_WIN2_DSP_ST0,
+	    (((uint32_t)y & 0x1fff) << 16) | ((uint32_t)x & 0x1fff));
+	vop_big_write(sc, VOP_REG_WIN2_CTRL0,
+	    VOP_WIN2_CTRL0_GATE | VOP_WIN2_CTRL0_FMT_ARGB |
+	    VOP_WIN2_CTRL0_ENABLE);
+	if (sc->commit_modeset & RK_KMS_STAGE_CFG_DONE)
+		vop_big_write(sc, VOP_REG_CFG_DONE, 0x00010001);
+}
+
+static int
+rk_kms_cursor_set(struct drm_crtc *crtc, struct drm_file *file,
+    uint32_t handle, uint32_t width, uint32_t height,
+    int32_t hot_x, int32_t hot_y)
+{
+	struct rk_kms_softc *sc = crtc->dev->driver_priv;
+	struct drm_gem_object *obj;
+	vm_paddr_t pa;
+
+	if (!sc->hw_attached)
+		return (0);
+	if (handle == 0 || width == 0 || height == 0) {
+		/* Disable path — release any pinned BO and blank WIN2. */
+		if (sc->cursor_bo != NULL) {
+			kms_gem_object_put(sc->cursor_bo);
+			sc->cursor_bo = NULL;
+		}
+		sc->cursor_width = 0;
+		sc->cursor_height = 0;
+		rk_kms_vop_program_cursor(sc, 0, 0, 0, 0, 0);
+		return (0);
+	}
+	obj = kms_gem_handle_lookup(file, handle);
+	if (obj == NULL)
+		return (ENOENT);
+	if (obj->pages == NULL || obj->npages == 0 ||
+	    obj->size < (size_t)width * height * 4u) {
+		kms_gem_object_put(obj);
+		return (EINVAL);
+	}
+	pa = VM_PAGE_TO_PHYS(obj->pages[0]);
+	if (pa > UINT32_MAX) {
+		kms_gem_object_put(obj);
+		return (ERANGE);
+	}
+	/* Swap in — release the previous pin (if any) after grabbing the
+	 * new ref so a same-handle re-set doesn't briefly drop refs. */
+	if (sc->cursor_bo != NULL)
+		kms_gem_object_put(sc->cursor_bo);
+	sc->cursor_bo = obj;
+	sc->cursor_width = width;
+	sc->cursor_height = height;
+	sc->cursor_hot_x = hot_x;
+	sc->cursor_hot_y = hot_y;
+	rk_kms_vop_program_cursor(sc, pa, width, height,
+	    sc->cursor_x - hot_x, sc->cursor_y - hot_y);
+	DPRINTF(sc, "cursor_set: %ux%u pa=0x%jx hot=%d,%d\n",
+	    width, height, (uintmax_t)pa, hot_x, hot_y);
+	return (0);
+}
+
+static int
+rk_kms_cursor_move(struct drm_crtc *crtc, int32_t x, int32_t y)
+{
+	struct rk_kms_softc *sc = crtc->dev->driver_priv;
+	vm_paddr_t pa;
+
+	if (!sc->hw_attached)
+		return (0);
+	sc->cursor_x = x;
+	sc->cursor_y = y;
+	if (sc->cursor_bo == NULL || sc->cursor_width == 0)
+		return (0);
+	pa = VM_PAGE_TO_PHYS(sc->cursor_bo->pages[0]);
+	rk_kms_vop_program_cursor(sc, pa,
+	    sc->cursor_width, sc->cursor_height,
+	    x - sc->cursor_hot_x, y - sc->cursor_hot_y);
+	return (0);
+}
+
+/*
  * Substitute the native (rk_kms_mode_table[0]) mode for any non-native
  * pick.  Shared by set_config, page_flip, and atomic_commit — keeps
  * the DP link at its trained pixel clock; the WIN0 scaler in
@@ -2885,6 +3031,8 @@ rk_kms_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
 static const struct drm_crtc_funcs rk_kms_crtc_funcs = {
 	.set_config = rk_kms_set_config,
 	.page_flip = rk_kms_page_flip,
+	.cursor_set = rk_kms_cursor_set,
+	.cursor_move = rk_kms_cursor_move,
 };
 static const struct drm_plane_funcs rk_kms_plane_funcs = { 0 };
 
@@ -3430,6 +3578,10 @@ rk_kms_detach(device_t dev)
 	}
 	sc->usbc_poll_armed = false;
 	callout_drain(&sc->usbc_poll);
+	if (sc->cursor_bo != NULL) {
+		kms_gem_object_put(sc->cursor_bo);
+		sc->cursor_bo = NULL;
+	}
 	rk_kms_fb_free(sc);
 	rk_kms_vblank_stop(sc);
 	if (sc->drm_dev != NULL) {
