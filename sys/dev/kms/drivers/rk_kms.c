@@ -2648,11 +2648,14 @@ rk_kms_set_config(struct drm_mode_set *set)
 		    set->fb != NULL ? set->fb->base.id : 0,
 		    sc->commit_modeset);
 		/*
-		 * DP link was trained at 1920x1080@60 (148.5 MHz) during
-		 * cdn_dp bring-up.  Switching pixel clock without retrain
-		 * kills the stream, so the VOP DSP timing must ALWAYS be
-		 * that native mode regardless of what Xorg picks.  The WIN0
-		 * scaler in vop_program_win0 upscales the smaller fb.
+		 * The XYM W156F1 panel we validate against doesn't reliably
+		 * lock onto a non-native pixel clock via cdn_dp's fast-path
+		 * reconfig — the DP framer accepts the new MSA but the
+		 * panel silently drops the stream.  Pin the outer DSP
+		 * timing to the trained native mode (rk_kms_mode_table[0])
+		 * and let the WIN0 scaler upscale the fb.  If a future
+		 * panel handles clock changes cleanly, drop this
+		 * substitution and Xorg's mode flows through natively.
 		 */
 		if (set->mode->hdisplay != rk_kms_mode_table[0].hdisplay ||
 		    set->mode->vdisplay != rk_kms_mode_table[0].vdisplay) {
@@ -2719,11 +2722,7 @@ rk_kms_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
 		return (0);
 	if ((sc->commit_modeset & RK_KMS_STAGE_WIN0) == 0)
 		return (0);
-	/*
-	 * Same substitution rule as set_config: the DSP timing must
-	 * stay native so the DP link keeps its trained pixel clock.
-	 * WIN0 scaler in vop_program_win0 handles fb-side upscaling.
-	 */
+	/* Same native-DSP substitution as set_config. */
 	if (crtc->mode.hdisplay != n->hdisplay ||
 	    crtc->mode.vdisplay != n->vdisplay) {
 		memset(&dst_mode, 0, sizeof(dst_mode));
@@ -2741,8 +2740,9 @@ rk_kms_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
 	} else {
 		outer = &crtc->mode;
 	}
-	DPRINTF(sc, "page_flip: fb=%u dst=%ux%u\n",
-	    fb->base.id, outer->hdisplay, outer->vdisplay);
+	DPRINTF(sc, "page_flip: fb=%u src=%ux%u dst=%ux%u\n",
+	    fb->base.id, fb->width, fb->height,
+	    outer->hdisplay, outer->vdisplay);
 	rk_kms_vop_program_win0(sc, outer, fb,
 	    rk_kms_hact_start(outer),
 	    rk_kms_vact_start(outer));
