@@ -241,15 +241,46 @@ static void rk_kms_usbc_poll(void *arg);
  * documented in the RK3399 TRM §22.4.
  */
 #define	VOP_REG_WIN0_CTRL0	0x0030
+#define	VOP_REG_WIN0_CTRL1	0x0034	/* scaler mode/skip bits */
 #define	VOP_REG_WIN0_YRGB_BUFSIZE 0x0038
 #define	VOP_REG_WIN0_VIR	0x003c
 #define	VOP_REG_WIN0_YRGB_MST	0x0040
 #define	VOP_REG_WIN0_ACT_INFO	0x0048
 #define	VOP_REG_WIN0_DSP_INFO	0x004c
 #define	VOP_REG_WIN0_DSP_ST	0x0050
+#define	VOP_REG_WIN0_SCL_FACTOR_YRGB 0x0054	/* [15:0]=hor, [31:16]=ver */
+#define	VOP_REG_WIN0_SCL_FACTOR_CBR  0x0058
+#define	VOP_REG_WIN0_SCL_OFFSET	0x005c
 #define	VOP_REG_WIN0_SRC_ALPHA	0x0060
 #define	VOP_REG_WIN0_DST_ALPHA	0x0064
 #define	VOP_REG_WIN0_CTRL2	0x006c
+
+/*
+ * WIN0_CTRL0 lb_mode field: 3 bits at [7:5].
+ *   0=LB_YUV_3840X5, 1=LB_YUV_2560X8, 2=LB_RGB_3840X2,
+ *   3=LB_RGB_2560X4, 4=LB_RGB_1920X5, 5=LB_RGB_1280X8.
+ * Per Linux drm/rockchip: RGB pick by src width:
+ *   >2560 → LB_RGB_3840X2, >1920 → LB_RGB_2560X4, else LB_RGB_1920X5.
+ */
+#define	VOP_WIN0_CTRL0_LB_MODE_SHIFT	5
+#define	VOP_WIN0_LB_RGB_3840X2	2
+#define	VOP_WIN0_LB_RGB_2560X4	3
+#define	VOP_WIN0_LB_RGB_1920X5	4
+
+/*
+ * WIN0_CTRL1 scaler-mode field packing (per rk3288_win_full_scl_ext
+ * in Linux drm/rockchip/rockchip_vop_reg.c).  Only YRGB fields matter
+ * for our XR24 packed-RGB scanout — CBCR half is zeroed.
+ *   [17:16] yrgb_hor_scl_mode  (0=NONE, 1=UP, 2=DOWN)
+ *   [19:18] yrgb_ver_scl_mode  (same)
+ *   [21:20] yrgb_hsd_mode      (down: 0=BIL, 1=AVG) — unused when UP
+ *   [22]    yrgb_vsu_mode      (up:   0=BIL, 1=BIC)
+ *   [23]    yrgb_vsd_mode      (down: 0=BIL, 1=AVG) — unused when UP
+ */
+#define	VOP_WIN0_SCL_MODE_NONE	0
+#define	VOP_WIN0_SCL_MODE_UP	1
+#define	VOP_WIN0_SCL_MODE_DOWN	2
+#define	VOP_WIN0_SCL_VSU_BIC	1
 #define	VOP_REG_POST_DSP_HACT	0x0170
 #define	VOP_REG_POST_DSP_VACT	0x0174
 
@@ -799,28 +830,78 @@ static const uint32_t rk_kms_primary_formats[] = {
  * timings the stub uses.  Once Phase 9b wires the DP/HDMI side this
  * comes from an EDID parse instead.
  */
+/*
+ * Table of DMT / CTA-861 modes to advertise on the connector.  1920x1080
+ * stays index 0 (PREFERRED) so Xorg defaults to it, but exposing the
+ * standard fallbacks lets xrandr / display settings offer alternatives.
+ * dp_force_mode only rewrites the timing when Xorg picks 1920x1080; for
+ * anything smaller we send the actual selected mode's timing to VOP.
+ */
+struct rk_kms_advertised_mode {
+	uint32_t	clock;		/* kHz */
+	uint16_t	hdisplay, hsync_start, hsync_end, htotal;
+	uint16_t	vdisplay, vsync_start, vsync_end, vtotal;
+	uint32_t	flags;
+	bool		preferred;
+};
+
+static const struct rk_kms_advertised_mode rk_kms_mode_table[] = {
+	/*
+	 * Native mode MUST stay at index 0 — set_config + page_flip
+	 * substitute rk_kms_mode_table[0] as the outer DSP timing
+	 * whenever Xorg picks anything else (so the DP link keeps its
+	 * trained pixel clock).  The WIN0 hardware scaler in
+	 * vop_program_win0 upscales the fb from the picked mode's
+	 * dimensions to native.
+	 */
+	{ 148500, 1920, 2008, 2052, 2200, 1080, 1084, 1089, 1125,
+	  KMS_MODE_FLAG_PHSYNC | KMS_MODE_FLAG_PVSYNC, true },
+	/* 1600x900@60 DMT-CVT-RB */
+	{ 108000, 1600, 1624, 1704, 1800,  900,  901,  904,  1000,
+	  KMS_MODE_FLAG_PHSYNC | KMS_MODE_FLAG_NVSYNC, false },
+	/* 1366x768@60 DMT-CVT-RB */
+	{  85500, 1366, 1436, 1579, 1792,  768,  771,  774,  798,
+	  KMS_MODE_FLAG_PHSYNC | KMS_MODE_FLAG_PVSYNC, false },
+	/* 1280x720@60 CEA-VIC 4 */
+	{  74250, 1280, 1390, 1430, 1650,  720,  725,  730,  750,
+	  KMS_MODE_FLAG_PHSYNC | KMS_MODE_FLAG_PVSYNC, false },
+	/* 1024x768@60 DMT */
+	{  65000, 1024, 1048, 1184, 1344,  768,  771,  777,  806,
+	  KMS_MODE_FLAG_NHSYNC | KMS_MODE_FLAG_NVSYNC, false },
+	/* 800x600@60 DMT */
+	{  40000,  800,  840,  968, 1056,  600,  601,  605,  628,
+	  KMS_MODE_FLAG_PHSYNC | KMS_MODE_FLAG_PVSYNC, false },
+};
+
 static int
 rk_kms_get_modes(struct drm_connector *connector)
 {
 	struct drm_display_mode *mode;
+	unsigned int i;
+	int added = 0;
 
 	if (connector->mode_count > 0)
 		return (0);
-	mode = kms_mode_create();
-	mode->clock = 148500;
-	mode->hdisplay = 1920;
-	mode->hsync_start = 2008;
-	mode->hsync_end = 2052;
-	mode->htotal = 2200;
-	mode->vdisplay = 1080;
-	mode->vsync_start = 1084;
-	mode->vsync_end = 1089;
-	mode->vtotal = 1125;
-	mode->flags = KMS_MODE_FLAG_PHSYNC | KMS_MODE_FLAG_PVSYNC;
-	mode->type = KMS_MODE_TYPE_DRIVER |
-	    KMS_MODE_TYPE_PREFERRED;
-	kms_connector_add_mode(connector, mode);
-	return (1);
+	for (i = 0; i < nitems(rk_kms_mode_table); i++) {
+		const struct rk_kms_advertised_mode *m = &rk_kms_mode_table[i];
+
+		mode = kms_mode_create();
+		mode->clock = m->clock;
+		mode->hdisplay = m->hdisplay;
+		mode->hsync_start = m->hsync_start;
+		mode->hsync_end = m->hsync_end;
+		mode->htotal = m->htotal;
+		mode->vdisplay = m->vdisplay;
+		mode->vsync_start = m->vsync_start;
+		mode->vsync_end = m->vsync_end;
+		mode->vtotal = m->vtotal;
+		mode->flags = m->flags;
+		mode->type = KMS_MODE_TYPE_DRIVER |
+		    (m->preferred ? KMS_MODE_TYPE_PREFERRED : 0);
+		kms_connector_add_mode(connector, mode);
+		added++;
+	}
+	return (added);
 }
 
 /*
@@ -1691,18 +1772,31 @@ rk_kms_vop_program_win0(struct rk_kms_softc *sc,
 			cpu_dcache_wb_range(va, PAGE_SIZE);
 		}
 	}
-	stride_bytes = roundup2(mode->hdisplay, 16) * 4u;	/* XR24 */
+	/*
+	 * Source dims come from the fb (Xorg's chosen mode allocates a
+	 * matching-size dumb buffer).  Destination dims come from the
+	 * display timing (always native 1920x1080 for our DP link).  If
+	 * fb != dst, engage the VOP hardware scaler so we can advertise
+	 * lower-res modes without retraining DP.
+	 */
+	uint32_t src_w = (fb != NULL) ? fb->width : mode->hdisplay;
+	uint32_t src_h = (fb != NULL) ? fb->height : mode->vdisplay;
+	uint32_t dst_w = mode->hdisplay;
+	uint32_t dst_h = mode->vdisplay;
+	uint32_t ctrl1 = 0;
+	uint32_t ctrl0_upper;
+	uint32_t lb_mode;
+
+	stride_bytes = roundup2(src_w, 16) * 4u;	/* XR24 stride */
 	stride_words = stride_bytes / 4u;
 
 	vop_big_write(sc, VOP_REG_WIN0_YRGB_BUFSIZE, 0u);
 	vop_big_write(sc, VOP_REG_WIN0_VIR, stride_words);
 	vop_big_write(sc, VOP_REG_WIN0_YRGB_MST, (uint32_t)pa);
 	vop_big_write(sc, VOP_REG_WIN0_ACT_INFO,
-	    (((uint32_t)mode->vdisplay - 1u) << 16) |
-	    ((uint32_t)mode->hdisplay - 1u));
+	    ((src_h - 1u) << 16) | (src_w - 1u));
 	vop_big_write(sc, VOP_REG_WIN0_DSP_INFO,
-	    (((uint32_t)mode->vdisplay - 1u) << 16) |
-	    ((uint32_t)mode->hdisplay - 1u));
+	    ((dst_h - 1u) << 16) | (dst_w - 1u));
 	vop_big_write(sc, VOP_REG_WIN0_DSP_ST,
 	    (vact_start << 16) | hact_start);
 	if (sc->output == RK_KMS_OUT_DP) {
@@ -1713,15 +1807,63 @@ rk_kms_vop_program_win0(struct rk_kms_softc *sc,
 	}
 	vop_big_write(sc, VOP_REG_WIN0_CTRL2, VOP_WIN0_CTRL2_PRIMARY);
 	vop_big_write(sc, VOP_REG_POST_DSP_HACT,
-	    (hact_start << 16) | (hact_start + mode->hdisplay));
+	    (hact_start << 16) | (hact_start + dst_w));
 	vop_big_write(sc, VOP_REG_POST_DSP_VACT,
-	    (vact_start << 16) | (vact_start + mode->vdisplay));
-	vop_big_write(sc, VOP_REG_WIN0_CTRL0,
-	    (sc->output == RK_KMS_OUT_DP ?
+	    (vact_start << 16) | (vact_start + dst_h));
+
+	/*
+	 * Scaler programming.  Formula per Linux
+	 * drm/rockchip/rockchip_drm_vop.h scl_cal_scale(src, dst, 16):
+	 *   factor = ((src * 2 - 3) << 15) / (dst - 1)
+	 * Same math for both bicubic UP and bilinear UP paths — the
+	 * filter selection is a separate mode bit.
+	 */
+	if (src_w != dst_w || src_h != dst_h) {
+		uint32_t fx, fy, mode_h, mode_v;
+
+		fx = (uint32_t)(((int64_t)(src_w * 2 - 3) << 15) /
+		    (int64_t)(dst_w - 1)) & 0xffff;
+		fy = (uint32_t)(((int64_t)(src_h * 2 - 3) << 15) /
+		    (int64_t)(dst_h - 1)) & 0xffff;
+		vop_big_write(sc, VOP_REG_WIN0_SCL_FACTOR_YRGB,
+		    (fy << 16) | fx);
+		vop_big_write(sc, VOP_REG_WIN0_SCL_FACTOR_CBR, 0);
+		vop_big_write(sc, VOP_REG_WIN0_SCL_OFFSET, 0);
+
+		mode_h = (src_w < dst_w) ? VOP_WIN0_SCL_MODE_UP :
+		    (src_w > dst_w) ? VOP_WIN0_SCL_MODE_DOWN : 0;
+		mode_v = (src_h < dst_h) ? VOP_WIN0_SCL_MODE_UP :
+		    (src_h > dst_h) ? VOP_WIN0_SCL_MODE_DOWN : 0;
+		/*
+		 * bit 15: line_load_mode (0 = normal, load 1 line at a time)
+		 * bit 0:  yrgb_axi_gather_en (enable AXI burst gather —
+		 *         required for scaler to fetch source pixels)
+		 * bits 11:8 yrgb_axi_gather_num = 0 (max burst)
+		 */
+		ctrl1 = (mode_h << 16) | (mode_v << 18) |
+		    (VOP_WIN0_SCL_VSU_BIC << 22) |
+		    (1u << 0);
+		lb_mode = (src_w > 2560) ? VOP_WIN0_LB_RGB_3840X2 :
+		    (src_w > 1920) ? VOP_WIN0_LB_RGB_2560X4 :
+		    VOP_WIN0_LB_RGB_1920X5;
+	} else {
+		/* Passthrough: no scaler, no line-buffer preallocation. */
+		vop_big_write(sc, VOP_REG_WIN0_SCL_FACTOR_YRGB, 0);
+		vop_big_write(sc, VOP_REG_WIN0_SCL_FACTOR_CBR, 0);
+		vop_big_write(sc, VOP_REG_WIN0_SCL_OFFSET, 0);
+		lb_mode = VOP_WIN0_LB_RGB_1920X5;
+	}
+	vop_big_write(sc, VOP_REG_WIN0_CTRL1, ctrl1);
+
+	ctrl0_upper = (sc->output == RK_KMS_OUT_DP ?
 	    VOP_WIN0_CTRL0_UPPER_DP : VOP_WIN0_CTRL0_UPPER_HDMI) |
-	    VOP_WIN0_CTRL0_LOWER);
-	DPRINTF(sc, "win0: pa=0x%jx stride=%u (%u words)\n",
-	    (uintmax_t)pa, stride_bytes, stride_words);
+	    VOP_WIN0_CTRL0_LOWER;
+	vop_big_write(sc, VOP_REG_WIN0_CTRL0,
+	    ctrl0_upper | (lb_mode << VOP_WIN0_CTRL0_LB_MODE_SHIFT));
+	DPRINTF(sc, "win0: pa=0x%jx src=%ux%u dst=%ux%u stride=%u"
+	    " ctrl1=0x%08x lb=%u\n",
+	    (uintmax_t)pa, src_w, src_h, dst_w, dst_h, stride_bytes,
+	    ctrl1, lb_mode);
 }
 
 /*
@@ -2495,6 +2637,8 @@ static int
 rk_kms_set_config(struct drm_mode_set *set)
 {
 	struct rk_kms_softc *sc;
+	struct drm_display_mode dst_mode;
+	const struct drm_display_mode *outer;
 
 	sc = set->crtc->dev->driver_priv;
 	if (set->mode != NULL) {
@@ -2503,8 +2647,35 @@ rk_kms_set_config(struct drm_mode_set *set)
 		    set->mode->clock,
 		    set->fb != NULL ? set->fb->base.id : 0,
 		    sc->commit_modeset);
+		/*
+		 * DP link was trained at 1920x1080@60 (148.5 MHz) during
+		 * cdn_dp bring-up.  Switching pixel clock without retrain
+		 * kills the stream, so the VOP DSP timing must ALWAYS be
+		 * that native mode regardless of what Xorg picks.  The WIN0
+		 * scaler in vop_program_win0 upscales the smaller fb.
+		 */
+		if (set->mode->hdisplay != rk_kms_mode_table[0].hdisplay ||
+		    set->mode->vdisplay != rk_kms_mode_table[0].vdisplay) {
+			const struct rk_kms_advertised_mode *n =
+			    &rk_kms_mode_table[0];
+
+			memset(&dst_mode, 0, sizeof(dst_mode));
+			dst_mode.clock = n->clock;
+			dst_mode.hdisplay = n->hdisplay;
+			dst_mode.hsync_start = n->hsync_start;
+			dst_mode.hsync_end = n->hsync_end;
+			dst_mode.htotal = n->htotal;
+			dst_mode.vdisplay = n->vdisplay;
+			dst_mode.vsync_start = n->vsync_start;
+			dst_mode.vsync_end = n->vsync_end;
+			dst_mode.vtotal = n->vtotal;
+			dst_mode.flags = n->flags;
+			outer = &dst_mode;
+		} else {
+			outer = set->mode;
+		}
 		if (sc->commit_modeset != 0 && sc->hw_attached)
-			rk_kms_vop_program_timing(sc, set->mode, set->fb);
+			rk_kms_vop_program_timing(sc, outer, set->fb);
 		rk_kms_vblank_start(sc, set->mode);
 	} else {
 		DPRINTF(sc, "set_config: blank (commit=%d)\n",
@@ -2540,15 +2711,41 @@ rk_kms_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
     uint32_t flags __unused, uint64_t user_data __unused)
 {
 	struct rk_kms_softc *sc = crtc->dev->driver_priv;
+	struct drm_display_mode dst_mode;
+	const struct drm_display_mode *outer;
+	const struct rk_kms_advertised_mode *n = &rk_kms_mode_table[0];
 
 	if (!sc->hw_attached || fb == NULL)
 		return (0);
 	if ((sc->commit_modeset & RK_KMS_STAGE_WIN0) == 0)
 		return (0);
-	DPRINTF(sc, "page_flip: fb=%u\n", fb->base.id);
-	rk_kms_vop_program_win0(sc, &crtc->mode, fb,
-	    rk_kms_hact_start(&crtc->mode),
-	    rk_kms_vact_start(&crtc->mode));
+	/*
+	 * Same substitution rule as set_config: the DSP timing must
+	 * stay native so the DP link keeps its trained pixel clock.
+	 * WIN0 scaler in vop_program_win0 handles fb-side upscaling.
+	 */
+	if (crtc->mode.hdisplay != n->hdisplay ||
+	    crtc->mode.vdisplay != n->vdisplay) {
+		memset(&dst_mode, 0, sizeof(dst_mode));
+		dst_mode.clock = n->clock;
+		dst_mode.hdisplay = n->hdisplay;
+		dst_mode.hsync_start = n->hsync_start;
+		dst_mode.hsync_end = n->hsync_end;
+		dst_mode.htotal = n->htotal;
+		dst_mode.vdisplay = n->vdisplay;
+		dst_mode.vsync_start = n->vsync_start;
+		dst_mode.vsync_end = n->vsync_end;
+		dst_mode.vtotal = n->vtotal;
+		dst_mode.flags = n->flags;
+		outer = &dst_mode;
+	} else {
+		outer = &crtc->mode;
+	}
+	DPRINTF(sc, "page_flip: fb=%u dst=%ux%u\n",
+	    fb->base.id, outer->hdisplay, outer->vdisplay);
+	rk_kms_vop_program_win0(sc, outer, fb,
+	    rk_kms_hact_start(outer),
+	    rk_kms_vact_start(outer));
 	if (sc->commit_modeset & RK_KMS_STAGE_CFG_DONE)
 		vop_big_write(sc, VOP_REG_CFG_DONE, 0x00010001);
 	return (0);
