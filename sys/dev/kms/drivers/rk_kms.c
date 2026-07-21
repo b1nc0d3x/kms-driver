@@ -324,24 +324,42 @@ static void rk_kms_usbc_poll(void *arg);
 #define	VOP_WIN2_CTRL0_GATE	(1u << 0)
 #define	VOP_WIN2_CTRL0_FMT_ARGB	(0u << 1)
 /*
- * Per-pixel alpha blend for the cursor plane.  Values decoded from
- * Linux drm/rockchip vop_plane_atomic_update on RK3288+ WIN2:
+ * Per-pixel alpha blend for the cursor plane.  Xorg's cursor bitmap
+ * is *non-premultiplied* ARGB (each RGB channel is the intended color
+ * before mixing with backdrop; the alpha channel is separate).  The
+ * standard "over" formula is:
+ *     output = src.RGB * src.A + dst.RGB * (1 - src.A)
+ *
+ * NB: even with the "correct" 0x8b/0xc0 config, activating WIN2 with
+ * hw_cursor=1 on the RK3399 VOP_BIG wedges WIN0 scan-out (display
+ * goes cyan / stops receiving proper primary content — behaviour is
+ * sticky past disable).  Alpha alone isn't the whole story; the WIN2
+ * enable also has to slot into the mixer z-order + not clobber
+ * WIN0's DP framer routing.  Left as-is with hw_cursor default off
+ * so operators can rescue the display via sysctl instead of reboot.
+ *
+ * Bits below (matches Linux drm/rockchip vop_plane_atomic_update):
+ *
  *   src_alpha_ctl:
  *     [0]   SRC_ALPHA_EN    = 1     (use per-pixel src alpha)
- *     [1]   SRC_COLOR_M0    = 0     (ALPHA_SRC_PRE_MUL)
- *     [2]   SRC_ALPHA_M0    = 0     (ALPHA_STRAIGHT)
+ *     [1]   SRC_COLOR_M0    = 1     (ALPHA_SRC_NO_PRE_MUL — signal
+ *                                    to VOP that src.RGB is NOT
+ *                                    already pre-multiplied)
+ *     [2]   SRC_ALPHA_M0    = 0     (ALPHA_STRAIGHT — use alpha
+ *                                    as-is, not 1-alpha)
  *     [4:3] SRC_BLEND_M0    = 1     (ALPHA_PER_PIX)
  *     [5]   SRC_ALPHA_CAL_M0= 0     (ALPHA_NO_SATURATION)
- *     [8:6] SRC_FACTOR_M0   = 1     (ALPHA_ONE — pass src through)
- *   = 0x49
+ *     [8:6] SRC_FACTOR_M0   = 2     (ALPHA_SRC — multiply src by
+ *                                    src.A)
+ *   = 0x01 | 0x02 | 0x08 | (2 << 6) = 0x8b
  *   dst_alpha_ctl:
- *     [8:6] DST_FACTOR_M0   = 3     (ALPHA_SRC_INVERSE — 1 - src_alpha
- *                                    blends the underlying primary
- *                                    fb wherever the cursor is
- *                                    transparent)
+ *     [8:6] DST_FACTOR_M0   = 3     (ALPHA_SRC_INVERSE — multiply
+ *                                    dst by 1 - src.A so cursor
+ *                                    transparent regions show the
+ *                                    primary fb through)
  *   = 0xc0
  */
-#define	VOP_WIN2_SRC_ALPHA_STD	0x00000049u
+#define	VOP_WIN2_SRC_ALPHA_STD	0x0000008bu
 #define	VOP_WIN2_DST_ALPHA_STD	0x000000c0u
 #define	VOP_REG_POST_DSP_HACT	0x0170
 #define	VOP_REG_POST_DSP_VACT	0x0174
