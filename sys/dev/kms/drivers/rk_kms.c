@@ -769,6 +769,21 @@ struct rk_kms_softc {
 	 */
 	struct callout			 usbc_poll;
 	uint32_t			 usbc_attach_seq_done;
+
+	/*
+	 * Last observed fusb302 CC-line attach state.  usbc_poll compares
+	 * this against a fresh fusb302_get_typec_status() every 500 ms;
+	 * any transition triggers kms_connector_hotplug so open drm fds
+	 * see DRM_EVENT_CONNECTOR_HOTPLUG and devd emits a
+	 * kms/cardN/hotplug broadcast.
+	 */
+	bool				 usbc_last_attached;
+
+	/*
+	 * Enable hotplug event dispatch (default OFF).  See usbc_poll
+	 * comment above the gate for rationale.
+	 */
+	int				 hotplug_enable;
 	bool				 usbc_poll_armed;
 
 	/*
@@ -2549,7 +2564,9 @@ rk_kms_usbc_poll(void *arg)
 	device_t fdev;
 	devclass_t fdc;
 	struct rk3399_typec_dp_altmode_status alt;
+	struct fusb302_typec_status ts;
 	uint32_t seq;
+	bool now_attached;
 
 	if (!sc->usbc_poll_armed)
 		return;
@@ -2562,6 +2579,41 @@ rk_kms_usbc_poll(void *arg)
 	fdev = devclass_get_device(fdc, 0);
 	if (fdev == NULL)
 		goto reschedule;
+
+	/*
+	 * Hotplug detection: fusb302 reports the CC-line attach state.
+	 * Compare to the last known state; on any transition, fire
+	 * kms_connector_hotplug so open drm_files receive
+	 * DRM_EVENT_CONNECTOR_HOTPLUG and devd emits a kms/cardN/hotplug
+	 * broadcast (which rc scripts / desktop session managers can hook
+	 * for automatic display re-probe on cable insertion/removal).
+	 *
+	 * Gated by dev.rk_kms.0.hotplug sysctl — default OFF because
+	 * kms_connector_hotplug's per-fd event dispatch has raced with
+	 * Xorg's atomic probe path and wedged the box on some boots.
+	 * Turn on to test hotplug flows manually.
+	 */
+	if (sc->hotplug_enable != 0 &&
+	    fusb302_get_typec_status(fdev, &ts) == 0) {
+		now_attached = ts.attached;
+		if (now_attached != sc->usbc_last_attached) {
+			enum drm_connector_status new_status = now_attached ?
+			    connector_status_connected :
+			    connector_status_disconnected;
+			DPRINTF(sc, "hotplug: attached %d -> %d\n",
+			    sc->usbc_last_attached, now_attached);
+			kms_connector_hotplug(&sc->connector, new_status);
+			sc->usbc_last_attached = now_attached;
+			if (!now_attached) {
+				/*
+				 * On disconnect, forget the last seq so the
+				 * next fresh attach re-fires bring-up even
+				 * if the fusb302 seq happened to match.
+				 */
+				sc->usbc_attach_seq_done = 0;
+			}
+		}
+	}
 
 	seq = fusb302_get_attach_seq(fdev);
 	if (seq == sc->usbc_attach_seq_done)
@@ -3199,6 +3251,13 @@ rk_kms_attach(device_t dev)
 	    "cache_flush_fb", CTLFLAG_RW, &sc->cache_flush_fb, 0,
 	    "DC CVAC the fb pages before each VOP DMA program "
 	    "(default on — VOP is non-coherent on RK3399)");
+	sc->hotplug_enable = 0;
+	SYSCTL_ADD_INT(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "hotplug", CTLFLAG_RW, &sc->hotplug_enable, 0,
+	    "Enable DP hotplug event dispatch (default off — "
+	    "kms_connector_hotplug's per-fd events have wedged Xorg's "
+	    "atomic probe path on boot)");
 	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 	    "usbc_bringup_now",
