@@ -18,6 +18,7 @@
 
 #include <vm/vm.h>
 #include <vm/vm_object.h>
+#include <vm/vm_page.h>
 
 #include <kms/drm_crtc.h>
 #include <kms/drm_device.h>
@@ -161,42 +162,48 @@ kms_open(struct cdev *cdev, int oflags __unused, int devtype __unused,
 }
 
 /*
- * Userspace mmap on the cdev.  MAP_DUMB returned an mmap_offset; the
- * userspace mmap() syscall carries that offset to us and we map it
- * back to the GEM object that owns it, then hand back the pre-built
- * cdev_pager.  vm_object_reference bumps the pager's refcount so it
- * outlives the GEM object's handle-table ref (lets userspace keep
- * a live mapping past DESTROY_DUMB, matching Linux semantics).
+ * Userspace mmap on the cdev — page-at-a-time variant.  Returns the
+ * physical address that backs a specific byte offset within a GEM
+ * object's MAP_DUMB region, with an explicit memattr so the resulting
+ * PTE gets the right cache-attribute bits.
+ *
+ * We take this path (instead of d_mmap_single with a cdev_pager) so
+ * we control the memattr per PTE.  On arm64 the cdev_pager MGTDEVICE
+ * path silently drops per-page memattr for FICTITIOUS pages, which
+ * left Xorg's writes stranded in a cached alias that the VOP DMA
+ * never observed.  Direct d_mmap forces UNCACHEABLE PTEs so user
+ * writes land in DRAM in time for scan-out.
  */
 static int
-kms_mmap_single(struct cdev *cdev, vm_ooffset_t *offset, vm_size_t size,
-    vm_object_t *object, int prot __unused)
+kms_mmap(struct cdev *cdev, vm_ooffset_t offset, vm_paddr_t *paddr,
+    int nprot __unused, vm_memattr_t *memattr)
 {
 	struct drm_device *dev;
 	struct drm_gem_object *obj;
+	uint64_t base;
+	uint32_t page_idx;
 
 	dev = cdev->si_drv1;
 	if (dev == NULL)
 		return (ENXIO);
 
-	obj = kms_gem_object_lookup_offset(dev, (uint64_t)*offset);
+	obj = kms_gem_object_lookup_offset_containing(dev, (uint64_t)offset,
+	    &base);
 	if (obj == NULL)
 		return (EINVAL);
-	if (size > obj->size) {
+	page_idx = (uint32_t)((offset - base) / PAGE_SIZE);
+	if (page_idx >= obj->npages) {
 		kms_gem_object_put(obj);
 		return (EINVAL);
 	}
-
-	/*
-	 * Bump the pager's reference for the user mapping.  The lookup
-	 * already pinned the GEM object via its own refcount; the put
-	 * below drops that and leaves only the pager ref to keep pages
-	 * alive while the mapping exists.
-	 */
-	vm_object_reference(obj->pager);
-	*object = obj->pager;
-	*offset = 0;	/* page index within the returned vm_object */
-
+	*paddr = VM_PAGE_TO_PHYS(obj->pages[page_idx]);
+	if (memattr != NULL) {
+#ifdef __aarch64__
+		*memattr = VM_MEMATTR_UNCACHEABLE;
+#else
+		*memattr = VM_MEMATTR_DEFAULT;
+#endif
+	}
 	kms_gem_object_put(obj);
 	return (0);
 }
@@ -277,5 +284,5 @@ struct cdevsw kms_cdevsw = {
 	.d_read =		kms_read,
 	.d_ioctl =		kms_ioctl,
 	.d_poll =		kms_poll,
-	.d_mmap_single =	kms_mmap_single,
+	.d_mmap =		kms_mmap,
 };

@@ -141,7 +141,20 @@ retry_alloc:
 	 * old kernel data.
 	 */
 	m = vm_page_alloc_noobj_contig(VM_ALLOC_WIRED | VM_ALLOC_ZERO,
-	    npages, 0, ~0UL, PAGE_SIZE, 0, VM_MEMATTR_DEFAULT);
+	    npages, 0, ~0UL, PAGE_SIZE, 0,
+#ifdef __aarch64__
+	    /*
+	     * arm64 aliases VM_MEMATTR_WRITE_COMBINING to WRITE_THROUGH
+	     * (still cached) — that leaves Xorg's scattered pixel writes
+	     * stranded in the D-cache while the RK3399 VOP DMA scans DRAM.
+	     * UNCACHEABLE routes every write straight to DRAM.  Slower for
+	     * pure-CPU workloads but scanout has no coherency plumbing.
+	     */
+	    VM_MEMATTR_UNCACHEABLE
+#else
+	    VM_MEMATTR_DEFAULT
+#endif
+	    );
 	if (m == NULL) {
 		if (tries++ < 3) {
 			vm_page_reclaim_contig(0, npages, 0, ~0UL,
@@ -154,6 +167,15 @@ retry_alloc:
 	}
 	for (i = 0; i < npages; i++, m++) {
 		m->valid = VM_PAGE_BITS_ALL;
+#ifdef __aarch64__
+		/*
+		 * Per-page memattr backs the PTE created by pmap_enter when
+		 * userspace mmaps this BO.  Explicit set ensures Xorg's mmap
+		 * gets an UNCACHEABLE mapping so its writes reach DRAM in
+		 * time for the VOP scan-out.
+		 */
+		pmap_page_set_memattr(m, VM_MEMATTR_UNCACHEABLE);
+#endif
 		obj->pages[i] = m;
 	}
 
@@ -165,6 +187,15 @@ retry_alloc:
 	 */
 	obj->pager = cdev_pager_allocate(obj, OBJT_MGTDEVICE,
 	    &drm_gem_pager_ops, size, 0, 0, NULL);
+#ifdef __aarch64__
+	/*
+	 * Set the pager's PTE-time memattr so any fault path that goes
+	 * through it still produces UNCACHEABLE PTEs.  Belt-and-braces
+	 * with the per-page memattr above.
+	 */
+	if (obj->pager != NULL)
+		vm_object_set_memattr(obj->pager, VM_MEMATTR_UNCACHEABLE);
+#endif
 	if (obj->pager == NULL) {
 		for (i = 0; i < npages; i++) {
 			vm_page_unwire_noq(obj->pages[i]);
@@ -238,6 +269,36 @@ kms_gem_object_put(struct drm_gem_object *obj)
 		return;
 	if (refcount_release(&obj->refs))
 		drm_gem_object_release(obj);
+}
+
+/*
+ * Range-based sibling used by the per-page d_mmap path.  Userspace
+ * fault addresses arrive as (mmap_offset + page_offset_within_object)
+ * so we can't demand an exact match on obj->mmap_offset — return the
+ * object whose [mmap_offset, mmap_offset+size) range contains offset,
+ * and report its base so the caller can compute
+ * page_idx = (offset - base) / PAGE_SIZE.
+ */
+struct drm_gem_object *
+kms_gem_object_lookup_offset_containing(struct drm_device *dev,
+    uint64_t offset, uint64_t *base_out)
+{
+	struct drm_gem_object *obj;
+
+	sx_slock(&dev->gem_lock);
+	TAILQ_FOREACH(obj, &dev->gem_objects, device_link) {
+		if (offset < obj->mmap_offset ||
+		    offset >= obj->mmap_offset + obj->size)
+			continue;
+		if (!refcount_acquire_if_not_zero(&obj->refs))
+			break;
+		sx_sunlock(&dev->gem_lock);
+		if (base_out != NULL)
+			*base_out = obj->mmap_offset;
+		return (obj);
+	}
+	sx_sunlock(&dev->gem_lock);
+	return (NULL);
 }
 
 struct drm_gem_object *

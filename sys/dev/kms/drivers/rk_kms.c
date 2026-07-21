@@ -702,6 +702,15 @@ struct rk_kms_softc {
 	int				 hdmi_skip_lock_check;
 
 	/*
+	 * Cache-flush the FB pages before each VOP DMA scan-out program.
+	 * Belt-and-braces on top of the kms-core DIRTYFB handler:
+	 * modeset-time flush ensures the initial fb bind sees the
+	 * freshest DRAM content even if no DIRTYFB has fired yet.
+	 * Default on (write 0 to compare / disable if it wedges).
+	 */
+	int				 cache_flush_fb;
+
+	/*
 	 * Debug verbosity (0 = quiet, 1 = trace MMIO + set_config).
 	 * Controlled by dev.rk_kms.0.debug.
 	 */
@@ -1659,6 +1668,29 @@ rk_kms_vop_program_win0(struct rk_kms_softc *sc,
 		    (uintmax_t)raw);
 		return;
 	}
+	/*
+	 * Cache coherency (2026-07-20): RK3399 VOP DMA is non-coherent
+	 * with the CPU caches.  For UNCACHEABLE-mapped GEM pages this is
+	 * a belt-and-braces flush; for legacy WB-mapped code paths (x86
+	 * cross-arch, or if we ever switch memattr back) it's the only
+	 * thing that guarantees fb DRAM has the latest pixels the caller
+	 * expects to be scanned out.  Walk pages one-by-one — GEM
+	 * allocator is not required to hand back physically-contiguous
+	 * pages, so flushing a single npages*PAGE_SIZE range off pa
+	 * (contiguous only for page 0) would touch unrelated physical
+	 * memory and can SEA-fault on arm64 if it walks off DRAM.  Gated
+	 * by cache_flush_fb sysctl (default on).
+	 */
+	if (sc->cache_flush_fb && fb != NULL && fb->gem_objs[0] != NULL &&
+	    fb->gem_objs[0]->pages != NULL &&
+	    fb->gem_objs[0]->npages > 0) {
+		struct drm_gem_object *cobj = fb->gem_objs[0];
+		for (uint32_t i = 0; i < cobj->npages; i++) {
+			vm_paddr_t ppa = VM_PAGE_TO_PHYS(cobj->pages[i]);
+			void *va = (void *)PHYS_TO_DMAP(ppa);
+			cpu_dcache_wb_range(va, PAGE_SIZE);
+		}
+	}
 	stride_bytes = roundup2(mode->hdisplay, 16) * 4u;	/* XR24 */
 	stride_words = stride_bytes / 4u;
 
@@ -2494,8 +2526,37 @@ rk_kms_set_config(struct drm_mode_set *set)
 	return (0);
 }
 
+/*
+ * PAGE_FLIP: Xorg's modesetting driver may swap between front/back
+ * scanout buffers via PAGE_FLIP instead of full SETCRTC.  Without a
+ * driver hook the framework silently updates crtc->primary_fb but
+ * leaves VOP WIN0_YRGB_MST pointing at the original SETCRTC fb — VOP
+ * keeps scanning the stale buffer while Xorg renders to the new one.
+ * Re-run WIN0 program + CFG_DONE latch so the new fb pa lands on the
+ * hardware for the next scan.
+ */
+static int
+rk_kms_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
+    uint32_t flags __unused, uint64_t user_data __unused)
+{
+	struct rk_kms_softc *sc = crtc->dev->driver_priv;
+
+	if (!sc->hw_attached || fb == NULL)
+		return (0);
+	if ((sc->commit_modeset & RK_KMS_STAGE_WIN0) == 0)
+		return (0);
+	DPRINTF(sc, "page_flip: fb=%u\n", fb->base.id);
+	rk_kms_vop_program_win0(sc, &crtc->mode, fb,
+	    rk_kms_hact_start(&crtc->mode),
+	    rk_kms_vact_start(&crtc->mode));
+	if (sc->commit_modeset & RK_KMS_STAGE_CFG_DONE)
+		vop_big_write(sc, VOP_REG_CFG_DONE, 0x00010001);
+	return (0);
+}
+
 static const struct drm_crtc_funcs rk_kms_crtc_funcs = {
 	.set_config = rk_kms_set_config,
+	.page_flip = rk_kms_page_flip,
 };
 static const struct drm_plane_funcs rk_kms_plane_funcs = { 0 };
 
@@ -2913,6 +2974,12 @@ rk_kms_attach(device_t dev)
 	    "Treat the DW HDMI PHY_STAT0[0] lock-bit timeout as non-fatal "
 	    "(default on — Innosilicon PHY doesn't assert that bit even "
 	    "when the link is up)");
+	sc->cache_flush_fb = 1;
+	SYSCTL_ADD_INT(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "cache_flush_fb", CTLFLAG_RW, &sc->cache_flush_fb, 0,
+	    "DC CVAC the fb pages before each VOP DMA program "
+	    "(default on — VOP is non-coherent on RK3399)");
 	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 	    "usbc_bringup_now",

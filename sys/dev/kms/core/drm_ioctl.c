@@ -12,11 +12,19 @@
 #include <sys/proc.h>
 #include <sys/sysctl.h>
 
+#include <vm/vm.h>
+#include <vm/vm_page.h>
+#include <machine/pmap.h>
+#include <machine/cpufunc.h>
+
 #include <drm/drm.h>
+#include <drm/drm_mode.h>
 #include <kms/drm_device.h>
 #include <kms/drm_drv.h>
 #include <kms/drm_file.h>
+#include <kms/drm_framebuffer.h>
 #include <kms/drm_gem.h>
+#include <kms/drm_mode_object.h>
 #include <kms/drm_prime.h>
 
 #include "kms_internal.h"
@@ -461,6 +469,46 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 	case DRM_IOCTL_PRIME_FD_TO_HANDLE:
 		return (kms_ioctl_prime_fd_to_handle(file,
 		    (struct drm_prime_handle *)data));
+	case DRM_IOCTL_MODE_DIRTYFB:
+		/*
+		 * modesetting's ShadowFB path calls this after copying the
+		 * shadow into the mmap'd scanout fb.  RK3399 VOP DMA is
+		 * non-coherent even with UNCACHEABLE user mappings' merge
+		 * buffers — DSB SY drains any pending userspace stores on
+		 * this CPU, then DC CVAC over the fb pages via DMAP makes
+		 * absolutely sure DRAM has the freshest content before we
+		 * ack.  Ignore the clip list — whole-fb sweep of an 8 MB
+		 * scanout is cheaper than walking 60 Hz-rate clip rects.
+		 */
+		{
+		struct drm_mode_fb_dirty_cmd *dc = (struct drm_mode_fb_dirty_cmd *)data;
+		struct drm_mode_object *obj;
+		struct drm_framebuffer *fb;
+		struct drm_gem_object *gem;
+		uint32_t i;
+
+		obj = kms_mode_object_find(file->dev, dc->fb_id,
+		    DRM_MODE_OBJECT_FB);
+		if (obj == NULL)
+			return (ENOENT);
+		fb = __containerof(obj, struct drm_framebuffer, base);
+#ifdef __aarch64__
+		__asm__ volatile("dsb sy" ::: "memory");
+		if (fb->gem_objs[0] != NULL) {
+			gem = fb->gem_objs[0];
+			for (i = 0; i < gem->npages; i++) {
+				vm_paddr_t ppa =
+				    VM_PAGE_TO_PHYS(gem->pages[i]);
+				void *va = (void *)PHYS_TO_DMAP(ppa);
+				cpu_dcache_wb_range(va, PAGE_SIZE);
+			}
+		}
+#else
+		(void)fb; (void)gem; (void)i;
+#endif
+		kms_mode_object_put(obj);
+		return (0);
+		}
 	case DRM_IOCTL_MODE_ADDFB:
 		return (kms_ioctl_mode_addfb(file,
 		    (struct drm_mode_fb_cmd *)data));

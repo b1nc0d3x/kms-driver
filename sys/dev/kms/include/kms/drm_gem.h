@@ -91,6 +91,15 @@ struct drm_gem_object *kms_gem_object_lookup_offset(struct drm_device *dev,
 	    uint64_t offset);
 
 /*
+ * Range-based sibling used by the per-page d_mmap path — returns the
+ * GEM object whose [mmap_offset, mmap_offset+size) window contains
+ * offset, along with that window's base so the caller can compute the
+ * intra-object page index.  Caller must put the returned reference.
+ */
+struct drm_gem_object *kms_gem_object_lookup_offset_containing(
+	    struct drm_device *dev, uint64_t offset, uint64_t *base_out);
+
+/*
  * Per-drm_file handle table operations.  Handles are 32-bit ids
  * unique within one drm_file; the same GEM object may receive
  * different handles in different files (Phase 9+ PRIME import) but
