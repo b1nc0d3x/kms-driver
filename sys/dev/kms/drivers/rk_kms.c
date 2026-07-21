@@ -2633,6 +2633,36 @@ rk_kms_vblank_stop(struct rk_kms_softc *sc)
 	DPRINTF(sc, "vblank ticker stop\n");
 }
 
+/*
+ * Substitute the native (rk_kms_mode_table[0]) mode for any non-native
+ * pick.  Shared by set_config, page_flip, and atomic_commit — keeps
+ * the DP link at its trained pixel clock; the WIN0 scaler in
+ * vop_program_win0 upscales the fb.  Caller passes storage for the
+ * synthesized native mode; return value is either that storage or the
+ * incoming mode pointer.
+ */
+static const struct drm_display_mode *
+rk_kms_outer_mode(const struct drm_display_mode *in,
+    struct drm_display_mode *scratch)
+{
+	const struct rk_kms_advertised_mode *n = &rk_kms_mode_table[0];
+
+	if (in->hdisplay == n->hdisplay && in->vdisplay == n->vdisplay)
+		return (in);
+	memset(scratch, 0, sizeof(*scratch));
+	scratch->clock = n->clock;
+	scratch->hdisplay = n->hdisplay;
+	scratch->hsync_start = n->hsync_start;
+	scratch->hsync_end = n->hsync_end;
+	scratch->htotal = n->htotal;
+	scratch->vdisplay = n->vdisplay;
+	scratch->vsync_start = n->vsync_start;
+	scratch->vsync_end = n->vsync_end;
+	scratch->vtotal = n->vtotal;
+	scratch->flags = n->flags;
+	return (scratch);
+}
+
 static int
 rk_kms_set_config(struct drm_mode_set *set)
 {
@@ -2648,35 +2678,11 @@ rk_kms_set_config(struct drm_mode_set *set)
 		    set->fb != NULL ? set->fb->base.id : 0,
 		    sc->commit_modeset);
 		/*
-		 * The XYM W156F1 panel we validate against doesn't reliably
-		 * lock onto a non-native pixel clock via cdn_dp's fast-path
-		 * reconfig — the DP framer accepts the new MSA but the
-		 * panel silently drops the stream.  Pin the outer DSP
-		 * timing to the trained native mode (rk_kms_mode_table[0])
-		 * and let the WIN0 scaler upscale the fb.  If a future
-		 * panel handles clock changes cleanly, drop this
-		 * substitution and Xorg's mode flows through natively.
+		 * See rk_kms_outer_mode() — pin DSP timing to trained
+		 * native to survive panel-quirk MSA changes; WIN0 scaler
+		 * handles fb upscale for non-native modes.
 		 */
-		if (set->mode->hdisplay != rk_kms_mode_table[0].hdisplay ||
-		    set->mode->vdisplay != rk_kms_mode_table[0].vdisplay) {
-			const struct rk_kms_advertised_mode *n =
-			    &rk_kms_mode_table[0];
-
-			memset(&dst_mode, 0, sizeof(dst_mode));
-			dst_mode.clock = n->clock;
-			dst_mode.hdisplay = n->hdisplay;
-			dst_mode.hsync_start = n->hsync_start;
-			dst_mode.hsync_end = n->hsync_end;
-			dst_mode.htotal = n->htotal;
-			dst_mode.vdisplay = n->vdisplay;
-			dst_mode.vsync_start = n->vsync_start;
-			dst_mode.vsync_end = n->vsync_end;
-			dst_mode.vtotal = n->vtotal;
-			dst_mode.flags = n->flags;
-			outer = &dst_mode;
-		} else {
-			outer = set->mode;
-		}
+		outer = rk_kms_outer_mode(set->mode, &dst_mode);
 		if (sc->commit_modeset != 0 && sc->hw_attached)
 			rk_kms_vop_program_timing(sc, outer, set->fb);
 		rk_kms_vblank_start(sc, set->mode);
@@ -2714,32 +2720,14 @@ rk_kms_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
     uint32_t flags __unused, uint64_t user_data __unused)
 {
 	struct rk_kms_softc *sc = crtc->dev->driver_priv;
-	struct drm_display_mode dst_mode;
+	struct drm_display_mode scratch;
 	const struct drm_display_mode *outer;
-	const struct rk_kms_advertised_mode *n = &rk_kms_mode_table[0];
 
 	if (!sc->hw_attached || fb == NULL)
 		return (0);
 	if ((sc->commit_modeset & RK_KMS_STAGE_WIN0) == 0)
 		return (0);
-	/* Same native-DSP substitution as set_config. */
-	if (crtc->mode.hdisplay != n->hdisplay ||
-	    crtc->mode.vdisplay != n->vdisplay) {
-		memset(&dst_mode, 0, sizeof(dst_mode));
-		dst_mode.clock = n->clock;
-		dst_mode.hdisplay = n->hdisplay;
-		dst_mode.hsync_start = n->hsync_start;
-		dst_mode.hsync_end = n->hsync_end;
-		dst_mode.htotal = n->htotal;
-		dst_mode.vdisplay = n->vdisplay;
-		dst_mode.vsync_start = n->vsync_start;
-		dst_mode.vsync_end = n->vsync_end;
-		dst_mode.vtotal = n->vtotal;
-		dst_mode.flags = n->flags;
-		outer = &dst_mode;
-	} else {
-		outer = &crtc->mode;
-	}
+	outer = rk_kms_outer_mode(&crtc->mode, &scratch);
 	DPRINTF(sc, "page_flip: fb=%u src=%ux%u dst=%ux%u\n",
 	    fb->base.id, fb->width, fb->height,
 	    outer->hdisplay, outer->vdisplay);
@@ -2845,6 +2833,8 @@ rk_kms_atomic_commit(struct drm_device *dev,
 {
 	struct rk_kms_softc *sc;
 	uint32_t i;
+	struct drm_display_mode scratch;
+	const struct drm_display_mode *outer;
 
 	if (state == NULL)
 		return (EINVAL);
@@ -2858,17 +2848,49 @@ rk_kms_atomic_commit(struct drm_device *dev,
 			continue;
 		fb = rk_kms_atomic_pick_fb(state, cs->crtc);
 		DPRINTF(sc, "atomic_commit: crtc=%u mode=%ux%u@%u "
-		    "active=%d fb=%u commit=%d\n",
+		    "active=%d fb=%u mode_changed=%d planes_changed=%d "
+		    "commit=%d\n",
 		    cs->crtc->base.id, cs->mode.hdisplay, cs->mode.vdisplay,
 		    cs->mode.clock, cs->active,
-		    fb != NULL ? fb->base.id : 0, sc->commit_modeset);
+		    fb != NULL ? fb->base.id : 0,
+		    cs->mode_changed, cs->planes_changed, sc->commit_modeset);
 		if (!cs->mode_changed && !cs->planes_changed &&
 		    !cs->connectors_changed)
 			continue;
 		if (sc->commit_modeset == 0 || !sc->hw_attached)
 			continue;
-		if (cs->active && cs->mode.hdisplay > 0)
-			rk_kms_vop_program_timing(sc, &cs->mode, fb);
+		if (cs->active && cs->mode.hdisplay > 0) {
+			outer = rk_kms_outer_mode(&cs->mode, &scratch);
+			if (cs->mode_changed) {
+				/*
+				 * Full modeset: program VOP timing (which
+				 * in turn programs WIN0 + finishes cdn_dp
+				 * + latches CFG_DONE).
+				 */
+				rk_kms_vop_program_timing(sc, outer, fb);
+			} else if (cs->planes_changed && fb != NULL) {
+				/*
+				 * Plane-only atomic commit (compositor
+				 * front/back flip): reprogram WIN0 with the
+				 * new fb, then latch CFG_DONE so VOP picks
+				 * up the new source on the next scan.
+				 */
+				rk_kms_vop_program_win0(sc, outer, fb,
+				    rk_kms_hact_start(outer),
+				    rk_kms_vact_start(outer));
+				if (sc->commit_modeset & RK_KMS_STAGE_CFG_DONE)
+					vop_big_write(sc, VOP_REG_CFG_DONE,
+					    0x00010001);
+			}
+			/*
+			 * Keep crtc->primary_fb in sync so subsequent
+			 * GETCRTC + our fb_flush callout see the current
+			 * scan-out buffer.  Refcount is managed by the
+			 * atomic core when it swaps state.
+			 */
+			if (fb != NULL)
+				cs->crtc->primary_fb = fb;
+		}
 	}
 	return (0);
 }
