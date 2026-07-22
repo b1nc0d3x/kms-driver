@@ -2982,6 +2982,37 @@ rk_kms_vop_program_cursor(struct rk_kms_softc *sc, vm_paddr_t pa,
 		vop_big_write(sc, VOP_REG_CFG_DONE, 0x00010001);
 }
 
+/*
+ * hw_cursor sysctl handler.  On 1→0 transition, blank WIN2 in-place
+ * so a leftover HW cursor bitmap doesn't stay stuck on screen next to
+ * whatever SW cursor Xorg composites into the primary fb — otherwise
+ * the operator sees two mice (one moving, one static).  The 0→1
+ * direction just updates the flag; Xorg needs an X restart before it
+ * probes for HW cursor support again, so there's nothing to program.
+ */
+static int
+rk_kms_hw_cursor_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_kms_softc *sc = arg1;
+	int val = sc->hw_cursor_enable;
+	int error;
+
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val == sc->hw_cursor_enable)
+		return (0);
+	if (val == 0 && sc->hw_attached && sc->cursor_bo != NULL) {
+		kms_gem_object_put(sc->cursor_bo);
+		sc->cursor_bo = NULL;
+		sc->cursor_width = 0;
+		sc->cursor_height = 0;
+		rk_kms_vop_program_cursor(sc, 0, 0, 0, 0, 0);
+	}
+	sc->hw_cursor_enable = val;
+	return (0);
+}
+
 static int
 rk_kms_cursor_set(struct drm_crtc *crtc, struct drm_file *file,
     uint32_t handle, uint32_t width, uint32_t height,
@@ -2993,8 +3024,24 @@ rk_kms_cursor_set(struct drm_crtc *crtc, struct drm_file *file,
 
 	if (!sc->hw_attached)
 		return (0);
-	if (sc->hw_cursor_enable == 0)
+	if (sc->hw_cursor_enable == 0) {
+		/*
+		 * SW-cursor fallback path.  If we had already programmed a
+		 * HW cursor before hw_cursor was flipped to 0 (mid-session
+		 * sysctl toggle, or Xorg latched HW cursor at startup and
+		 * we're being asked to move it), blank WIN2 so the stuck
+		 * bitmap doesn't shadow the SW cursor Xorg is about to
+		 * composite into the primary fb.
+		 */
+		if (sc->cursor_bo != NULL) {
+			kms_gem_object_put(sc->cursor_bo);
+			sc->cursor_bo = NULL;
+			sc->cursor_width = 0;
+			sc->cursor_height = 0;
+			rk_kms_vop_program_cursor(sc, 0, 0, 0, 0, 0);
+		}
 		return (ENOTTY);	/* signal Xorg to draw SW cursor */
+	}
 	if (handle == 0 || width == 0 || height == 0) {
 		/* Disable path — release any pinned BO and blank WIN2. */
 		if (sc->cursor_bo != NULL) {
@@ -3698,12 +3745,15 @@ rk_kms_attach(device_t dev)
 	    "kms_connector_hotplug's per-fd events have wedged Xorg's "
 	    "atomic probe path on boot)");
 	sc->hw_cursor_enable = 1;
-	SYSCTL_ADD_INT(device_get_sysctl_ctx(dev),
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
-	    "hw_cursor", CTLFLAG_RW, &sc->hw_cursor_enable, 0,
+	    "hw_cursor",
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
+	    rk_kms_hw_cursor_sysctl, "I",
 	    "Enable HW cursor plane (VOP WIN2 area 0, default on — "
 	    "returns ENOTTY when off so Xorg draws a SW cursor into the "
-	    "primary fb)");
+	    "primary fb; 1→0 write also blanks WIN2 immediately so a "
+	    "leftover HW cursor doesn't double with Xorg's SW cursor)");
 	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 	    "usbc_bringup_now",
