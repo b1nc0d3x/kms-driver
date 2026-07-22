@@ -19,6 +19,7 @@
 
 #include <drm/drm.h>
 #include <drm/drm_mode.h>
+#include <kms/drm_crtc.h>
 #include <kms/drm_device.h>
 #include <kms/drm_drv.h>
 #include <kms/drm_file.h>
@@ -469,6 +470,53 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 	case DRM_IOCTL_PRIME_FD_TO_HANDLE:
 		return (kms_ioctl_prime_fd_to_handle(file,
 		    (struct drm_prime_handle *)data));
+	case DRM_IOCTL_MODE_SETGAMMA:
+		/*
+		 * Copy the three per-channel 16-bit LUTs from userspace into
+		 * kernel storage, then hand them to the driver's gamma_set
+		 * hook.  We cap gamma_size at 4096 entries to bound the
+		 * malloc; typical Xorg / redshift use 256.  Driver hooks
+		 * that don't need real gamma either report gamma_size=0 up
+		 * front (kms_ioctl_mode_getcrtc caches 256) or return 0
+		 * from a no-op gamma_set — both keep userspace happy.
+		 */
+		{
+		struct drm_mode_crtc_lut *lut = (struct drm_mode_crtc_lut *)data;
+		struct drm_mode_object *obj;
+		struct drm_crtc *crtc;
+		uint16_t *rbuf = NULL, *gbuf = NULL, *bbuf = NULL;
+		size_t bytes;
+		int err = 0;
+
+		if (lut->gamma_size == 0 || lut->gamma_size > 4096)
+			return (EINVAL);
+		obj = kms_mode_object_find(file->dev, lut->crtc_id,
+		    DRM_MODE_OBJECT_CRTC);
+		if (obj == NULL)
+			return (ENOENT);
+		crtc = __containerof(obj, struct drm_crtc, base);
+		if (crtc->funcs == NULL || crtc->funcs->gamma_set == NULL) {
+			kms_mode_object_put(obj);
+			return (0);	/* stub-safe no-op */
+		}
+		bytes = (size_t)lut->gamma_size * sizeof(uint16_t);
+		rbuf = malloc(bytes, M_KMS, M_WAITOK);
+		gbuf = malloc(bytes, M_KMS, M_WAITOK);
+		bbuf = malloc(bytes, M_KMS, M_WAITOK);
+		err = copyin((void *)(uintptr_t)lut->red, rbuf, bytes);
+		if (err == 0)
+			err = copyin((void *)(uintptr_t)lut->green, gbuf, bytes);
+		if (err == 0)
+			err = copyin((void *)(uintptr_t)lut->blue, bbuf, bytes);
+		if (err == 0)
+			err = crtc->funcs->gamma_set(crtc, lut->gamma_size,
+			    rbuf, gbuf, bbuf);
+		free(rbuf, M_KMS);
+		free(gbuf, M_KMS);
+		free(bbuf, M_KMS);
+		kms_mode_object_put(obj);
+		return (err);
+		}
 	case DRM_IOCTL_MODE_DIRTYFB:
 		/*
 		 * modesetting's ShadowFB path calls this after copying the

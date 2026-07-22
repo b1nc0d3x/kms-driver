@@ -67,6 +67,18 @@ struct drm_crtc_funcs {
 		    uint32_t handle, uint32_t width, uint32_t height,
 		    int32_t hot_x, int32_t hot_y);
 	int	(*cursor_move)(struct drm_crtc *crtc, int32_t x, int32_t y);
+
+	/*
+	 * SETGAMMA: install per-channel 16-bit gamma correction ramps of
+	 * `size` entries each.  If NULL, the framework returns 0 (no-op
+	 * as before) so callers that don't need real gamma still see
+	 * successful set — matches Linux behaviour for stub drivers.
+	 * red / green / blue are kernel-side copies already sanitized by
+	 * the framework; callers must not touch userspace pointers.
+	 */
+	int	(*gamma_set)(struct drm_crtc *crtc, uint32_t size,
+		    const uint16_t *red, const uint16_t *green,
+		    const uint16_t *blue);
 };
 
 struct drm_crtc {

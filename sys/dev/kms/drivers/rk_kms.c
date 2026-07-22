@@ -3007,6 +3007,71 @@ rk_kms_cursor_move(struct drm_crtc *crtc, int32_t x, int32_t y)
 }
 
 /*
+ * SETGAMMA: install per-channel gamma correction ramps into the VOP
+ * 1024-entry gamma LUT at 0x2000, then latch via update_gamma_lut and
+ * enable via dsp_lut_en.  Userspace tools (redshift, xrandr --gamma,
+ * night-shift-alikes) drive this.
+ *
+ * Xorg / X11 gamma is per-channel 16-bit unsigned (0..0xffff maps to
+ * 0..1.0 output).  VOP LUT entries are 32-bit words packing R:G:B as
+ * 10-bit fields:  [29:20] R, [19:10] G, [9:0] B.  Down-convert 16→10
+ * by dropping the low 6 bits.
+ *
+ * The LUT is 1024 entries; typical userspace passes size=256.  We
+ * quadruple-tile the 256-entry input so every 4 consecutive LUT slots
+ * carry the same value — VOP indexes by the top 10 bits of the pixel
+ * value, giving equivalent-to-256-entry lookup for our 8-bit content.
+ * When userspace passes size=1024 we skip the tile and write directly.
+ */
+static int
+rk_kms_gamma_set(struct drm_crtc *crtc, uint32_t size,
+    const uint16_t *red, const uint16_t *green, const uint16_t *blue)
+{
+	struct rk_kms_softc *sc = crtc->dev->driver_priv;
+	uint32_t i, tile;
+	uint32_t dsp_ctrl1;
+
+	if (!sc->hw_attached)
+		return (0);
+	if (size == 0 || (size != 256 && size != 1024))
+		return (EINVAL);
+	tile = (size == 256) ? 4 : 1;	/* upscale 256→1024 via 4× tile */
+
+	/*
+	 * Clear dsp_lut_en before rewriting so VOP doesn't scan through
+	 * a half-updated LUT.  RK3399 also supports the update_gamma_lut
+	 * bit which allows atomic in-place refresh; keep the disable
+	 * path for correctness on cold LUT programming.
+	 */
+	dsp_ctrl1 = vop_big_read(sc, VOP_REG_DSP_CTRL1);
+	vop_big_write(sc, VOP_REG_DSP_CTRL1,
+	    dsp_ctrl1 & ~VOP_DSP_CTRL1_LUT_EN);
+	vop_big_write(sc, VOP_REG_CFG_DONE, 0x00010001);
+
+	for (i = 0; i < size; i++) {
+		uint32_t r10 = (uint32_t)red[i]   >> 6;	/* 16 → 10 */
+		uint32_t g10 = (uint32_t)green[i] >> 6;
+		uint32_t b10 = (uint32_t)blue[i]  >> 6;
+		uint32_t entry = ((r10 & 0x3ff) << 20) |
+		    ((g10 & 0x3ff) << 10) | (b10 & 0x3ff);
+		uint32_t t;
+
+		for (t = 0; t < tile; t++)
+			vop_big_write(sc,
+			    VOP_REG_GAMMA_LUT + (i * tile + t) * 4u, entry);
+	}
+
+	/* Re-enable + latch. */
+	dsp_ctrl1 = vop_big_read(sc, VOP_REG_DSP_CTRL1);
+	vop_big_write(sc, VOP_REG_DSP_CTRL1,
+	    dsp_ctrl1 | VOP_DSP_CTRL1_LUT_EN | VOP_DSP_CTRL1_UPDATE_LUT);
+	vop_big_write(sc, VOP_REG_CFG_DONE, 0x00010001);
+	DPRINTF(sc, "gamma_set: %u entries × %ux tile written to LUT\n",
+	    size, tile);
+	return (0);
+}
+
+/*
  * Substitute the native (rk_kms_mode_table[0]) mode for any non-native
  * pick.  Shared by set_config, page_flip, and atomic_commit — keeps
  * the DP link at its trained pixel clock; the WIN0 scaler in
@@ -3117,6 +3182,7 @@ static const struct drm_crtc_funcs rk_kms_crtc_funcs = {
 	.page_flip = rk_kms_page_flip,
 	.cursor_set = rk_kms_cursor_set,
 	.cursor_move = rk_kms_cursor_move,
+	.gamma_set = rk_kms_gamma_set,
 };
 static const struct drm_plane_funcs rk_kms_plane_funcs = { 0 };
 
