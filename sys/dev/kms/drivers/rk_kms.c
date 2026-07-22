@@ -375,9 +375,17 @@ static void rk_kms_usbc_poll(void *arg);
 #define	VOP_WIN0_SRC_ALPHA_OPAQUE 0x00ff0000u
 #define	VOP_WIN0_DST_ALPHA_OPAQUE 0x00000000u
 #define	VOP_WIN0_LB_MODE_RGB	(4u << 5)
-#define	VOP_WIN0_DATA_FMT_XRGB8888 0x00000000u
-#define	VOP_WIN0_CTRL0_LOWER	(VOP_WIN0_LB_MODE_RGB |			\
-				 VOP_WIN0_DATA_FMT_XRGB8888 | 0x01u)
+/*
+ * WIN0 CTRL0 data_format field (bits 3:1) — per RK3288/RK3399 VOP TRM
+ * and Linux drm/rockchip vop_full_data_formats.  Set into ctrl0_lower
+ * by the format select in vop_program_win0; can't bake into a constant
+ * because it's fb-dependent.
+ */
+#define	VOP_WIN0_DATA_FMT_ARGB8888 (0u << 1)
+#define	VOP_WIN0_DATA_FMT_RGB888   (1u << 1)
+#define	VOP_WIN0_DATA_FMT_RGB565   (2u << 1)
+#define	VOP_WIN0_CTRL0_RB_SWAP	(1u << 12)
+#define	VOP_WIN0_CTRL0_LOWER	(VOP_WIN0_LB_MODE_RGB | 0x01u)
 #define	VOP_WIN0_CTRL2_PRIMARY	0x00000021u
 
 /*
@@ -1995,10 +2003,52 @@ rk_kms_vop_program_win0(struct rk_kms_softc *sc,
 	uint32_t dst_h = mode->vdisplay;
 	uint32_t ctrl1 = 0;
 	uint32_t ctrl0_upper;
+	uint32_t ctrl0_fmt;
 	uint32_t lb_mode;
+	uint32_t fourcc;
+	uint32_t cpp;
 
-	stride_bytes = roundup2(src_w, 16) * 4u;	/* XR24 stride */
-	stride_words = stride_bytes / 4u;
+	/*
+	 * Pixel format select.  We advertise ARGB8888 / XRGB8888 / RGB565
+	 * on the primary; every other fourcc that reaches us falls back to
+	 * XRGB8888 (data_format=0) with a matching 4-bpp stride so we
+	 * scan out garbage colours rather than wedge on a malformed
+	 * register write.  BGRA / BGRX / BGR565 set rb_swap.
+	 */
+	fourcc = (fb != NULL) ? fb->format : DRM_FORMAT_XRGB8888;
+	switch (fourcc) {
+	case DRM_FORMAT_RGB565:
+		ctrl0_fmt = VOP_WIN0_DATA_FMT_RGB565;
+		cpp = 2;
+		break;
+	case DRM_FORMAT_BGR565:
+		ctrl0_fmt = VOP_WIN0_DATA_FMT_RGB565 | VOP_WIN0_CTRL0_RB_SWAP;
+		cpp = 2;
+		break;
+	case DRM_FORMAT_BGRA8888:
+	case DRM_FORMAT_BGRX8888:
+	case DRM_FORMAT_ABGR8888:
+	case DRM_FORMAT_XBGR8888:
+		ctrl0_fmt = VOP_WIN0_DATA_FMT_ARGB8888 | VOP_WIN0_CTRL0_RB_SWAP;
+		cpp = 4;
+		break;
+	case DRM_FORMAT_ARGB8888:
+	case DRM_FORMAT_XRGB8888:
+	default:
+		ctrl0_fmt = VOP_WIN0_DATA_FMT_ARGB8888;
+		cpp = 4;
+		break;
+	}
+	/*
+	 * Stride source: prefer fb->pitches[0] (what userspace's allocator
+	 * used) over recomputing from width * cpp — Xorg / Wayland allocators
+	 * may pad differently than we would, and scanning with a mismatched
+	 * stride shears every row.  Fall back to width * cpp only when no
+	 * fb (blank path).  VOP VIR takes stride in 32-bit words; round up
+	 * so a byte-stride that isn't word-aligned still fits.
+	 */
+	stride_bytes = (fb != NULL) ? fb->pitches[0] : (src_w * cpp);
+	stride_words = (stride_bytes + 3u) / 4u;
 
 	vop_big_write(sc, VOP_REG_WIN0_YRGB_BUFSIZE, 0u);
 	vop_big_write(sc, VOP_REG_WIN0_VIR, stride_words);
@@ -2067,13 +2117,13 @@ rk_kms_vop_program_win0(struct rk_kms_softc *sc,
 
 	ctrl0_upper = (sc->output == RK_KMS_OUT_DP ?
 	    VOP_WIN0_CTRL0_UPPER_DP : VOP_WIN0_CTRL0_UPPER_HDMI) |
-	    VOP_WIN0_CTRL0_LOWER;
+	    VOP_WIN0_CTRL0_LOWER | ctrl0_fmt;
 	vop_big_write(sc, VOP_REG_WIN0_CTRL0,
 	    ctrl0_upper | (lb_mode << VOP_WIN0_CTRL0_LB_MODE_SHIFT));
-	DPRINTF(sc, "win0: pa=0x%jx src=%ux%u dst=%ux%u stride=%u"
+	DPRINTF(sc, "win0: pa=0x%jx src=%ux%u dst=%ux%u stride=%u fmt=0x%08x"
 	    " ctrl1=0x%08x lb=%u\n",
 	    (uintmax_t)pa, src_w, src_h, dst_w, dst_h, stride_bytes,
-	    ctrl1, lb_mode);
+	    fourcc, ctrl1, lb_mode);
 }
 
 /*
