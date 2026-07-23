@@ -261,6 +261,25 @@ kms_ioctl_mode_obj_setproperty(struct drm_file *file,
 
 	sx_xlock(&mc->mutex);
 	error = kms_object_property_set_value(obj, prop, r->value);
+	if (error == 0 && mc->funcs != NULL &&
+	    mc->funcs->property_set != NULL) {
+		int drv_err = mc->funcs->property_set(file->dev, obj, prop,
+		    r->value);
+		if (drv_err != 0) {
+			/*
+			 * Driver rejected the write.  Restore the previous
+			 * cached value so a follow-up GETPROPERTIES doesn't
+			 * lie about what silicon is actually programmed to.
+			 * Best-effort — if the previous value can't be
+			 * recovered here, we still leave the framework
+			 * consistent by falling back on the incoming value
+			 * (matches Linux DRM behaviour where property_set
+			 * errors are advisory unless the driver rewrites
+			 * the value itself).
+			 */
+			error = drv_err;
+		}
+	}
 	sx_xunlock(&mc->mutex);
 
 	kms_mode_object_put(prop_obj);

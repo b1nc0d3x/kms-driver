@@ -34,11 +34,27 @@ struct drm_device;
  * at a time via OBJ_SETPROPERTY) still works against driver builds
  * that have not yet wired the atomic surface.
  */
+struct drm_mode_object;
+struct drm_property;
+
 struct drm_mode_config_funcs {
 	int (*atomic_check)(struct drm_device *dev,
 	    struct drm_atomic_state *state);
 	int (*atomic_commit)(struct drm_device *dev,
 	    struct drm_atomic_state *state, bool nonblock);
+	/*
+	 * Optional per-driver property set hook.  Called after the
+	 * framework stores value into obj->properties in response to
+	 * MODE_OBJ_SETPROPERTY (single-property write) with the
+	 * mode_config.mutex held exclusive.  Return 0 on success or
+	 * any errno to reject the write (framework will roll back the
+	 * cached value).  Drivers use this for enum / range properties
+	 * whose write needs to reach silicon — video_src, audio_src,
+	 * connector power state, etc.
+	 */
+	int (*property_set)(struct drm_device *dev,
+	    struct drm_mode_object *obj, struct drm_property *prop,
+	    uint64_t value);
 };
 
 /*

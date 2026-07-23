@@ -68,6 +68,7 @@
 #include <kms/drm_gem.h>
 #include <kms/drm_mode_config.h>
 #include <kms/drm_modes.h>
+#include <kms/drm_property.h>
 #include <kms/drm_plane.h>
 #include <kms/drm_vblank.h>
 
@@ -962,6 +963,20 @@ struct rk_kms_softc {
 	int				 auto_switch;
 	int				 output_target;
 	struct task			 output_task;
+
+	/*
+	 * DRM connector properties mirroring the sysctl testing surface.
+	 * video_src / audio_src are read-write enums exposed as
+	 * xrandr / drmModeObjectSetProperty writable knobs;
+	 * video_connected is an immutable range whose value the driver
+	 * pushes on every usbc_poll tick so userspace can observe the
+	 * cached HDMI-HPD + DP-trained bitmask without hitting sysctl.
+	 * property_set on the mode_config funcs dispatches writes back
+	 * to rk_kms_set_video_src.
+	 */
+	struct drm_property		*prop_video_src;
+	struct drm_property		*prop_audio_src;
+	struct drm_property		*prop_video_connected;
 
 	/*
 	 * EDID probe latch — set once the first successful
@@ -2896,6 +2911,22 @@ rk_kms_refresh_video_connected(struct rk_kms_softc *sc)
 	 */
 	sc->dp_connected = sc->usbc_last_attached &&
 	    sc->usbc_attach_seq_done != 0;
+	/*
+	 * Push the fresh bitmask into the DRM connector property so
+	 * userspace polling via drmModeObjectGetProperties sees the
+	 * same value the video_connected sysctl reports.  Silently
+	 * skip if the property hasn't been created yet (topology_init
+	 * runs after the first poll may fire).
+	 */
+	if (sc->prop_video_connected != NULL) {
+		uint64_t mask = 0;
+		if (sc->hdmi_connected)
+			mask |= (1u << RK_KMS_OUT_HDMI);
+		if (sc->dp_connected)
+			mask |= (1u << RK_KMS_OUT_DP);
+		(void)kms_object_property_set_value(&sc->connector.base,
+		    sc->prop_video_connected, mask);
+	}
 }
 
 /*
@@ -2992,6 +3023,19 @@ rk_kms_set_video_src(struct rk_kms_softc *sc, int out, bool force)
 	 */
 	kms_connector_hotplug(&sc->connector,
 	    connector_status_connected);
+	/*
+	 * Mirror the new active output into the DRM connector
+	 * properties so a userspace GETPROPERTY (xrandr, wlroots) sees
+	 * the current state — the sysctl path bypasses
+	 * MODE_OBJ_SETPROPERTY, and without this the property value
+	 * would lag behind sc->output.
+	 */
+	if (sc->prop_video_src != NULL)
+		(void)kms_object_property_set_value(&sc->connector.base,
+		    sc->prop_video_src, (uint64_t)out);
+	if (sc->prop_audio_src != NULL)
+		(void)kms_object_property_set_value(&sc->connector.base,
+		    sc->prop_audio_src, (uint64_t)out);
 	device_printf(sc->dev, "video_src -> %s (hpd hdmi=%d dp=%d)\n",
 	    out == RK_KMS_OUT_HDMI ? "HDMI" : "DP",
 	    sc->hdmi_connected, sc->dp_connected);
@@ -3979,9 +4023,48 @@ rk_kms_atomic_commit(struct drm_device *dev,
 	return (0);
 }
 
+/*
+ * DRM property_set hook — fires from MODE_OBJ_SETPROPERTY after the
+ * framework has cached the new value in obj->properties, with
+ * mode_config.mutex held exclusive.  We match on our own registered
+ * prop_video_src / prop_audio_src pointers so an unrelated property
+ * write (EDID blob update, DPMS, plane CRTC_ID, …) falls through
+ * silently.
+ *
+ * video_src writes call the same rk_kms_set_video_src helper as the
+ * sysctl surface — so a compositor doing
+ *   drmModeObjectSetProperty(fd, connector_id, video_src_id, RK_KMS_OUT_HDMI)
+ * ends up going through the identical teardown / config / hotplug
+ * dispatch as the sysctl testing entry.  audio_src mirrors video for
+ * now (independent routing TBD, matching sysctl semantics).
+ */
+static int
+rk_kms_property_set(struct drm_device *dev, struct drm_mode_object *obj,
+    struct drm_property *prop, uint64_t value)
+{
+	struct rk_kms_softc *sc = dev->driver_priv;
+
+	if (sc == NULL || obj == NULL || prop == NULL)
+		return (0);
+	if (prop == sc->prop_video_src) {
+		int target = (int)value;
+		if (target != RK_KMS_OUT_HDMI && target != RK_KMS_OUT_DP)
+			return (EINVAL);
+		return (rk_kms_set_video_src(sc, target, false));
+	}
+	if (prop == sc->prop_audio_src) {
+		int target = (int)value;
+		if (target != sc->output)
+			return (EOPNOTSUPP);
+		return (0);
+	}
+	return (0);
+}
+
 static const struct drm_mode_config_funcs rk_kms_mode_config_funcs = {
 	.atomic_check  = rk_kms_atomic_check,
 	.atomic_commit = rk_kms_atomic_commit,
+	.property_set  = rk_kms_property_set,
 };
 static const struct drm_encoder_funcs rk_kms_encoder_funcs = { 0 };
 static const struct drm_connector_funcs rk_kms_connector_funcs = {
@@ -4026,6 +4109,41 @@ rk_kms_topology_init(struct rk_kms_softc *sc)
 	sc->connector.mm_width = 600;
 	sc->connector.mm_height = 340;
 	kms_connector_attach_encoder(&sc->connector, &sc->encoder);
+
+	/*
+	 * DRM connector properties — production surface mirroring the
+	 * video_src / audio_src / video_connected sysctls.  Xorg /
+	 * Wayland compositors and xrandr already know how to iterate +
+	 * set these via MODE_OBJ_SETPROPERTY, so once these are attached
+	 *   xrandr --output HDMI-1 --set video_src DP
+	 * fires the same rk_kms_set_video_src helper the sysctl uses.
+	 */
+	sc->prop_video_src = kms_property_create_enum(sc->drm_dev, 0,
+	    "video_src");
+	if (sc->prop_video_src != NULL) {
+		kms_property_add_enum(sc->prop_video_src,
+		    RK_KMS_OUT_HDMI, "HDMI");
+		kms_property_add_enum(sc->prop_video_src,
+		    RK_KMS_OUT_DP, "DP");
+		kms_object_attach_property(&sc->connector.base,
+		    sc->prop_video_src, sc->output);
+	}
+	sc->prop_audio_src = kms_property_create_enum(sc->drm_dev, 0,
+	    "audio_src");
+	if (sc->prop_audio_src != NULL) {
+		kms_property_add_enum(sc->prop_audio_src,
+		    RK_KMS_OUT_HDMI, "HDMI");
+		kms_property_add_enum(sc->prop_audio_src,
+		    RK_KMS_OUT_DP, "DP");
+		kms_object_attach_property(&sc->connector.base,
+		    sc->prop_audio_src, sc->output);
+	}
+	sc->prop_video_connected = kms_property_create_range(sc->drm_dev,
+	    KMS_PROP_IMMUTABLE, "video_connected", 0, 3);
+	if (sc->prop_video_connected != NULL)
+		kms_object_attach_property(&sc->connector.base,
+		    sc->prop_video_connected, 0);
+
 	return (0);
 }
 
