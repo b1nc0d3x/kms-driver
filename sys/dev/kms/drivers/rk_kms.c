@@ -656,13 +656,23 @@ static uint32_t rk_kms_vact_start(const struct drm_display_mode *m);
  */
 #define	HDMI_PHY_I2C_CKCALCTRL_OVERRIDE 0x8000
 
-#define	HDMI_PHY_CONF0_PDDQ	(1u << 1)
-#define	HDMI_PHY_CONF0_PDZ	(1u << 2)
-#define	HDMI_PHY_CONF0_ENTMDS	(1u << 3)
-#define	HDMI_PHY_CONF0_SVSRET	(1u << 4)
-#define	HDMI_PHY_CONF0_TXPWRON	(1u << 6)
-#define	HDMI_PHY_CONF0_SELDIPIF	(1u << 5)
-#define	HDMI_PHY_CONF0_SELDATAENPOL (1u << 7)
+/*
+ * DesignWare HDMI PHY_CONF0 bit layout — Gen2 (Innosilicon on RK3399).
+ * These match Linux drm/bridge/synopsys/dw-hdmi.h GEN2_* and the rk_drm
+ * reference; the reverse-order values previously here (PDDQ=bit1,
+ * TXPWRON=bit6, ...) came from an older Gen1-era header and had the
+ * "SVSRET" bit landing on the REAL PDDQ position — so power-on left
+ * PDDQ high and the PHY never woke out of low-power / never locked
+ * (PHY_STAT0[0] TX_PHY_LOCK stuck at 0).
+ */
+#define	HDMI_PHY_CONF0_PDZ	(1u << 7)
+#define	HDMI_PHY_CONF0_ENTMDS	(1u << 6)
+#define	HDMI_PHY_CONF0_SVSRET	(1u << 5)
+#define	HDMI_PHY_CONF0_PDDQ	(1u << 4)
+#define	HDMI_PHY_CONF0_TXPWRON	(1u << 3)
+#define	HDMI_PHY_CONF0_ENHPDRXSENSE (1u << 2)
+#define	HDMI_PHY_CONF0_SELDATAENPOL (1u << 1)
+#define	HDMI_PHY_CONF0_SELDIPIF	(1u << 0)
 
 #define	HDMI_MC_SWRST_PIXEL	(1u << 0)
 #define	HDMI_MC_SWRST_TMDS	(1u << 1)
