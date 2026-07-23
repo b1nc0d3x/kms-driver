@@ -138,6 +138,8 @@ int	rk_cdn_dp_enable_mode(uint32_t clock, uint16_t hdisplay,
 	    uint16_t vtotal, uint32_t flags);
 int	rk_cdn_dp_set_video_active_first(bool active);
 int	rk_cdn_dp_get_cached_edid(device_t dev, uint8_t *buf, size_t len);
+int	rk_cdn_dp_audio_start(int channels, int sample_rate,
+	    int sample_width);
 
 /*
  * fusb302 helpers — declared in <dev/iicbus/usb/fusb302_var.h>, but
@@ -3102,12 +3104,30 @@ rk_kms_output_switch_task(void *arg, int pending __unused)
 static void
 rk_kms_usbc_bringup(struct rk_kms_softc *sc, const char *cause)
 {
-	int brerr, vaerr;
+	int brerr, vaerr, aerr;
 
 	brerr = rk_cdn_dp_auto_bringup_default();
 	vaerr = rk_cdn_dp_set_video_active_first(true);
-	DPRINTF(sc, "%s: auto_bringup=%d video_active=%d\n", cause, brerr,
-	    vaerr);
+	/*
+	 * Fire cdn_dp audio start as part of the bring-up so /dev/dsp0
+	 * plays as soon as a client opens it — matches the video path,
+	 * where scan-out is live the moment the cable trains.  Prior
+	 * to this, audio was gated behind a manual
+	 *   sudo sysctl dev.rk_cdn_dp.0.audio_start_now=1
+	 * step in rc.local (or by the operator), which broke on cable
+	 * unplug + replug: video came back automatically via usbc_poll
+	 * but audio did not.  Idempotent when already started; a
+	 * successive re-arm just re-latches the packetizer state.
+	 * Only fire when auto_bringup succeeded (bringup returns 0)
+	 * and video_active succeeded — running audio_start against
+	 * a not-yet-trained link puts cdn_dp's mailbox in a bad state.
+	 */
+	if (brerr == 0 && vaerr == 0)
+		aerr = rk_cdn_dp_audio_start(2, 48000, 16);
+	else
+		aerr = -1;
+	DPRINTF(sc, "%s: auto_bringup=%d video_active=%d audio=%d\n",
+	    cause, brerr, vaerr, aerr);
 }
 
 /*
