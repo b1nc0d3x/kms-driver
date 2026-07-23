@@ -3530,6 +3530,79 @@ rk_kms_output_dump_sysctl(SYSCTL_HANDLER_ARGS)
 	    hdmi_read1(sc, HDMI_PHY_CONF0),
 	    hdmi_read1(sc, HDMI_MC_LOCKONCLOCK),
 	    hdmi_read1(sc, HDMI_MC_CLKDIS));
+	device_printf(sc->dev,
+	    "output dump: WIN0 CTRL0=0x%08x CTRL2=0x%08x MST=0x%08x "
+	    "DSP_INFO=0x%08x DSP_ST=0x%08x SRC_ALPHA=0x%08x "
+	    "DST_ALPHA=0x%08x\n",
+	    vop_big_read(sc, VOP_REG_WIN0_CTRL0),
+	    vop_big_read(sc, VOP_REG_WIN0_CTRL2),
+	    vop_big_read(sc, VOP_REG_WIN0_YRGB_MST),
+	    vop_big_read(sc, VOP_REG_WIN0_DSP_INFO),
+	    vop_big_read(sc, VOP_REG_WIN0_DSP_ST),
+	    vop_big_read(sc, VOP_REG_WIN0_SRC_ALPHA),
+	    vop_big_read(sc, VOP_REG_WIN0_DST_ALPHA));
+	device_printf(sc->dev,
+	    "output dump: DSP_BG=0x%08x POST_SCL_CTRL=0x%08x "
+	    "POST_DSP_HACT=0x%08x POST_DSP_VACT=0x%08x\n",
+	    vop_big_read(sc, VOP_REG_DSP_BG),
+	    vop_big_read(sc, VOP_REG_POST_SCL_CTRL),
+	    vop_big_read(sc, VOP_REG_POST_DSP_HACT),
+	    vop_big_read(sc, VOP_REG_POST_DSP_VACT));
+	return (0);
+}
+
+/*
+ * Cursor-test sysctl.  Programs a driver-owned 64x64 ARGB scratch
+ * buffer into WIN2 at a fixed on-screen position, then latches.
+ * Bypasses Xorg's cursor path entirely so we can isolate the
+ * "does enabling WIN2 disturb WIN0" question independent of
+ * cursor_bo lifetime / DDX state.
+ *
+ *   sysctl dev.rk_kms.0.cursor_test=1   # enable, program at 200,200
+ *   sysctl dev.rk_kms.0.cursor_test=0   # blank + CFG_DONE latch
+ *
+ * Buffer is allocated on first enable, kept alive for the driver's
+ * lifetime.  Solid magenta pattern so any WIN2 output is visually
+ * obvious; alpha channel 0xff = fully opaque so per-pixel-alpha
+ * blend still exercises the same code path as the real cursor.
+ */
+static uint32_t *rk_kms_cursor_test_buf = NULL;
+static vm_paddr_t rk_kms_cursor_test_pa = 0;
+
+static int
+rk_kms_cursor_test_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_kms_softc *sc = arg1;
+	int val = 0;
+	int error;
+
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (!sc->hw_attached)
+		return (0);
+	if (val == 0) {
+		rk_kms_vop_program_cursor(sc, 0, 0, 0, 0, 0);
+		device_printf(sc->dev,
+		    "cursor_test: WIN2 blanked\n");
+		return (0);
+	}
+	if (rk_kms_cursor_test_buf == NULL) {
+		uint32_t i;
+		rk_kms_cursor_test_buf = contigmalloc(64 * 64 * 4,
+		    M_DEVBUF, M_WAITOK | M_ZERO, 0, ~0u, PAGE_SIZE, 0);
+		if (rk_kms_cursor_test_buf == NULL)
+			return (ENOMEM);
+		for (i = 0; i < 64 * 64; i++)
+			rk_kms_cursor_test_buf[i] = 0xffff00ff;	/* opaque magenta */
+		rk_kms_cursor_test_pa =
+		    pmap_kextract((vm_offset_t)rk_kms_cursor_test_buf);
+	}
+	rk_kms_vop_program_cursor(sc, rk_kms_cursor_test_pa, 64, 64,
+	    200, 200);
+	device_printf(sc->dev,
+	    "cursor_test: WIN2 enabled with 64x64 magenta at (200,200) pa=0x%jx\n",
+	    (uintmax_t)rk_kms_cursor_test_pa);
 	return (0);
 }
 
@@ -4582,26 +4655,27 @@ rk_kms_attach(device_t dev)
 	    "fresh config_hdmi / config_dp cycle (recovers a stuck "
 	    "session mid-use).");
 	/*
-	 * Default OFF: WIN2 activation on this VOP still visibly
-	 * disturbs WIN0 scanout (primary content dims / drops) on the
-	 * XYM W156F1 DP panel — see the "screen shifts / display
-	 * flickers in backlight mode" reports.  The DSP_ST0 offset and
-	 * blank/latch fixes are in place, but the underlying z-order /
-	 * mixer routing that lets WIN2 clobber WIN0 is not yet
-	 * identified.  Xorg's SW-cursor fallback via ENOTTY works.
-	 * Flip to 1 by sysctl to test HW cursor once that path is
-	 * fixed.
+	 * Default ON.  Earlier "screen shifts / backlight only"
+	 * reports were traced to two separate bugs both since fixed:
+	 * (a) cursor DSP_ST0 was in screen coords instead of DSP-
+	 *     timing coords, so past hdisplay-hact_start the cursor
+	 *     wrapped to the left edge (looked like a shift) and
+	 * (b) the DP→HDMI switch path hit an unrelated HDMI PHY
+	 *     bit-order bug that darkened the DP monitor.
+	 * WIN2 activation in isolation was proven clean via the
+	 * cursor_test sysctl (2026-07-23): programmed a 64x64
+	 * magenta test buffer into WIN2 with WIN0 scanning Xfce
+	 * simultaneously, both visible, no disturbance.
 	 */
-	sc->hw_cursor_enable = 0;
+	sc->hw_cursor_enable = 1;
 	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 	    "hw_cursor",
 	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
 	    rk_kms_hw_cursor_sysctl, "I",
-	    "Enable HW cursor plane (VOP WIN2 area 0, default OFF — "
-	    "WIN2 enable still disturbs WIN0 scanout).  Returns ENOTTY "
-	    "when off so Xorg draws a SW cursor into the primary fb; "
-	    "1→0 write blanks WIN2 immediately.");
+	    "Enable HW cursor plane (VOP WIN2 area 0, default ON).  "
+	    "Returns ENOTTY when off so Xorg draws a SW cursor into "
+	    "the primary fb; 1→0 write blanks WIN2 immediately.");
 	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 	    "output_dump",
@@ -4610,6 +4684,14 @@ rk_kms_attach(device_t dev)
 	    "Write any value to dump SOC_CON20 mux + VOP_SYS_CTRL + "
 	    "DSP_CTRL{0,1} + HDMI PHY_STAT/CONF + MC_LOCKONCLOCK into "
 	    "dmesg.  Diagnoses 'which output is really live'.");
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "cursor_test",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE, sc, 0,
+	    rk_kms_cursor_test_sysctl, "I",
+	    "Write 1 to program WIN2 with a magenta 64x64 test cursor at "
+	    "(200,200) — bypasses Xorg so we can isolate WIN2→WIN0 "
+	    "interference.  Write 0 to blank + latch WIN2.");
 	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 	    "win2_dump",
