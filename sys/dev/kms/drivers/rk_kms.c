@@ -3450,7 +3450,44 @@ rk_kms_vop_program_cursor(struct rk_kms_softc *sc, vm_paddr_t pa,
 	 */
 	x += (int32_t)sc->dsp_hact_start;
 	y += (int32_t)sc->dsp_vact_start;
+	/*
+	 * Right/bottom-edge clipping.  WIN2 area 0 renders a
+	 * (w × h) rectangle starting at DSP_ST0 — if that rect
+	 * extends past the DSP active area, the trailing pixels
+	 * land in HBLANK/VBLANK where VOP produces garbage (visible
+	 * as "cursor gets fuzzy near the right edge").  Shrink the
+	 * rendered rect so its bottom-right corner clips at
+	 * hact_start + hdisplay / vact_start + vdisplay.  MST base
+	 * stays the same — VOP just skips the extra source rows /
+	 * columns.
+	 */
+	/*
+	 * Stride is always the SOURCE-buffer stride (source w × 4B),
+	 * not the clipped visible width — VOP uses this to advance
+	 * from one row of the source to the next.  Setting stride to
+	 * clipped w makes row 1 start at 'pixel <clipped_w>' of row 0
+	 * (visible as horizontal streaking / fuzz near the right edge).
+	 */
 	stride_words = (w * 4u) / 4u;	/* ARGB8888 → 4B/pixel */
+	if (sc->crtc.mode_valid) {
+		int32_t hact_end = (int32_t)sc->dsp_hact_start +
+		    (int32_t)sc->crtc.mode.hdisplay;
+		int32_t vact_end = (int32_t)sc->dsp_vact_start +
+		    (int32_t)sc->crtc.mode.vdisplay;
+		int32_t remaining_w = hact_end - x;
+		int32_t remaining_h = vact_end - y;
+		if (remaining_w <= 0 || remaining_h <= 0) {
+			/* Cursor fully past the active area — blank WIN2. */
+			vop_big_write(sc, VOP_REG_WIN2_CTRL0, 0);
+			if (sc->commit_modeset & RK_KMS_STAGE_CFG_DONE)
+				vop_big_write(sc, VOP_REG_CFG_DONE, 0x00010001);
+			return;
+		}
+		if ((int32_t)w > remaining_w)
+			w = (uint32_t)remaining_w;
+		if ((int32_t)h > remaining_h)
+			h = (uint32_t)remaining_h;
+	}
 
 	/*
 	 * Zero WIN2_CTRL1 + areas 1/2/3 MSTs.  WIN2 has four sub-area
