@@ -1245,6 +1245,12 @@ grf_write(struct rk_kms_softc *sc, bus_size_t off, uint32_t val)
 }
 
 static inline uint32_t
+grf_read(struct rk_kms_softc *sc, bus_size_t off)
+{
+	return (bus_space_read_4(sc->bst, sc->grf_bsh, off));
+}
+
+static inline uint32_t
 pmu_read(struct rk_kms_softc *sc, bus_size_t off)
 {
 	return (bus_space_read_4(sc->bst, sc->pmu_bsh, off));
@@ -3426,6 +3432,41 @@ rk_kms_vop_program_cursor(struct rk_kms_softc *sc, vm_paddr_t pa,
  * matches what cursor_set / cursor_move most recently programmed.
  * Writing any value triggers a fresh dump into dmesg; read is a no-op.
  */
+/*
+ * Diagnostic: dump the state that controls which physical output
+ * VOP_BIG is currently feeding — SOC_CON20 mux, VOP SYS_CTRL enable
+ * bits, DSP_CTRL0 out-mode, HDMI PHY_STAT0, HDMI MC_LOCKONCLOCK,
+ * HDMI PHY_CONF0.  Write any non-zero to fire the dump into dmesg.
+ */
+static int
+rk_kms_output_dump_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_kms_softc *sc = arg1;
+	int val = 0;
+	int error;
+
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (!sc->hw_attached)
+		return (0);
+	device_printf(sc->dev,
+	    "output dump: SOC_CON20=0x%08x VOP_SYS_CTRL=0x%08x "
+	    "DSP_CTRL0=0x%08x DSP_CTRL1=0x%08x\n",
+	    grf_read(sc, GRF_SOC_CON20),
+	    vop_big_read(sc, VOP_REG_SYS_CTRL),
+	    vop_big_read(sc, VOP_REG_DSP_CTRL0),
+	    vop_big_read(sc, VOP_REG_DSP_CTRL1));
+	device_printf(sc->dev,
+	    "output dump: HDMI PHY_STAT0=0x%02x PHY_CONF0=0x%02x "
+	    "MC_LOCKONCLOCK=0x%02x MC_CLKDIS=0x%02x\n",
+	    hdmi_read1(sc, HDMI_PHY_STAT0),
+	    hdmi_read1(sc, HDMI_PHY_CONF0),
+	    hdmi_read1(sc, HDMI_MC_LOCKONCLOCK),
+	    hdmi_read1(sc, HDMI_MC_CLKDIS));
+	return (0);
+}
+
 static int
 rk_kms_win2_dump_sysctl(SYSCTL_HANDLER_ARGS)
 {
@@ -4421,6 +4462,14 @@ rk_kms_attach(device_t dev)
 	    "WIN2 enable still disturbs WIN0 scanout).  Returns ENOTTY "
 	    "when off so Xorg draws a SW cursor into the primary fb; "
 	    "1→0 write blanks WIN2 immediately.");
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "output_dump",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE, sc, 0,
+	    rk_kms_output_dump_sysctl, "I",
+	    "Write any value to dump SOC_CON20 mux + VOP_SYS_CTRL + "
+	    "DSP_CTRL{0,1} + HDMI PHY_STAT/CONF + MC_LOCKONCLOCK into "
+	    "dmesg.  Diagnoses 'which output is really live'.");
 	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 	    "win2_dump",
