@@ -245,9 +245,21 @@ static uint32_t rk_kms_vact_start(const struct drm_display_mode *m);
 #define	VOP_SYS_CTRL_MMU_EN	(1u << 20)
 #define	VOP_SYS_CTRL_MIPI_DUAL	(1u << 11)
 #define	VOP_SYS_CTRL_MIPI_EN	(1u << 15)
-#define	VOP_SYS_CTRL_ENABLE	(1u << 11)
+/*
+ * VOP_BIG SYS_CTRL output-enable bits.  Per RK3399 TRM / Linux
+ * drm/rockchip rk3399_output — bit 11 is the DP output enable
+ * (previously mis-labeled ENABLE), not a generic VOP-on switch.
+ * The VOP is 'on' when STANDBY (bit 22) is clear; there is no
+ * separate master-enable bit.  Setting DP_EN + HDMI_EN
+ * simultaneously feeds both downstream framers, which produces
+ * garbage on whichever is actually connected — always drive
+ * exactly one of {DP_EN, HDMI_EN} based on sc->output.
+ */
+#define	VOP_SYS_CTRL_DP_EN	(1u << 11)
 #define	VOP_SYS_CTRL_RGB_EN	(1u << 12)
 #define	VOP_SYS_CTRL_HDMI_EN	(1u << 13)
+#define	VOP_SYS_CTRL_EDP_EN	(1u << 14)
+#define	VOP_SYS_CTRL_MIPI_EN	(1u << 15)
 
 #define	VOP_DSP_OUT_MODE_MASK	0x0000000fu
 #define	VOP_DSP_OUT_MODE_AAAA	0x0000000fu	/* RGB+alpha 30bpp */
@@ -2377,8 +2389,18 @@ rk_kms_vop_program_timing(struct rk_kms_softc *sc,
 		DPRINTF(sc, "STAGE vop_sys STARTING\n");
 		sys_ctrl = vop_big_read(sc, VOP_REG_SYS_CTRL);
 		DPRINTF(sc, "STAGE vop_sys read=0x%x\n", sys_ctrl);
-		sys_ctrl &= ~(VOP_SYS_CTRL_STANDBY | VOP_SYS_CTRL_MMU_EN);
-		sys_ctrl |= VOP_SYS_CTRL_ENABLE | VOP_SYS_CTRL_RGB_EN |
+		sys_ctrl &= ~(VOP_SYS_CTRL_STANDBY | VOP_SYS_CTRL_MMU_EN |
+		    VOP_SYS_CTRL_EDP_EN | VOP_SYS_CTRL_MIPI_EN);
+		/*
+		 * rk_drm reference sets DP_EN + RGB_EN + HDMI_EN
+		 * unconditionally on both DP and HDMI paths — the actual
+		 * downstream routing is via the GRF SOC_CON20 mux, and
+		 * clearing the 'wrong' output-enable in VOP starves the
+		 * chosen framer (empirically: DP flickers colors when
+		 * HDMI_EN is not co-set alongside DP_EN).  Follow the
+		 * reference: enable all three, let the GRF mux pick.
+		 */
+		sys_ctrl |= VOP_SYS_CTRL_DP_EN | VOP_SYS_CTRL_RGB_EN |
 		    VOP_SYS_CTRL_HDMI_EN;
 		vop_big_write(sc, VOP_REG_SYS_CTRL, sys_ctrl);
 		DPRINTF(sc, "STAGE vop_sys DONE write=0x%x\n",
