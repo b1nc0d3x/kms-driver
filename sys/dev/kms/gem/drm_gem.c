@@ -20,6 +20,7 @@
 #include <sys/refcount.h>
 #include <sys/rwlock.h>
 #include <sys/sx.h>
+#include <sys/sysctl.h>
 
 #include <vm/vm.h>
 #include <vm/vm_extern.h>
@@ -35,6 +36,13 @@
 #include <kms/drm_gem.h>
 
 #include "kms_internal.h"
+
+SYSCTL_DECL(_kern_kms);
+vm_paddr_t kms_debug_last_gem_pa = 0;
+SYSCTL_QUAD(_kern_kms, OID_AUTO, last_gem_pa, CTLFLAG_RD,
+    &kms_debug_last_gem_pa, 0,
+    "Physical address (page 0) of the most recently created GEM object. "
+    "Test-only surface for cross-driver buffer-sharing bring-up.");
 
 /*
  * Per-file handle entry.  GEM objects live on the device-side list
@@ -232,6 +240,16 @@ retry_alloc:
 	dev->mmap_offset_counter += size;
 	TAILQ_INSERT_TAIL(&dev->gem_objects, obj, device_link);
 	sx_xunlock(&dev->gem_lock);
+
+	/*
+	 * Debug hook — remember the pa of page 0 of the most-recently
+	 * created GEM.  Read via the kern.kms.last_gem_pa sysctl by
+	 * cross-driver test rigs that need to map the same DRAM into
+	 * a peer accelerator's IOMMU (e.g. fgpu on Mali).  Not part
+	 * of any production ABI; strictly for kernel-side wiring of
+	 * PRIME-adjacent handshakes before real dmabuf export lands.
+	 */
+	kms_debug_last_gem_pa = VM_PAGE_TO_PHYS(obj->pages[0]);
 
 	return (obj);
 }
