@@ -866,6 +866,16 @@ struct rk_kms_softc {
 	 * kms/cardN/hotplug broadcast.
 	 */
 	bool				 usbc_last_attached;
+	/*
+	 * Set once the first poll tick has captured the initial
+	 * fusb302 attach state into usbc_last_attached.  Without
+	 * this the boot-time value is the M_ZERO false, so the first
+	 * poll on a system where the cable is already plugged in
+	 * would look like a false→true transition and fire a spurious
+	 * hotplug event during Xorg's initial atomic probe — the wedge
+	 * that has kept hotplug default-off.
+	 */
+	bool				 usbc_attached_seeded;
 
 	/*
 	 * Enable hotplug event dispatch (default OFF).  See usbc_poll
@@ -2855,7 +2865,23 @@ rk_kms_usbc_poll(void *arg)
 	if (sc->hotplug_enable != 0 &&
 	    fusb302_get_typec_status(fdev, &ts) == 0) {
 		now_attached = ts.attached;
-		if (now_attached != sc->usbc_last_attached) {
+		if (!sc->usbc_attached_seeded) {
+			/*
+			 * First poll after boot / driver load — capture the
+			 * current fusb302 attach state without firing a
+			 * hotplug event.  The connector status was already
+			 * set to connected in attach; the initial state is
+			 * discovered by userspace via GETCONNECTOR, not via
+			 * hotplug (which is for CHANGES only, matching Linux
+			 * DRM behaviour).  Firing a spurious false→true
+			 * event during Xorg's initial atomic probe is what
+			 * historically wedged the box.
+			 */
+			sc->usbc_last_attached = now_attached;
+			sc->usbc_attached_seeded = true;
+			DPRINTF(sc, "hotplug: seeded initial attached=%d\n",
+			    now_attached);
+		} else if (now_attached != sc->usbc_last_attached) {
 			enum drm_connector_status new_status = now_attached ?
 			    connector_status_connected :
 			    connector_status_disconnected;
@@ -3828,13 +3854,15 @@ rk_kms_attach(device_t dev)
 	    "cache_flush_fb", CTLFLAG_RW, &sc->cache_flush_fb, 0,
 	    "DC CVAC the fb pages before each VOP DMA program "
 	    "(default on — VOP is non-coherent on RK3399)");
-	sc->hotplug_enable = 0;
+	sc->hotplug_enable = 1;
 	SYSCTL_ADD_INT(device_get_sysctl_ctx(dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 	    "hotplug", CTLFLAG_RW, &sc->hotplug_enable, 0,
-	    "Enable DP hotplug event dispatch (default off — "
-	    "kms_connector_hotplug's per-fd events have wedged Xorg's "
-	    "atomic probe path on boot)");
+	    "Enable DP hotplug event dispatch (default on).  The first "
+	    "poll after boot seeds usbc_last_attached from the current "
+	    "fusb302 state without firing an event, so a cable already "
+	    "plugged in at boot no longer triggers a spurious hotplug "
+	    "against Xorg's atomic probe.");
 	/*
 	 * Default OFF: WIN2 activation on this VOP still visibly
 	 * disturbs WIN0 scanout (primary content dims / drops) on the
