@@ -756,7 +756,20 @@ struct rk_kms_softc {
 	struct drm_crtc			 crtc;
 	struct drm_plane		 primary;
 	struct drm_encoder		 encoder;
+	/*
+	 * Two DRM connectors — one per physical port on the RockPro64.
+	 * `connector` is the primary reference used everywhere: its
+	 * type at creation reflects the currently-active output
+	 * (HDMIA when video_src=HDMI, DisplayPort when video_src=DP).
+	 * `alt_connector` exposes the OTHER port so xrandr / wlroots
+	 * see the full topology and can pick either.  Both share the
+	 * single VOP_BIG-driven encoder — only one at a time carries
+	 * pixels (GRF SOC_CON20[6] mux), tracked via video_src.
+	 * Per-connector status mirrors the HDMI HPD / DP-trained bits
+	 * pushed by usbc_poll.
+	 */
 	struct drm_connector		 connector;
+	struct drm_connector		 alt_connector;
 
 	/*
 	 * MMIO mappings.  bsh / size pairs follow the rk_drm reference.
@@ -2927,6 +2940,27 @@ rk_kms_refresh_video_connected(struct rk_kms_softc *sc)
 		(void)kms_object_property_set_value(&sc->connector.base,
 		    sc->prop_video_connected, mask);
 	}
+	/*
+	 * Update per-connector status so xrandr / wlroots see the real
+	 * physical HPD.  Primary connector stays 'connected' because
+	 * it is the currently-active output — SETCRTC needs the
+	 * connector marked connected even when the physical sink is
+	 * momentarily unplugged, otherwise the compositor collapses
+	 * the desktop.  Alt connector tracks its port's HPD directly.
+	 */
+	if (sc->alt_connector.dev != NULL) {
+		enum drm_connector_status new_alt;
+		bool alt_up = (sc->output == RK_KMS_OUT_DP) ?
+		    sc->hdmi_connected : sc->dp_connected;
+		new_alt = alt_up ? connector_status_connected :
+		    connector_status_disconnected;
+		if (sc->alt_connector.status != new_alt) {
+			sc->alt_connector.status = new_alt;
+			if (sc->hotplug_enable != 0)
+				kms_connector_hotplug(&sc->alt_connector,
+				    new_alt);
+		}
+	}
 }
 
 /*
@@ -4211,14 +4245,44 @@ rk_kms_topology_init(struct rk_kms_softc *sc)
 		return (error);
 	sc->encoder.possible_crtcs = crtc_mask;
 
+	/*
+	 * Primary connector matches the currently-active output (per
+	 * sc->output at attach — usually DP after rc.local runs).
+	 * Alt connector exposes the OTHER port.  Both attach to the
+	 * same encoder — VOP_BIG has one output stream, the GRF mux
+	 * selects which downstream framer receives it.
+	 */
+	{
+	int prim_type = (sc->output == RK_KMS_OUT_DP) ?
+	    DRM_MODE_CONNECTOR_DisplayPort : DRM_MODE_CONNECTOR_HDMIA;
+	int alt_type = (sc->output == RK_KMS_OUT_DP) ?
+	    DRM_MODE_CONNECTOR_HDMIA : DRM_MODE_CONNECTOR_DisplayPort;
+
 	error = kms_connector_init(sc->drm_dev, &sc->connector,
-	    &rk_kms_connector_funcs, DRM_MODE_CONNECTOR_HDMIA);
+	    &rk_kms_connector_funcs, prim_type);
 	if (error != 0)
 		return (error);
 	sc->connector.status = connector_status_connected;
 	sc->connector.mm_width = 600;
 	sc->connector.mm_height = 340;
 	kms_connector_attach_encoder(&sc->connector, &sc->encoder);
+
+	error = kms_connector_init(sc->drm_dev, &sc->alt_connector,
+	    &rk_kms_connector_funcs, alt_type);
+	if (error != 0)
+		return (error);
+	/*
+	 * Alt connector's initial status = whichever HPD bit reflects
+	 * its physical port.  Real HPD state is refreshed by
+	 * usbc_poll's refresh_video_connected on the first tick.
+	 * Start pessimistic: disconnected → userspace won't try to
+	 * SETCRTC against it until poll confirms.
+	 */
+	sc->alt_connector.status = connector_status_disconnected;
+	sc->alt_connector.mm_width = 600;
+	sc->alt_connector.mm_height = 340;
+	kms_connector_attach_encoder(&sc->alt_connector, &sc->encoder);
+	}
 
 	/*
 	 * DRM connector properties — production surface mirroring the
@@ -4260,6 +4324,8 @@ rk_kms_topology_init(struct rk_kms_softc *sc)
 static void
 rk_kms_topology_teardown(struct rk_kms_softc *sc)
 {
+	if (sc->alt_connector.dev != NULL)
+		kms_connector_cleanup(&sc->alt_connector);
 	kms_connector_cleanup(&sc->connector);
 	kms_encoder_cleanup(&sc->encoder);
 	kms_plane_cleanup(&sc->primary);
