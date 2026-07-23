@@ -210,6 +210,24 @@ static void rk_kms_usbc_poll(void *arg);
 #define	VOP_REG_SYS_CTRL	0x0008
 #define	VOP_REG_DSP_CTRL0	0x0010
 #define	VOP_REG_DSP_CTRL1	0x0014
+/*
+ * VOP interrupt block.  Layout matches Linux drm/rockchip
+ * rk3366_vop_intr (used by rk3399_vop_big).  Bit assignments in the
+ * low 16 come from rk3368_vop_intrs[] (index → bit):
+ *   bit 0 = FS_INTR       (frame-start, i.e. vblank)
+ *   bit 3 = LINE_FLAG_INTR
+ *   bit 5 = BUS_ERROR_INTR
+ * INTR_EN0 and INTR_CLEAR0 are self-latched: the high 16 bits are a
+ * write-enable mask, the low 16 bits are the value.  Writing
+ * 0x00010001 to INTR_EN0 enables FS_INTR; 0x00010001 to INTR_CLEAR0
+ * acks it.  INTR_STATUS0 is read-only latched status.
+ */
+#define	VOP_REG_INTR_EN0	0x0280
+#define	VOP_REG_INTR_CLEAR0	0x0284
+#define	VOP_REG_INTR_STATUS0	0x0288
+#define	VOP_INTR_FS		(1u << 0)
+#define	VOP_INTR_LINE_FLAG	(1u << 3)
+#define	VOP_INTR_BUS_ERROR	(1u << 5)
 #define	VOP_REG_DSP_HTOTAL	0x0188
 #define	VOP_REG_DSP_HACT	0x018c
 #define	VOP_REG_DSP_VTOTAL	0x0190
@@ -793,6 +811,16 @@ struct rk_kms_softc {
 	int				 vblank_ticks;
 	bool				 vblank_running;
 	int				 vblank_enable;
+	/*
+	 * Real VOP frame-start IRQ resources — populated by
+	 * rk_kms_setup_vblank_irq when the hw.rk_kms.attach_vblank_irq
+	 * loader tunable is 1.  When present, replaces the soft-timer
+	 * vblank source: kms_vblank_handler runs from the ithread on
+	 * every real vsync instead of a wall-clock timer approximation.
+	 */
+	struct resource			*vblank_irq_res;
+	void				*vblank_irq_cookie;
+	bool				 vblank_irq_active;
 
 	/*
 	 * Optional DCLK_VOP0 soft-reset pulse inside the vop_timing stage.
@@ -2925,6 +2953,30 @@ reschedule:
  * any pending FLIP_COMPLETE event from a PAGE_FLIP_EVENT-armed
  * page-flip.  Re-enqueues itself until vblank_running goes false.
  */
+/*
+ * Real VOP frame-start ISR.  Runs in an ithread (bus_setup_intr with
+ * filter=NULL) so it's free to take sx locks — kms_vblank_handler
+ * grabs mode_config.mutex.  Acks the interrupt via the self-latched
+ * INTR_CLEAR0 write, then dispatches into the framework.  Every
+ * queued PAGE_FLIP_EVENT / WAIT_VBLANK sleeper wakes on the real
+ * scanout raster origin instead of a wall-clock timer that drifts
+ * relative to actual video output.
+ */
+static void
+rk_kms_vblank_isr(void *arg)
+{
+	struct rk_kms_softc *sc = arg;
+	uint32_t status;
+
+	status = vop_big_read(sc, VOP_REG_INTR_STATUS0) & 0xffff;
+	if ((status & VOP_INTR_FS) == 0)
+		return;
+	/* Self-latched ack — high 16 = write-enable mask. */
+	vop_big_write(sc, VOP_REG_INTR_CLEAR0,
+	    ((uint32_t)VOP_INTR_FS << 16) | VOP_INTR_FS);
+	kms_vblank_handler(&sc->crtc);
+}
+
 static void
 rk_kms_vblank_task(void *arg, int pending __unused)
 {
@@ -2944,6 +2996,20 @@ rk_kms_vblank_start(struct rk_kms_softc *sc,
 {
 	uint32_t hz_v;
 
+	/*
+	 * When the real IRQ is armed, arm the VOP's frame-start interrupt
+	 * on this modeset (idempotent — re-enabling is a no-op) and skip
+	 * the soft-timer entirely.  If IRQ setup ever tore itself down,
+	 * fall back to the soft path so the framework still gets ticks.
+	 */
+	if (sc->vblank_irq_active) {
+		vop_big_write(sc, VOP_REG_INTR_CLEAR0,
+		    ((uint32_t)VOP_INTR_FS << 16) | VOP_INTR_FS);
+		vop_big_write(sc, VOP_REG_INTR_EN0,
+		    ((uint32_t)VOP_INTR_FS << 16) | VOP_INTR_FS);
+		DPRINTF(sc, "vblank IRQ armed: VOP FS_INTR enabled\n");
+		return;
+	}
 	if (!sc->vblank_enable || sc->vblank_running)
 		return;
 	hz_v = kms_mode_vrefresh(mode);
@@ -3746,6 +3812,125 @@ rk_kms_hw_detach(struct rk_kms_softc *sc)
 	sc->hw_attached = false;
 }
 
+/*
+ * Loader-tunable knob for the real vblank IRQ path.  Wiring the VOP
+ * frame-start IRQ requires borrowing the interrupts property from a
+ * DT node (vop@ff900000) that our driver doesn't own — a
+ * misconfiguration or firmware quirk can produce a spurious IRQ
+ * storm that stalls the box before the console is ready.  Per the
+ * "no attach-time wedgy ops without a tunable gate" rule, gate this
+ * behind a read-only tunable that defaults to 0.  Users opt in via
+ * /boot/loader.conf:
+ *     hw.rk_kms.attach_vblank_irq="1"
+ * The soft-timer path remains as the fallback whenever this stays
+ * off, so shipping default is safe.
+ */
+static SYSCTL_NODE(_hw, OID_AUTO, rk_kms, CTLFLAG_RD | CTLFLAG_MPSAFE, NULL,
+    "rk_kms driver globals");
+static int rk_kms_attach_vblank_irq_tunable = 0;
+SYSCTL_INT(_hw_rk_kms, OID_AUTO, attach_vblank_irq,
+    CTLFLAG_RDTUN, &rk_kms_attach_vblank_irq_tunable, 0,
+    "At attach time, borrow the vop@ff900000 IRQ and replace the "
+    "60Hz soft-timer with a real VOP FS_INTR handler (default 0 — "
+    "soft-timer).");
+
+/*
+ * Borrow the VOP_BIG frame-start IRQ.  We are not the parent of the
+ * VOP DT node, so we appropriate its `interrupts` property by
+ * appending an entry to our own resource_list via
+ * ofw_bus_intr_to_rl, then bus_alloc_resource_any/bus_setup_intr as
+ * if it had always been ours.  On any failure we leave the soft-
+ * timer path untouched — success sets vblank_irq_active which
+ * rk_kms_vblank_start uses to skip the soft-timer branch.
+ */
+static int
+rk_kms_setup_vblank_irq(struct rk_kms_softc *sc)
+{
+	struct resource_list *rl;
+	phandle_t vop_node;
+	int rid;
+	int error;
+
+	vop_node = OF_finddevice("/vop@ff900000");
+	if (vop_node == -1 || vop_node == 0) {
+		device_printf(sc->dev,
+		    "vblank_irq: /vop@ff900000 not found in DT\n");
+		return (ENOENT);
+	}
+	rl = BUS_GET_RESOURCE_LIST(device_get_parent(sc->dev), sc->dev);
+	if (rl == NULL) {
+		device_printf(sc->dev,
+		    "vblank_irq: no resource_list on our device\n");
+		return (ENXIO);
+	}
+	/*
+	 * Append vop-big's interrupts to our RL.  The helper walks the
+	 * interrupt-parent chain via ofw_bus_search_iparent, so we get
+	 * a correctly-resolved GIC SPI regardless of whether iparent
+	 * is inherited or explicitly set on the vop node.
+	 */
+	error = ofw_bus_intr_to_rl(sc->dev, vop_node, rl, NULL);
+	if (error != 0) {
+		device_printf(sc->dev,
+		    "vblank_irq: intr_to_rl failed %d\n", error);
+		return (error);
+	}
+	rid = 0;
+	sc->vblank_irq_res = bus_alloc_resource_any(sc->dev, SYS_RES_IRQ,
+	    &rid, RF_ACTIVE | RF_SHAREABLE);
+	if (sc->vblank_irq_res == NULL) {
+		device_printf(sc->dev,
+		    "vblank_irq: bus_alloc_resource_any failed\n");
+		return (ENXIO);
+	}
+	error = bus_setup_intr(sc->dev, sc->vblank_irq_res,
+	    INTR_TYPE_MISC | INTR_MPSAFE, NULL, rk_kms_vblank_isr, sc,
+	    &sc->vblank_irq_cookie);
+	if (error != 0) {
+		device_printf(sc->dev,
+		    "vblank_irq: bus_setup_intr failed %d\n", error);
+		bus_release_resource(sc->dev, SYS_RES_IRQ, rid,
+		    sc->vblank_irq_res);
+		sc->vblank_irq_res = NULL;
+		return (error);
+	}
+	/*
+	 * Do NOT enable VOP_INTR_EN0 here — a stray FS_INTR while cdn_dp
+	 * or vpll is still being configured would fire the handler on
+	 * an unlocked pipeline.  rk_kms_vblank_start arms it after the
+	 * first successful modeset.
+	 */
+	sc->vblank_irq_active = true;
+	device_printf(sc->dev,
+	    "vblank_irq: real VOP FS_INTR wired (irq res=%p)\n",
+	    sc->vblank_irq_res);
+	return (0);
+}
+
+static void
+rk_kms_teardown_vblank_irq(struct rk_kms_softc *sc)
+{
+	if (!sc->vblank_irq_active)
+		return;
+	/*
+	 * Disable the IRQ source before tearing down the handler — a
+	 * fire between bus_teardown_intr and bus_release_resource
+	 * would deref a freed cookie.
+	 */
+	if (sc->hw_attached)
+		vop_big_write(sc, VOP_REG_INTR_EN0,
+		    ((uint32_t)VOP_INTR_FS << 16) | 0u);
+	if (sc->vblank_irq_cookie != NULL)
+		bus_teardown_intr(sc->dev, sc->vblank_irq_res,
+		    sc->vblank_irq_cookie);
+	sc->vblank_irq_cookie = NULL;
+	if (sc->vblank_irq_res != NULL)
+		bus_release_resource(sc->dev, SYS_RES_IRQ, 0,
+		    sc->vblank_irq_res);
+	sc->vblank_irq_res = NULL;
+	sc->vblank_irq_active = false;
+}
+
 static int
 rk_kms_probe(device_t dev)
 {
@@ -3800,6 +3985,14 @@ rk_kms_attach(device_t dev)
 		rk_kms_hw_detach(sc);
 		return (error);
 	}
+
+	/*
+	 * Real VOP frame-start IRQ (opt-in via
+	 * hw.rk_kms.attach_vblank_irq="1" in loader.conf).  Failure is
+	 * non-fatal — the soft-timer path stays wired.
+	 */
+	if (rk_kms_attach_vblank_irq_tunable != 0)
+		(void)rk_kms_setup_vblank_irq(sc);
 
 	SYSCTL_ADD_INT(device_get_sysctl_ctx(dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
@@ -3971,6 +4164,12 @@ rk_kms_detach(device_t dev)
 	}
 	sc->usbc_poll_armed = false;
 	callout_drain(&sc->usbc_poll);
+	/*
+	 * Tear down the borrowed VOP IRQ before anything else touches
+	 * MMIO — pending or in-flight FS_INTR must not run against a
+	 * driver whose softc is midway through free.
+	 */
+	rk_kms_teardown_vblank_irq(sc);
 	if (sc->cursor_bo != NULL) {
 		kms_gem_object_put(sc->cursor_bo);
 		sc->cursor_bo = NULL;
