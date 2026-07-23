@@ -912,6 +912,28 @@ struct rk_kms_softc {
 	int				 hotplug_enable;
 
 	/*
+	 * Output-source detection & switching (video_src / audio_src
+	 * sysctls, later mirrored via DRM connector properties).
+	 *
+	 * hdmi_connected: dw-hdmi PHY_STAT0[1] HPD, refreshed by
+	 *     usbc_poll every 500ms.
+	 * dp_connected:   fusb302 CC-line attach + cdn_dp fw stage
+	 *     >= 19 (link trained).  Updated from usbc_poll.
+	 * auto_switch:    if 1, on active-output disconnect + the other
+	 *     connected, enqueue an output-switch task automatically.
+	 * output_task:    deferred switch executor — runs on
+	 *     taskqueue_thread so config_hdmi / config_dp can sleep on
+	 *     cdn_dp mailbox / dw-hdmi PHY brings-up.
+	 * output_target:  set_video_src writes the requested destination
+	 *     here; output_task reads it and drives the transition.
+	 */
+	bool				 hdmi_connected;
+	bool				 dp_connected;
+	int				 auto_switch;
+	int				 output_target;
+	struct task			 output_task;
+
+	/*
 	 * EDID probe latch — set once the first successful
 	 * rk_cdn_dp_get_cached_edid parse pushes the blob into the
 	 * DRM connector property.  get_modes re-checks this every call
@@ -2796,6 +2818,124 @@ rk_kms_config_sysctl(SYSCTL_HANDLER_ARGS)
 }
 
 /*
+ * dw-hdmi hot-plug detect.  HDMI_PHY_STAT0[1] latches the HPD line;
+ * a connected sink drives it high.  Safe to call from softclock — no
+ * locks required, just a byte MMIO read.
+ */
+static bool
+rk_kms_hdmi_hpd_read(struct rk_kms_softc *sc)
+{
+	if (!sc->hw_attached)
+		return (false);
+	return ((hdmi_read1(sc, HDMI_PHY_STAT0) & 0x02) != 0);
+}
+
+/*
+ * Refresh the video_connected shadow flags.  Called from usbc_poll
+ * every 500 ms so sysctl / DRM-property readers get near-live state
+ * without doing MMIO on every ioctl.
+ */
+static void
+rk_kms_refresh_video_connected(struct rk_kms_softc *sc)
+{
+	sc->hdmi_connected = rk_kms_hdmi_hpd_read(sc);
+	/*
+	 * dp_connected == fusb302 CC attached AND we've completed at
+	 * least one auto-bringup cycle for the current attach_seq (so
+	 * cdn_dp has trained the link and the sink has been walked
+	 * through DP altmode entry).  Without the second half, we would
+	 * report DP as connected while the mailbox firmware is still
+	 * mid-training, and set_video_src → config_dp would race the
+	 * in-flight bring-up.
+	 */
+	sc->dp_connected = sc->usbc_last_attached &&
+	    sc->usbc_attach_seq_done != 0;
+}
+
+/*
+ * Shared "switch to output X" primitive — reachable from the
+ * sysctl set_video_src handler, the auto-switch task, and (future)
+ * the DRM connector property setter.  Runs on a sleepable context
+ * (taskqueue_thread), never softclock.
+ *
+ * out ∈ { RK_KMS_OUT_HDMI (0), RK_KMS_OUT_DP (1) }.  Anything else
+ * returns EINVAL.  Idempotent: switching to the currently active
+ * output is a no-op unless the caller passes force=true (used for
+ * the "reset" sysctl that recovers mid-use).
+ */
+static int
+rk_kms_set_video_src(struct rk_kms_softc *sc, int out, bool force)
+{
+	int error;
+
+	if (!sc->hw_attached)
+		return (ENXIO);
+	if (out != RK_KMS_OUT_HDMI && out != RK_KMS_OUT_DP)
+		return (EINVAL);
+	if (!force && sc->output == out && sc->config_active != 0) {
+		DPRINTF(sc, "set_video_src: no-op, already on %d\n", out);
+		return (0);
+	}
+	if (out == RK_KMS_OUT_HDMI) {
+		if (!sc->hdmi_connected)
+			DPRINTF(sc, "set_video_src: HDMI HPD absent, "
+			    "trying anyway\n");
+		error = rk_kms_config_hdmi(sc);
+	} else {
+		if (!sc->dp_connected)
+			DPRINTF(sc, "set_video_src: DP not trained, "
+			    "trying anyway\n");
+		error = rk_kms_config_dp(sc);
+	}
+	if (error != 0) {
+		device_printf(sc->dev,
+		    "set_video_src: config_%s failed rc=%d\n",
+		    out == RK_KMS_OUT_HDMI ? "hdmi" : "dp", error);
+		return (error);
+	}
+	/*
+	 * Restore commit_modeset to STAGE_ALL — both config_hdmi and
+	 * config_dp intentionally clear it at the tail so a subsequent
+	 * userspace SETCRTC with mode=NULL can't push VOP into standby.
+	 * But an operator-visible switch DOES want Xorg's next SETCRTC
+	 * to run the full pipeline (WIN0 fb bind) — otherwise we get
+	 * the "dark panel with backlight" failure mode.  Bump it back
+	 * so the immediately-following kms_connector_hotplug → Xorg
+	 * SETCRTC fires all seven stages.
+	 */
+	sc->commit_modeset = RK_KMS_STAGE_ALL;
+	/*
+	 * Broadcast the topology change to every drm_file open on the
+	 * device — Xorg's modesetting DDX subscribes and re-fires
+	 * SETCRTC on receipt, which is what actually binds the fb into
+	 * WIN0 on the newly-active output.
+	 */
+	kms_connector_hotplug(&sc->connector,
+	    connector_status_connected);
+	device_printf(sc->dev, "video_src -> %s (hpd hdmi=%d dp=%d)\n",
+	    out == RK_KMS_OUT_HDMI ? "HDMI" : "DP",
+	    sc->hdmi_connected, sc->dp_connected);
+	return (0);
+}
+
+/*
+ * Deferred output-switch task.  Enqueued from usbc_poll (softclock
+ * context, can't sleep) so the actual config_hdmi / config_dp work
+ * runs where it may sleep on cdn_dp mailbox roundtrips + dw-hdmi
+ * PHY brings-up.  output_target holds the requested destination —
+ * usbc_poll writes it before enqueue, we read it here.
+ */
+static void
+rk_kms_output_switch_task(void *arg, int pending __unused)
+{
+	struct rk_kms_softc *sc = arg;
+
+	if (!sc->hw_attached)
+		return;
+	(void)rk_kms_set_video_src(sc, sc->output_target, true);
+}
+
+/*
  * Run cdn_dp's full 19-stage bring-up + frame video-active arm.
  * Shared between the sysctl trigger and the altmode-entry poller.
  * Both calls are idempotent; on a link that's already trained this
@@ -2810,6 +2950,92 @@ rk_kms_usbc_bringup(struct rk_kms_softc *sc, const char *cause)
 	vaerr = rk_cdn_dp_set_video_active_first(true);
 	DPRINTF(sc, "%s: auto_bringup=%d video_active=%d\n", cause, brerr,
 	    vaerr);
+}
+
+/*
+ * video_src sysctl: read returns the currently active output
+ * (0=HDMI, 1=DP).  Write requests a switch; the shared
+ * rk_kms_set_video_src helper does the transition — teardown of
+ * current output implicit via config_hdmi / config_dp, then
+ * kms_connector_hotplug so Xorg refires SETCRTC on the new one.
+ * Write from a sysctl context runs synchronously (already in a
+ * sleepable thread), so we skip the taskqueue defer here.
+ */
+static int
+rk_kms_video_src_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_kms_softc *sc = arg1;
+	int val = sc->output;
+	int error;
+
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	return (rk_kms_set_video_src(sc, val, false));
+}
+
+/*
+ * audio_src sysctl.  In this first cut audio piggybacks on video
+ * — whichever monitor is being scanned out also carries the audio
+ * packets that dp_audio / hdmi_audio infoframes push.  Independent
+ * routing (HDMI video + DP audio, or the reverse) is a later
+ * feature that will add per-channel mailbox commands; for now we
+ * return video_src and reject sets that don't match.
+ */
+static int
+rk_kms_audio_src_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_kms_softc *sc = arg1;
+	int val = sc->output;
+	int error;
+
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val != sc->output)
+		return (EOPNOTSUPP);	/* independent audio routing TBD */
+	return (0);
+}
+
+/*
+ * video_connected sysctl (RO).  Bitmask: bit RK_KMS_OUT_HDMI set if
+ * HDMI HPD asserted, bit RK_KMS_OUT_DP set if the USB-C cable is
+ * attached and cdn_dp has completed one bring-up cycle.  Refreshed
+ * every 500 ms by usbc_poll; readers see the last cached value.
+ */
+static int
+rk_kms_video_connected_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_kms_softc *sc = arg1;
+	int mask = 0;
+
+	if (sc->hdmi_connected)
+		mask |= (1u << RK_KMS_OUT_HDMI);
+	if (sc->dp_connected)
+		mask |= (1u << RK_KMS_OUT_DP);
+	return (sysctl_handle_int(oidp, &mask, 0, req));
+}
+
+/*
+ * reset sysctl (W).  Write any non-zero value to force the
+ * currently active output through a fresh config_hdmi / config_dp
+ * cycle — useful when a live session went stale (fuzzy scan-out
+ * from a stuck fb pointer, DP HPD glitch that didn't take out the
+ * link fully, etc.).  Read is a no-op.
+ */
+static int
+rk_kms_reset_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_kms_softc *sc = arg1;
+	int val = 0;
+	int error;
+
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val == 0)
+		return (0);
+	return (rk_kms_set_video_src(sc, sc->output, true));
 }
 
 /*
@@ -2867,6 +3093,28 @@ rk_kms_usbc_poll(void *arg)
 
 	if (!sc->usbc_poll_armed)
 		return;
+	/*
+	 * Refresh HDMI HPD + DP-trained shadows regardless of which
+	 * output is currently active — auto_switch needs both.
+	 */
+	rk_kms_refresh_video_connected(sc);
+	if (sc->auto_switch != 0) {
+		bool active_up = (sc->output == RK_KMS_OUT_HDMI) ?
+		    sc->hdmi_connected : sc->dp_connected;
+		bool other_up = (sc->output == RK_KMS_OUT_HDMI) ?
+		    sc->dp_connected : sc->hdmi_connected;
+		if (!active_up && other_up) {
+			int target = (sc->output == RK_KMS_OUT_HDMI) ?
+			    RK_KMS_OUT_DP : RK_KMS_OUT_HDMI;
+			device_printf(sc->dev,
+			    "auto_switch: %s dropped, switching to %s\n",
+			    sc->output == RK_KMS_OUT_HDMI ? "HDMI" : "DP",
+			    target == RK_KMS_OUT_HDMI ? "HDMI" : "DP");
+			sc->output_target = target;
+			taskqueue_enqueue(taskqueue_thread,
+			    &sc->output_task);
+		}
+	}
 	if (sc->dp_enable == 0 || sc->output != RK_KMS_OUT_DP)
 		goto reschedule;
 
@@ -3953,6 +4201,7 @@ rk_kms_attach(device_t dev)
 	sc->dev = dev;
 	TIMEOUT_TASK_INIT(taskqueue_thread, &sc->vblank_task, 0,
 	    rk_kms_vblank_task, sc);
+	TASK_INIT(&sc->output_task, 0, rk_kms_output_switch_task, sc);
 
 	error = rk_kms_hw_attach(sc);
 	if (error != 0) {
@@ -4056,6 +4305,49 @@ rk_kms_attach(device_t dev)
 	    "fusb302 state without firing an event, so a cable already "
 	    "plugged in at boot no longer triggers a spurious hotplug "
 	    "against Xorg's atomic probe.");
+	/*
+	 * Video/audio source detection + switching sysctls.  These are
+	 * the testing surface; production callers will use the mirrored
+	 * DRM connector properties once that layer lands.
+	 */
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "video_src",
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
+	    rk_kms_video_src_sysctl, "I",
+	    "Active video output: 0=HDMI, 1=DP.  Write to switch (does "
+	    "the full teardown + config + hotplug-notify sequence).");
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "audio_src",
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
+	    rk_kms_audio_src_sysctl, "I",
+	    "Active audio output: 0=HDMI, 1=DP.  In this version audio "
+	    "follows video; writes that don't match video_src return "
+	    "EOPNOTSUPP (independent routing TBD).");
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "video_connected",
+	    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0,
+	    rk_kms_video_connected_sysctl, "I",
+	    "Connected-output bitmask: bit0=HDMI HPD, bit1=DP trained.  "
+	    "Refreshed every 500 ms by usbc_poll.");
+	sc->auto_switch = 0;
+	SYSCTL_ADD_INT(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "auto_switch", CTLFLAG_RW, &sc->auto_switch, 0,
+	    "When 1, usbc_poll auto-fires an output switch to the "
+	    "remaining connected sink whenever the active output drops.  "
+	    "Default 0 — operator confirms before touching production "
+	    "output routing.");
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "reset",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE, sc, 0,
+	    rk_kms_reset_sysctl, "I",
+	    "Write any non-zero to force the current output through a "
+	    "fresh config_hdmi / config_dp cycle (recovers a stuck "
+	    "session mid-use).");
 	/*
 	 * Default OFF: WIN2 activation on this VOP still visibly
 	 * disturbs WIN0 scanout (primary content dims / drops) on the
@@ -4164,6 +4456,12 @@ rk_kms_detach(device_t dev)
 	}
 	sc->usbc_poll_armed = false;
 	callout_drain(&sc->usbc_poll);
+	/*
+	 * Drain any in-flight or queued output-switch task before we
+	 * touch MMIO — the task's config_hdmi/config_dp would panic
+	 * against a partially-detached softc.
+	 */
+	taskqueue_drain(taskqueue_thread, &sc->output_task);
 	/*
 	 * Tear down the borrowed VOP IRQ before anything else touches
 	 * MMIO — pending or in-flight FS_INTR must not run against a
