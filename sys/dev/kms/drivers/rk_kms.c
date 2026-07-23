@@ -3835,16 +3835,27 @@ rk_kms_attach(device_t dev)
 	    "Enable DP hotplug event dispatch (default off — "
 	    "kms_connector_hotplug's per-fd events have wedged Xorg's "
 	    "atomic probe path on boot)");
-	sc->hw_cursor_enable = 1;
+	/*
+	 * Default OFF: WIN2 activation on this VOP still visibly
+	 * disturbs WIN0 scanout (primary content dims / drops) on the
+	 * XYM W156F1 DP panel — see the "screen shifts / display
+	 * flickers in backlight mode" reports.  The DSP_ST0 offset and
+	 * blank/latch fixes are in place, but the underlying z-order /
+	 * mixer routing that lets WIN2 clobber WIN0 is not yet
+	 * identified.  Xorg's SW-cursor fallback via ENOTTY works.
+	 * Flip to 1 by sysctl to test HW cursor once that path is
+	 * fixed.
+	 */
+	sc->hw_cursor_enable = 0;
 	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 	    "hw_cursor",
 	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
 	    rk_kms_hw_cursor_sysctl, "I",
-	    "Enable HW cursor plane (VOP WIN2 area 0, default on — "
-	    "returns ENOTTY when off so Xorg draws a SW cursor into the "
-	    "primary fb; 1→0 write also blanks WIN2 immediately so a "
-	    "leftover HW cursor doesn't double with Xorg's SW cursor)");
+	    "Enable HW cursor plane (VOP WIN2 area 0, default OFF — "
+	    "WIN2 enable still disturbs WIN0 scanout).  Returns ENOTTY "
+	    "when off so Xorg draws a SW cursor into the primary fb; "
+	    "1→0 write blanks WIN2 immediately.");
 	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 	    "win2_dump",
