@@ -153,6 +153,14 @@ static void rk_kms_display_domain_sanity(struct rk_kms_softc *sc);
 static int rk_kms_dp_modeset(struct rk_kms_softc *sc,
     const struct drm_display_mode *mode);
 static void rk_kms_usbc_poll(void *arg);
+struct drm_display_mode;
+static const struct drm_display_mode *rk_kms_outer_mode(
+    const struct drm_display_mode *in, struct drm_display_mode *scratch);
+static void rk_kms_vop_program_win0(struct rk_kms_softc *sc,
+    const struct drm_display_mode *mode, struct drm_framebuffer *fb,
+    uint32_t hact_start, uint32_t vact_start);
+static uint32_t rk_kms_hact_start(const struct drm_display_mode *m);
+static uint32_t rk_kms_vact_start(const struct drm_display_mode *m);
 
 #define	RK_KMS_DESC	"Rockchip RK3399 display (kms)"
 
@@ -2876,6 +2884,20 @@ rk_kms_set_video_src(struct rk_kms_softc *sc, int out, bool force)
 		DPRINTF(sc, "set_video_src: no-op, already on %d\n", out);
 		return (0);
 	}
+	/*
+	 * Teardown of the currently-active output before we retrain the
+	 * VOP mux.  Without this, the framer we're leaving keeps its
+	 * last frame latched — the DP monitor stays lit showing stale
+	 * content while HDMI is being brought up.  For DP the mailbox
+	 * DPTX_ENABLE_VIDEO(false) drops video into the "power-only"
+	 * state the user asked for (altmode CC-line negotiation stays,
+	 * link stays trained, but no pixels leave the framer).
+	 */
+	if (sc->output == RK_KMS_OUT_DP && out != RK_KMS_OUT_DP) {
+		int va = rk_cdn_dp_set_video_active_first(false);
+		DPRINTF(sc, "set_video_src: DP video_active(false) rc=%d\n",
+		    va);
+	}
 	if (out == RK_KMS_OUT_HDMI) {
 		if (!sc->hdmi_connected)
 			DPRINTF(sc, "set_video_src: HDMI HPD absent, "
@@ -2904,6 +2926,26 @@ rk_kms_set_video_src(struct rk_kms_softc *sc, int out, bool force)
 	 * SETCRTC fires all seven stages.
 	 */
 	sc->commit_modeset = RK_KMS_STAGE_ALL;
+	/*
+	 * Re-bind the current Xorg primary fb into WIN0 ourselves —
+	 * Xorg's modesetting DDX does NOT refire SETCRTC on
+	 * DRM_EVENT_CONNECTOR_HOTPLUG when the mode list is unchanged
+	 * (both HDMI and DP report 1920x1080), so without this the new
+	 * framer would scan out a blank buffer until the session
+	 * restarts.  Program WIN0 directly against crtc->primary_fb (the
+	 * fb Xorg installed with the LAST SETCRTC on the old output)
+	 * and latch via CFG_DONE.
+	 */
+	if (sc->crtc.primary_fb != NULL) {
+		struct drm_display_mode outer_scratch;
+		const struct drm_display_mode *outer =
+		    rk_kms_outer_mode(&sc->crtc.mode, &outer_scratch);
+		rk_kms_vop_program_win0(sc, outer, sc->crtc.primary_fb,
+		    rk_kms_hact_start(outer),
+		    rk_kms_vact_start(outer));
+		vop_big_write(sc, VOP_REG_CFG_DONE, 0x00010001);
+		DPRINTF(sc, "set_video_src: rebound WIN0 to primary_fb\n");
+	}
 	/*
 	 * Broadcast the topology change to every drm_file open on the
 	 * device — Xorg's modesetting DDX subscribes and re-fires
