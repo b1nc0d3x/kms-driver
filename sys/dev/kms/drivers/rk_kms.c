@@ -896,6 +896,14 @@ struct rk_kms_softc {
 	int32_t				 cursor_hot_y;
 	int32_t				 cursor_x;
 	int32_t				 cursor_y;
+	/*
+	 * DSP-space origin of the active area, cached from the last
+	 * modeset.  Cursor coords come from Xorg in screen-relative
+	 * (0..hdisplay-1); WIN2 DSP_ST0 is in DSP-timing coord, so we
+	 * add these to translate.
+	 */
+	uint32_t			 dsp_hact_start;
+	uint32_t			 dsp_vact_start;
 
 	/*
 	 * HW cursor default OFF — enabling it caused the DP display to
@@ -2234,6 +2242,12 @@ rk_kms_vop_program_timing(struct rk_kms_softc *sc,
 	vact_start = rk_kms_vact_start(mode);
 	hsync_len = mode->hsync_end - mode->hsync_start;
 	vsync_len = mode->vsync_end - mode->vsync_start;
+	/*
+	 * Cache the DSP-space active-area origin for other planes
+	 * (WIN2 cursor) to translate on-screen coords into DSP coords.
+	 */
+	sc->dsp_hact_start = hact_start;
+	sc->dsp_vact_start = vact_start;
 
 	pa = rk_kms_fb_paddr(fb);
 	stride = roundup2(mode->hdisplay, 16) * 4u;
@@ -2944,6 +2958,14 @@ rk_kms_vop_program_cursor(struct rk_kms_softc *sc, vm_paddr_t pa,
 
 	if (pa == 0 || w == 0 || h == 0) {
 		vop_big_write(sc, VOP_REG_WIN2_CTRL0, 0);
+		/*
+		 * VOP CTRL registers are shadowed — a CFG_DONE latch is
+		 * required to move the write from shadow to active.  Without
+		 * it, WIN2 stays visibly enabled with whatever its last
+		 * active state was, even though the shadow reads back 0.
+		 */
+		if (sc->commit_modeset & RK_KMS_STAGE_CFG_DONE)
+			vop_big_write(sc, VOP_REG_CFG_DONE, 0x00010001);
 		return;
 	}
 	/* Clamp negative on-screen coords to 0; WIN2 DSP_ST0 is
@@ -2951,6 +2973,19 @@ rk_kms_vop_program_cursor(struct rk_kms_softc *sc, vm_paddr_t pa,
 	 * simply won't program a negative position. */
 	if (x < 0) x = 0;
 	if (y < 0) y = 0;
+	/*
+	 * Translate screen coords → DSP-timing coords.  Xorg passes
+	 * (x, y) relative to the display origin (0,0 top-left of the
+	 * scanout).  VOP WIN2 DSP_ST0 is in DSP-timing coord, which
+	 * puts (0,0) at the sync-start, so the active area begins at
+	 * (hact_start, vact_start).  Without this offset the cursor
+	 * either sits in the horizontal blanking region (invisible)
+	 * or, when Xorg positions it past hdisplay-hact_start, wraps
+	 * to the left edge of the screen — matching the "can't reach
+	 * the rightmost pixels" report.
+	 */
+	x += (int32_t)sc->dsp_hact_start;
+	y += (int32_t)sc->dsp_vact_start;
 	stride_words = (w * 4u) / 4u;	/* ARGB8888 → 4B/pixel */
 
 	/*
@@ -2968,6 +3003,9 @@ rk_kms_vop_program_cursor(struct rk_kms_softc *sc, vm_paddr_t pa,
 	    (((h - 1u) & 0xfff) << 16) | ((w - 1u) & 0xfff));
 	vop_big_write(sc, VOP_REG_WIN2_DSP_ST0,
 	    (((uint32_t)y & 0x1fff) << 16) | ((uint32_t)x & 0x1fff));
+	DPRINTF(sc, "cursor: WIN2 DSP_ST0=%u,%u (hact_start=%u vact_start=%u)\n",
+	    (uint32_t)x & 0x1fff, (uint32_t)y & 0x1fff,
+	    sc->dsp_hact_start, sc->dsp_vact_start);
 	/*
 	 * Per-pixel alpha blend — without this the transparent regions
 	 * of the cursor bitmap render as opaque black instead of showing
@@ -2990,6 +3028,39 @@ rk_kms_vop_program_cursor(struct rk_kms_softc *sc, vm_paddr_t pa,
  * direction just updates the flag; Xorg needs an X restart before it
  * probes for HW cursor support again, so there's nothing to program.
  */
+/*
+ * Diagnostic: read back the WIN2 area-0 register block so operators
+ * can verify the cursor plane state (position, size, format, MST base)
+ * matches what cursor_set / cursor_move most recently programmed.
+ * Writing any value triggers a fresh dump into dmesg; read is a no-op.
+ */
+static int
+rk_kms_win2_dump_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct rk_kms_softc *sc = arg1;
+	int val = 0;
+	int error;
+
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (!sc->hw_attached)
+		return (0);
+	device_printf(sc->dev,
+	    "WIN2 dump: CTRL0=0x%08x CTRL1=0x%08x VIR01=0x%08x "
+	    "MST0=0x%08x DSP_INFO0=0x%08x DSP_ST0=0x%08x "
+	    "SRC_ALPHA=0x%08x DST_ALPHA=0x%08x\n",
+	    vop_big_read(sc, VOP_REG_WIN2_CTRL0),
+	    vop_big_read(sc, VOP_REG_WIN2_CTRL1),
+	    vop_big_read(sc, VOP_REG_WIN2_VIR0_1),
+	    vop_big_read(sc, VOP_REG_WIN2_MST0),
+	    vop_big_read(sc, VOP_REG_WIN2_DSP_INFO0),
+	    vop_big_read(sc, VOP_REG_WIN2_DSP_ST0),
+	    vop_big_read(sc, VOP_REG_WIN2_SRC_ALPHA_CTRL),
+	    vop_big_read(sc, VOP_REG_WIN2_DST_ALPHA_CTRL));
+	return (0);
+}
+
 static int
 rk_kms_hw_cursor_sysctl(SYSCTL_HANDLER_ARGS)
 {
@@ -3002,14 +3073,31 @@ rk_kms_hw_cursor_sysctl(SYSCTL_HANDLER_ARGS)
 		return (error);
 	if (val == sc->hw_cursor_enable)
 		return (0);
-	if (val == 0 && sc->hw_attached && sc->cursor_bo != NULL) {
-		kms_gem_object_put(sc->cursor_bo);
-		sc->cursor_bo = NULL;
+	/*
+	 * Flip the enable flag BEFORE touching WIN2 so a racing
+	 * cursor_move on another CPU sees hw_cursor_enable=0 and takes
+	 * the ENOTTY early-out — otherwise it re-arms WIN2 between our
+	 * blank write and the store below.
+	 */
+	sc->hw_cursor_enable = val;
+	if (val == 0 && sc->hw_attached) {
+		if (sc->cursor_bo != NULL) {
+			kms_gem_object_put(sc->cursor_bo);
+			sc->cursor_bo = NULL;
+		}
 		sc->cursor_width = 0;
 		sc->cursor_height = 0;
+		/*
+		 * Unconditionally blank WIN2 whether cursor_bo is currently
+		 * tracked or not — VOP CTRL0 can hold a stale enable bit
+		 * from an earlier program_cursor even after cursor_bo was
+		 * cleared (subsequent Xorg cursor_set with hw_cursor=0 sees
+		 * the ENOTTY early-out but the hardware isn't touched).  A
+		 * lingering WIN2 enable disturbs WIN0 z-order and makes the
+		 * primary content dark.
+		 */
 		rk_kms_vop_program_cursor(sc, 0, 0, 0, 0, 0);
 	}
-	sc->hw_cursor_enable = val;
 	return (0);
 }
 
@@ -3094,6 +3182,9 @@ rk_kms_cursor_move(struct drm_crtc *crtc, int32_t x, int32_t y)
 		return (ENOTTY);	/* signal Xorg to draw SW cursor */
 	sc->cursor_x = x;
 	sc->cursor_y = y;
+	DPRINTF(sc, "cursor_move: xy=%d,%d hot=%d,%d bo=%p w=%u h=%u\n",
+	    x, y, sc->cursor_hot_x, sc->cursor_hot_y,
+	    sc->cursor_bo, sc->cursor_width, sc->cursor_height);
 	if (sc->cursor_bo == NULL || sc->cursor_width == 0)
 		return (0);
 	pa = VM_PAGE_TO_PHYS(sc->cursor_bo->pages[0]);
@@ -3754,6 +3845,12 @@ rk_kms_attach(device_t dev)
 	    "returns ENOTTY when off so Xorg draws a SW cursor into the "
 	    "primary fb; 1→0 write also blanks WIN2 immediately so a "
 	    "leftover HW cursor doesn't double with Xorg's SW cursor)");
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "win2_dump",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE, sc, 0,
+	    rk_kms_win2_dump_sysctl, "I",
+	    "Write any value to dump WIN2 area-0 registers into dmesg");
 	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 	    "usbc_bringup_now",
