@@ -256,3 +256,125 @@ kms_ioctl_prime_fd_to_handle(struct drm_file *file,
 	args->handle = handle;
 	return (0);
 }
+
+/* ---- fgpu bridge (optional) --------------------------------------------- */
+
+/*
+ * If fgpu.ko is loaded, register a struct fgpu_dmabuf_ops so that
+ * FGPU_IOC_BO_IMPORT can accept our prime fds — enabling
+ * "kms CREATE_DUMB → PRIME_HANDLE_TO_FD → fgpu BO_IMPORT" cross-driver
+ * flows without kms.ko hard-depending on fgpu.ko.  Symbol resolved
+ * at SYSINIT time via kldsym(9); no-op if fgpu.ko is absent.
+ *
+ * Kept in-tree here (rather than a separate bridge module) because
+ * the four adapter functions are 20 lines of glue and duplicating the
+ * build harness for a single .ko is worse than an optional symbol
+ * lookup.
+ */
+#include <sys/linker.h>
+#include <sys/kernel.h>
+#include <sys/module.h>
+#include <vm/vm_page.h>
+
+struct fgpu_dmabuf_ops {
+	void		*(*fd_to_gem)(struct file *fp);
+	void		 (*gem_put)(void *gem_cookie);
+	size_t		 (*gem_size)(void *gem_cookie);
+	vm_paddr_t	 (*gem_first_pa)(void *gem_cookie);
+};
+
+static void *
+kms_bridge_fd_to_gem(struct file *fp)
+{
+
+	return (kms_prime_fd_to_gem(fp));
+}
+
+static void
+kms_bridge_gem_put(void *gem_cookie)
+{
+
+	kms_gem_object_put((struct drm_gem_object *)gem_cookie);
+}
+
+static size_t
+kms_bridge_gem_size(void *gem_cookie)
+{
+	struct drm_gem_object *obj = gem_cookie;
+
+	return (obj != NULL ? obj->size : 0);
+}
+
+static vm_paddr_t
+kms_bridge_gem_first_pa(void *gem_cookie)
+{
+	struct drm_gem_object *obj = gem_cookie;
+
+	if (obj == NULL || obj->pages == NULL || obj->npages == 0)
+		return (0);
+	return (VM_PAGE_TO_PHYS(obj->pages[0]));
+}
+
+static const struct fgpu_dmabuf_ops kms_bridge_ops = {
+	.fd_to_gem	= kms_bridge_fd_to_gem,
+	.gem_put	= kms_bridge_gem_put,
+	.gem_size	= kms_bridge_gem_size,
+	.gem_first_pa	= kms_bridge_gem_first_pa,
+};
+
+static int (*fgpu_register_dmabuf_ops_p)(const struct fgpu_dmabuf_ops *);
+static void (*fgpu_unregister_dmabuf_ops_p)(void);
+static bool kms_bridge_registered;
+
+/*
+ * linker_file_foreach predicate — checks whether `lf` exports both
+ * fgpu API symbols, and if so caches their addresses into the
+ * *_p globals + returns non-zero to stop iteration.
+ */
+static int
+kms_bridge_find_fgpu(linker_file_t lf, void *ctx __unused)
+{
+	caddr_t reg, unreg;
+
+	reg = linker_file_lookup_symbol(lf, "fgpu_register_dmabuf_ops", 0);
+	unreg = linker_file_lookup_symbol(lf, "fgpu_unregister_dmabuf_ops", 0);
+	if (reg == NULL || unreg == NULL)
+		return (0);
+	fgpu_register_dmabuf_ops_p =
+	    (int (*)(const struct fgpu_dmabuf_ops *))reg;
+	fgpu_unregister_dmabuf_ops_p = (void (*)(void))unreg;
+	return (1);	/* found; stop iteration */
+}
+
+static void
+kms_bridge_fgpu_init(void *unused __unused)
+{
+
+	/*
+	 * Best-effort lookup — fgpu.ko may not be loaded, or may load
+	 * later.  We check once at SYSINIT; users who want the bridge
+	 * should load fgpu.ko BEFORE kms.ko.  If fgpu.ko lands later
+	 * the bridge stays inactive (fgpu will see ENOTSUP for foreign
+	 * imports until either module is reloaded).
+	 */
+	(void)linker_file_foreach(kms_bridge_find_fgpu, NULL);
+	if (fgpu_register_dmabuf_ops_p == NULL ||
+	    fgpu_unregister_dmabuf_ops_p == NULL)
+		return;
+	if (fgpu_register_dmabuf_ops_p(&kms_bridge_ops) == 0) {
+		kms_bridge_registered = true;
+		printf("kms: registered fgpu dmabuf bridge\n");
+	}
+}
+SYSINIT(kms_bridge_fgpu, SI_SUB_DRIVERS, SI_ORDER_ANY,
+    kms_bridge_fgpu_init, NULL);
+
+static void
+kms_bridge_fgpu_fini(void *unused __unused)
+{
+
+	if (kms_bridge_registered && fgpu_unregister_dmabuf_ops_p != NULL)
+		fgpu_unregister_dmabuf_ops_p();
+}
+SYSUNINIT(kms_bridge_fgpu, SI_SUB_DRIVERS, SI_ORDER_ANY,
+    kms_bridge_fgpu_fini, NULL);
