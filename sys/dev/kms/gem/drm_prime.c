@@ -149,6 +149,29 @@ kms_prime_fo_fill_kinfo(struct file *fp __unused, struct kinfo_file *kif,
 	return (0);
 }
 
+/*
+ * Cross-driver accessor.  Consumer drivers (e.g. fgpu) can pass a
+ * struct file * and receive the underlying drm_gem_object with an
+ * added reference — or NULL if the fd is not a kms prime fd.  This
+ * lets other drivers import a kms scanout BO without having to
+ * introspect our internal fileops / private-data layout.
+ *
+ * Caller must drop the returned reference via kms_gem_object_put().
+ */
+struct drm_gem_object *
+kms_prime_fd_to_gem(struct file *fp)
+{
+	struct kms_prime_file *pf;
+
+	if (fp == NULL || fp->f_ops != &kms_prime_fileops)
+		return (NULL);
+	pf = fp->f_data;
+	if (pf == NULL || pf->obj == NULL)
+		return (NULL);
+	kms_gem_object_get(pf->obj);
+	return (pf->obj);
+}
+
 int
 kms_ioctl_prime_handle_to_fd(struct drm_file *file,
     struct drm_prime_handle *args)

@@ -25,10 +25,24 @@
 
 struct drm_file;
 struct drm_prime_handle;
+struct drm_gem_object;
+struct file;
 
 int	kms_ioctl_prime_handle_to_fd(struct drm_file *file,
 	    struct drm_prime_handle *args);
 int	kms_ioctl_prime_fd_to_handle(struct drm_file *file,
 	    struct drm_prime_handle *args);
+
+/*
+ * Cross-driver accessor.  If `fp` is a kms prime fd (returned by
+ * DRM_IOCTL_PRIME_HANDLE_TO_FD), returns the underlying
+ * drm_gem_object with an added reference.  Caller must drop the ref
+ * via kms_gem_object_put() when done.  Returns NULL for any other
+ * fd type.
+ *
+ * Intended for consumer drivers that want to import a kms-scanout BO
+ * (e.g. fgpu importing a rk_kms framebuffer as a GPU BO backing).
+ */
+struct drm_gem_object *kms_prime_fd_to_gem(struct file *fp);
 
 #endif /* _KMS_DRM_PRIME_H_ */
