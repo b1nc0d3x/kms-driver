@@ -326,6 +326,8 @@ static int (*fgpu_register_dmabuf_ops_p)(const struct fgpu_dmabuf_ops *);
 static void (*fgpu_unregister_dmabuf_ops_p)(void);
 static bool kms_bridge_registered;
 
+int kms_bridge_rearm(void);	/* forward decl — definition after SYSINIT */
+
 /*
  * linker_file_foreach predicate — checks whether `lf` exports both
  * fgpu API symbols, and if so caches their addresses into the
@@ -351,23 +353,41 @@ kms_bridge_fgpu_init(void *unused __unused)
 {
 
 	/*
-	 * Best-effort lookup — fgpu.ko may not be loaded, or may load
-	 * later.  We check once at SYSINIT; users who want the bridge
-	 * should load fgpu.ko BEFORE kms.ko.  If fgpu.ko lands later
-	 * the bridge stays inactive (fgpu will see ENOTSUP for foreign
-	 * imports until either module is reloaded).
+	 * Best-effort lookup at kms SYSINIT time — fgpu.ko may not be
+	 * loaded yet, or may load later and call kms_bridge_rearm()
+	 * itself.  If fgpu.ko is present we register immediately.
 	 */
-	(void)linker_file_foreach(kms_bridge_find_fgpu, NULL);
-	if (fgpu_register_dmabuf_ops_p == NULL ||
-	    fgpu_unregister_dmabuf_ops_p == NULL)
-		return;
-	if (fgpu_register_dmabuf_ops_p(&kms_bridge_ops) == 0) {
-		kms_bridge_registered = true;
-		printf("kms: registered fgpu dmabuf bridge\n");
-	}
+	(void)kms_bridge_rearm();
 }
 SYSINIT(kms_bridge_fgpu, SI_SUB_DRIVERS, SI_ORDER_ANY,
     kms_bridge_fgpu_init, NULL);
+
+/*
+ * Re-run the bridge scan + registration.  Always re-looks-up fgpu's
+ * symbols (so a reloaded fgpu.ko gets a fresh pointer) and calls
+ * register unconditionally.  Public so fgpu.ko can call it from its
+ * own SYSINIT — solves the "kms boots without fgpu; fgpu loads
+ * later" order dependency AND the "smoketest kldunload/kldload
+ * fgpu" reload case (fgpu's ops state was wiped when its cdev
+ * detached, so re-registering restores it).
+ */
+int
+kms_bridge_rearm(void)
+{
+
+	fgpu_register_dmabuf_ops_p = NULL;
+	fgpu_unregister_dmabuf_ops_p = NULL;
+	kms_bridge_registered = false;
+	(void)linker_file_foreach(kms_bridge_find_fgpu, NULL);
+	if (fgpu_register_dmabuf_ops_p == NULL ||
+	    fgpu_unregister_dmabuf_ops_p == NULL)
+		return (ENOENT);
+	if (fgpu_register_dmabuf_ops_p(&kms_bridge_ops) != 0)
+		return (EIO);
+	kms_bridge_registered = true;
+	printf("kms: registered fgpu dmabuf bridge\n");
+	return (0);
+}
 
 static void
 kms_bridge_fgpu_fini(void *unused __unused)
