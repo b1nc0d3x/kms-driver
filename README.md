@@ -1,5 +1,7 @@
 # KMS Framework
 
+[![build](https://github.com/b1nc0d3x/kms-driver/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/b1nc0d3x/kms-driver/actions/workflows/build.yml)
+
 A native FreeBSD Kernel Mode Setting (KMS) framework — no LinuxKPI, no
 `drm2`, no `drm-kmod`, no Linux compatibility shim of any kind.  Pure
 FreeBSD primitives all the way down.
