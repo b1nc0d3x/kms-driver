@@ -1,0 +1,84 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  cross-build-arm64:
+    name: cross-build kms.ko + rk_kms.ko for arm64 (FreeBSD VM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: cross-build inside FreeBSD 15.0 VM
+        # vmactions/freebsd-vm spins a FreeBSD guest with the checkout
+        # at /home/runner/work/<repo>/<repo>.  We use the host cc as a
+        # cross-compiler by pointing --target at aarch64-freebsd15.0.
+        # src.txz gives us /usr/src/sys so bsd.kmod.mk resolves properly.
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "15.0"
+          usesh: true
+          run: |
+            set -eux
+            uname -a
+
+            # Fetch FreeBSD 15.0 source tarball → /usr/src.  Provides
+            # all arch subdirs (arm64/, x86/, …) so the aarch64 build
+            # picks up the correct machine headers.
+            if [ ! -d /usr/src/sys/arm64 ]; then
+              fetch -q https://download.freebsd.org/releases/amd64/15.0-RELEASE/src.txz
+              tar xf src.txz -C /
+            fi
+
+            echo "=== cross-build kms.ko + rk_kms.ko (aarch64) ==="
+            env MACHINE=arm64 MACHINE_ARCH=aarch64 \
+                CC="cc --target=aarch64-unknown-freebsd15.0" \
+                make -B
+
+            file sys/modules/kms/core/kms.ko | grep -q "ARM aarch64" || {
+              echo "FAIL: kms.ko is not aarch64"
+              exit 1
+            }
+            file sys/modules/rk_kms/rk_kms.ko | grep -q "ARM aarch64" || {
+              echo "FAIL: rk_kms.ko is not aarch64"
+              exit 1
+            }
+            ls -l sys/modules/kms/core/kms.ko sys/modules/rk_kms/rk_kms.ko
+            echo "=== ok ==="
+
+  native-build-amd64:
+    name: native build kms.ko + rk_kms.ko for amd64 (FreeBSD VM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: native build inside FreeBSD 15.0 VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "15.0"
+          usesh: true
+          run: |
+            set -eux
+            uname -a
+
+            if [ ! -d /usr/src/sys/amd64 ]; then
+              fetch -q https://download.freebsd.org/releases/amd64/15.0-RELEASE/src.txz
+              tar xf src.txz -C /
+            fi
+
+            echo "=== native build kms.ko + rk_kms.ko (amd64) ==="
+            # rk_kms is arm64-only (Rockchip); build just kms.ko native.
+            make -C sys/modules/kms/core -B
+            file sys/modules/kms/core/kms.ko | grep -q "x86-64" || {
+              echo "FAIL: kms.ko is not x86-64"
+              exit 1
+            }
+            ls -l sys/modules/kms/core/kms.ko
+            echo "=== ok ==="
