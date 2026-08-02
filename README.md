@@ -93,4 +93,11 @@ rk_kms"` builds the modules via the normal kernel-modules path.
 
 ## License
 
-BSD-2-Clause. See individual source files for SPDX identifiers.
+BSD-2-Clause — see `LICENSE`.  Every framework and driver source file
+carries the `SPDX-License-Identifier: BSD-2-Clause` header.
+
+The DRM userspace ABI headers under `sys/dev/kms/uapi/drm/` (`drm.h`,
+`drm_mode.h`, `drm_fourcc.h`, `drm_sarea.h`) are derived from the
+Linux kernel DRM subsystem and keep their upstream MIT-style license.
+That license is permissive and BSD-compatible; the top of each of
+those files carries its original copyright notice.
