@@ -21,19 +21,19 @@ SRCTOP:=	${.CURDIR}
 all: modules
 
 modules:
-	${MAKE} -C ${.CURDIR}/sys/modules/kms \
+	${MAKE} -C ${.CURDIR}/sys/modules/kms/core \
 	    SRCTOP=${SRCTOP} SYSDIR=${SYSDIR}
 	${MAKE} -C ${.CURDIR}/sys/modules/rk_kms \
 	    SRCTOP=${SRCTOP} SYSDIR=${SYSDIR}
 
 clean:
-	${MAKE} -C ${.CURDIR}/sys/modules/kms clean \
+	${MAKE} -C ${.CURDIR}/sys/modules/kms/core clean \
 	    SRCTOP=${SRCTOP} SYSDIR=${SYSDIR} || true
 	${MAKE} -C ${.CURDIR}/sys/modules/rk_kms clean \
 	    SRCTOP=${SRCTOP} SYSDIR=${SYSDIR} || true
 
 install:
-	${MAKE} -C ${.CURDIR}/sys/modules/kms install \
+	${MAKE} -C ${.CURDIR}/sys/modules/kms/core install \
 	    SRCTOP=${SRCTOP} SYSDIR=${SYSDIR} DESTDIR=${DESTDIR}
 	${MAKE} -C ${.CURDIR}/sys/modules/rk_kms install \
 	    SRCTOP=${SRCTOP} SYSDIR=${SYSDIR} DESTDIR=${DESTDIR}
