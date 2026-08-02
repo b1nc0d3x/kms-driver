@@ -1,7 +1,11 @@
 # Top-level standalone build for the kms driver framework + drivers.
 #
 # Targets:
-#   make              build kms.ko + rk_kms.ko
+#   make              build kms.ko + rk_kms.ko  (rk_kms needs the
+#                     FUSB302 USB-C PD controller driver installed at
+#                     dev/iicbus/usb/fusb302_var.h — NOT in stock
+#                     FreeBSD src.  Framework-only builds use kms-only)
+#   make kms-only     build just kms.ko (framework only, no HW deps)
 #   make install      install built modules (uses DESTDIR)
 #   make clean        remove build artifacts
 #
@@ -16,13 +20,15 @@
 SYSDIR?=	/usr/src/sys
 SRCTOP:=	${.CURDIR}
 
-.PHONY: all modules clean install
+.PHONY: all kms-only modules clean install
 
 all: modules
 
-modules:
+kms-only:
 	${MAKE} -C ${.CURDIR}/sys/modules/kms/core \
 	    SRCTOP=${SRCTOP} SYSDIR=${SYSDIR}
+
+modules: kms-only
 	${MAKE} -C ${.CURDIR}/sys/modules/rk_kms \
 	    SRCTOP=${SRCTOP} SYSDIR=${SYSDIR}
 

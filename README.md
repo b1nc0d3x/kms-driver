@@ -47,11 +47,22 @@ sys/modules/rk_kms/  builds rk_kms.ko
 
 ## Build
 
-Host build (amd64 or arm64 native):
+Framework only (no external deps):
 
 ```sh
-make
+make kms-only            # builds kms.ko
 ```
+
+Full build (framework + rk_kms driver):
+
+```sh
+make                     # builds kms.ko + rk_kms.ko
+```
+
+`rk_kms.ko` depends on an out-of-tree FUSB302 USB-C PD controller
+driver at `dev/iicbus/usb/fusb302_var.h` — install that driver
+alongside first, or build only `kms-only` on hosts without it (CI
+does the latter).
 
 Cross-build to arm64 from an amd64 host (requires FreeBSD src at
 `/usr/src` for the kernel headers):
