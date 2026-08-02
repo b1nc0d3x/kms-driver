@@ -45,14 +45,18 @@ SYSCTL_DECL(_kern_kms);
  * for the dri cdev anyway); this lets them read input.  When the last
  * drm_device unregisters, restore to 0600 root:wheel.
  *
- * Gated by kern.kms.input_passthrough (default 1).  Set to 0 to opt
- * out and use external seat management.
+ * Gated by kern.kms.input_passthrough (default 0 per M1 review).  Set
+ * to 1 to opt in — kernel-side seat management is a development
+ * convenience only; upstream prefers devfs.rules or a devd rule.
+ * Keeping this default-off avoids silently widening keyboard perms
+ * on every DRM open.
  */
-static int kms_input_passthrough = 1;
+static int kms_input_passthrough = 0;
 SYSCTL_INT(_kern_kms, OID_AUTO, input_passthrough, CTLFLAG_RWTUN,
     &kms_input_passthrough, 0,
     "Relax /dev/input/event* to 0660 root:video while a DRM device is"
-    " live (built-in seat replacement; default 1 = on)");
+    " live (built-in seat replacement; default 0 = off; set 1 as a"
+    " dev convenience — prefer devfs.rules for production)");
 
 #define	KMS_INPUT_MAX	32	/* event0 .. event31 */
 #define	KMS_GID_VIDEO	44	/* matches FreeBSD's wheel-44 video gid */

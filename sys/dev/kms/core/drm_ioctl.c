@@ -310,6 +310,32 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 		}
 	}
 
+	/*
+	 * H5 DRM_MASTER gate: modeset ioctls require the caller to be
+	 * master.  First-opener auto-becomes master (kms_open), so the
+	 * usual single-Xorg / single-Wayland flow works unchanged.
+	 * Additional openers (or any user in `video` on a shared box)
+	 * must first take mastership via SET_MASTER (priv_check gated),
+	 * otherwise these calls get EACCES.  Matches Linux's
+	 * DRM_MASTER-flagged ioctls in drm_ioctls[].
+	 */
+	if (!file->is_master) {
+		switch (cmd) {
+		case DRM_IOCTL_MODE_SETCRTC:
+		case DRM_IOCTL_MODE_PAGE_FLIP:
+		case DRM_IOCTL_MODE_ATOMIC:
+		case DRM_IOCTL_MODE_ADDFB:
+		case DRM_IOCTL_MODE_ADDFB2:
+		case DRM_IOCTL_MODE_RMFB:
+		case DRM_IOCTL_MODE_SETGAMMA:
+		case DRM_IOCTL_MODE_CURSOR:
+		case DRM_IOCTL_MODE_CURSOR2:
+		case DRM_IOCTL_MODE_DIRTYFB:
+		case DRM_IOCTL_MODE_SETPLANE:
+			return (EACCES);
+		}
+	}
+
 	switch (cmd) {
 	case DRM_IOCTL_MODE_LIST_LESSEES: {
 		/*
@@ -557,21 +583,25 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 			kms_mode_object_put(obj);
 			return (0);
 		}
-		if (dc->num_clips > 0 && dc->clips_ptr != 0 &&
-		    fb->pitches[0] > 0) {
+		if (dc->num_clips > 0 && dc->num_clips <= 64 &&
+		    dc->clips_ptr != 0 && fb->pitches[0] > 0) {
 			/*
 			 * Copy clip list from userspace, then translate
 			 * each rect into a byte range within the fb and
-			 * flush only those pages.  Cap at 64 clips to
-			 * bound stack use and worst-case CPU per call.
+			 * flush only those pages.  Cap at 64 clips per
+			 * call — beyond that, fall through to the full-fb
+			 * sweep below rather than silently truncating
+			 * (M6: stale regions on screen were otherwise
+			 * possible when userspace passed >64 clips).
+			 * Also honour fb->offsets[0] so a non-zero plane
+			 * offset flushes the correct pages.
 			 */
 			struct drm_clip_rect clips[64];
 			uint32_t nclips = dc->num_clips;
 			uint32_t pitch = fb->pitches[0];
+			uint32_t plane_off = fb->offsets[0];
 			int err;
 
-			if (nclips > nitems(clips))
-				nclips = nitems(clips);
 			err = copyin((void *)(uintptr_t)dc->clips_ptr, clips,
 			    nclips * sizeof(clips[0]));
 			if (err != 0) {
@@ -587,8 +617,8 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 					continue;
 				if (y2 > fb->height)
 					y2 = fb->height;
-				off_lo = y1 * pitch;
-				off_hi = y2 * pitch;
+				off_lo = plane_off + y1 * pitch;
+				off_hi = plane_off + y2 * pitch;
 				p_lo = off_lo / PAGE_SIZE;
 				p_hi = (off_hi + PAGE_SIZE - 1) / PAGE_SIZE;
 				if (p_hi > gem->npages)

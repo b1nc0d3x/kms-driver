@@ -42,6 +42,17 @@ struct drm_pending_event {
  */
 struct drm_file {
 	struct drm_device	*dev;
+	/*
+	 * refs counts owners of this drm_file:
+	 *   1 for the d_open (dropped by kms_file_dtor),
+	 *   +1 per in-flight vblank/flip event that will call kms_send_event
+	 *      from an IRQ context after mc->mutex has been dropped.
+	 * Structure lives until refs hits 0.  kms_file_get / kms_file_put
+	 * from drm_events.c IRQ paths keep it alive across the H4 race
+	 * window between "detach event to ready list, drop mc->mutex" and
+	 * "kms_send_event on pe->file".
+	 */
+	volatile u_int		 refs;
 	bool			 authenticated;
 	bool			 is_master;
 	/*

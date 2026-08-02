@@ -115,6 +115,13 @@ struct drm_crtc {
 	struct drm_file			*pending_flip_file;
 	uint64_t			 pending_flip_user_data;
 	/*
+	 * H3: outgoing fb held from PAGE_FLIP arm-time until the vblank
+	 * handler fires FLIP_COMPLETE.  Prevents the VOP scan-out engine
+	 * from reading freed memory for up to a frame after the flip is
+	 * armed but before it latches.  NULL when no flip is armed.
+	 */
+	struct drm_framebuffer		*pending_flip_old_fb;
+	/*
 	 * WAIT_VBLANK + _DRM_VBLANK_EVENT outstanding requests.  Each
 	 * carries the target sequence; kms_vblank_handler dispatches +
 	 * frees the entry when sequence >= target.  Multiple outstanding

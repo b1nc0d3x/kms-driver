@@ -359,8 +359,17 @@ static uint32_t rk_kms_vact_start(const struct drm_display_mode *m);
 #define	VOP_REG_WIN2_MST0	0x00c0
 #define	VOP_REG_WIN2_DSP_INFO0	0x00c4
 #define	VOP_REG_WIN2_DSP_ST0	0x00c8
+#define	VOP_REG_WIN2_MST1	0x00d0
+#define	VOP_REG_WIN2_DSP_INFO1	0x00d4
+#define	VOP_REG_WIN2_DSP_ST1	0x00d8
 #define	VOP_REG_WIN2_SRC_ALPHA_CTRL 0x00dc
+#define	VOP_REG_WIN2_MST2	0x00e0
+#define	VOP_REG_WIN2_DSP_INFO2	0x00e4
+#define	VOP_REG_WIN2_DSP_ST2	0x00e8
 #define	VOP_REG_WIN2_DST_ALPHA_CTRL 0x00ec
+#define	VOP_REG_WIN2_MST3	0x00f0
+#define	VOP_REG_WIN2_DSP_INFO3	0x00f4
+#define	VOP_REG_WIN2_DSP_ST3	0x00f8
 #define	VOP_WIN2_CTRL0_ENABLE	(1u << 4)
 #define	VOP_WIN2_CTRL0_GATE	(1u << 0)
 #define	VOP_WIN2_CTRL0_FMT_ARGB	(0u << 1)
@@ -3510,14 +3519,24 @@ rk_kms_vop_program_cursor(struct rk_kms_softc *sc, vm_paddr_t pa,
 	}
 
 	/*
-	 * Zero WIN2_CTRL1 + areas 1/2/3 MSTs.  WIN2 has four sub-area
-	 * scan-out slots (MST0..MST3); we only use area 0 for cursor but
-	 * VOP will happily DMA from areas 1/2/3 too if their enables (in
-	 * CTRL1 upper bits) or MST fields carry stale garbage from POR
-	 * or a prior run — which is our leading hypothesis for the
-	 * "WIN2 enable wedges WIN0" behaviour observed on the XYM panel.
+	 * Zero WIN2_CTRL1 + areas 1/2/3 MST/DSP_INFO/DSP_ST.  WIN2 has four
+	 * sub-area scan-out slots; we only use area 0 for cursor but VOP
+	 * will DMA from areas 1/2/3 too if their MST fields carry stale
+	 * garbage from POR or a prior run — user was seeing speckle trails
+	 * on DP monitor following cursor motion; areas 1/2/3 pointing at
+	 * uninitialized RAM matches "random-looking pixels at cursor-
+	 * adjacent screen positions".
 	 */
 	vop_big_write(sc, VOP_REG_WIN2_CTRL1, 0);
+	vop_big_write(sc, VOP_REG_WIN2_MST1, 0);
+	vop_big_write(sc, VOP_REG_WIN2_DSP_INFO1, 0);
+	vop_big_write(sc, VOP_REG_WIN2_DSP_ST1, 0);
+	vop_big_write(sc, VOP_REG_WIN2_MST2, 0);
+	vop_big_write(sc, VOP_REG_WIN2_DSP_INFO2, 0);
+	vop_big_write(sc, VOP_REG_WIN2_DSP_ST2, 0);
+	vop_big_write(sc, VOP_REG_WIN2_MST3, 0);
+	vop_big_write(sc, VOP_REG_WIN2_DSP_INFO3, 0);
+	vop_big_write(sc, VOP_REG_WIN2_DSP_ST3, 0);
 	vop_big_write(sc, VOP_REG_WIN2_VIR0_1, stride_words & 0x1fff);
 	vop_big_write(sc, VOP_REG_WIN2_MST0, (uint32_t)pa);
 	vop_big_write(sc, VOP_REG_WIN2_DSP_INFO0,

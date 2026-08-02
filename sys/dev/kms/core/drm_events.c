@@ -36,6 +36,7 @@
 #include <kms/drm_crtc.h>
 #include <kms/drm_device.h>
 #include <kms/drm_file.h>
+#include <kms/drm_framebuffer.h>
 #include <kms/drm_mode_config.h>
 #include <kms/drm_mode_object.h>
 
@@ -159,18 +160,30 @@ kms_vblank_handler(struct drm_crtc *crtc)
 	TAILQ_HEAD(, kms_pending_vblank_event) ready;
 	TAILQ_INIT(&ready);
 
+	struct drm_framebuffer *flip_old_fb = NULL;
+
 	sx_xlock(&mc->mutex);
 	crtc->sequence++;
 	if (crtc->pending_flip_file != NULL) {
 		flip_file = crtc->pending_flip_file;
 		flip_user_data = crtc->pending_flip_user_data;
+		flip_old_fb = crtc->pending_flip_old_fb;
 		crtc->pending_flip_file = NULL;
 		crtc->pending_flip_user_data = 0;
+		crtc->pending_flip_old_fb = NULL;
+		/*
+		 * flip_file already holds a ref taken at PAGE_FLIP arm-time
+		 * (drm_modeset.c).  We consume that ref via kms_file_put
+		 * after kms_send_vblank_event delivers, without needing a
+		 * fresh kms_file_get here.
+		 */
 	}
 	/*
 	 * Drain everything in pending_vblank_events whose target_seq has
 	 * been reached.  Detach to a local list so we can deliver outside
 	 * the mode_config lock (kms_send_event takes the per-file event_mtx).
+	 * Each pe->file already holds a ref taken at WAIT_VBLANK queue-time
+	 * (see kms_ioctl_wait_vblank); we consume it after delivery below.
 	 */
 	TAILQ_FOREACH_SAFE(pe, &crtc->pending_vblank_events, link, pe_next) {
 		if ((int32_t)(crtc->sequence - pe->target_seq) >= 0) {
@@ -186,6 +199,7 @@ kms_vblank_handler(struct drm_crtc *crtc)
 		drm_event_fill_vblank(&ev, DRM_EVENT_VBLANK, crtc->base.id,
 		    pe->target_seq, pe->user_data);
 		(void)kms_send_event(pe->file, &ev, sizeof(ev));
+		kms_file_put(pe->file);	/* release WAIT_VBLANK queue-time ref */
 		free(pe, M_KMS);
 	}
 
@@ -196,9 +210,14 @@ kms_vblank_handler(struct drm_crtc *crtc)
 	 */
 	wakeup(crtc);
 
-	if (flip_file != NULL)
+	if (flip_file != NULL) {
 		(void)kms_send_vblank_event(flip_file, crtc,
 		    DRM_EVENT_FLIP_COMPLETE, flip_user_data);
+		kms_file_put(flip_file);	/* release PAGE_FLIP arm-time ref */
+		/* H3: drop the outgoing fb now that scan-out has moved on. */
+		if (flip_old_fb != NULL)
+			kms_mode_object_put(&flip_old_fb->base);
+	}
 }
 
 /* --- WAIT_VBLANK ioctl --- */
@@ -268,6 +287,12 @@ kms_ioctl_wait_vblank(struct drm_file *file, union drm_wait_vblank *arg)
 			pe->file = file;
 			pe->target_seq = target;
 			pe->user_data = arg->request.signal;
+			/*
+			 * H4: hold a drm_file ref while pe is queued.
+			 * Released in kms_vblank_handler after delivery
+			 * (or in kms_file_dtor if close() races the IRQ).
+			 */
+			kms_file_get(file);
 			TAILQ_INSERT_TAIL(&crtc->pending_vblank_events,
 			    pe, link);
 			sx_xunlock(&mc->mutex);
