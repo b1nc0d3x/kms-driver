@@ -188,11 +188,13 @@ drm_ioctl_get_cap(struct drm_file *file __unused, struct drm_get_cap *c)
 		return (0);
 	case DRM_CAP_ADDFB2_MODIFIERS:
 		/*
-		 * We accept ADDFB2 with the FB_MODIFIERS flag set — the
-		 * modifier value is ignored (we treat every surface as
-		 * linear) but the ioctl shape is supported, which is what
-		 * the cap actually advertises.  Mesa's GBM backend gates
-		 * dmabuf import on this.
+		 * ADDFB2 stores per-plane modifiers into fb->modifiers[]
+		 * when DRM_MODE_FB_MODIFIERS is set (drm_framebuffer.c).
+		 * Drivers read them at scan-out time and accept or reject
+		 * via their plane/atomic_check hook.  The framework does
+		 * NOT yet advertise per-plane (format, modifier) tuples
+		 * through an IN_FORMATS blob property, so userspace must
+		 * probe by trial (ADDFB2, expect EINVAL on unsupported).
 		 */
 		c->value = 1;
 		return (0);
