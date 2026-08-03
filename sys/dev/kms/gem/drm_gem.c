@@ -38,11 +38,20 @@
 #include "kms_internal.h"
 
 SYSCTL_DECL(_kern_kms);
+#ifdef KMS_DEBUG_GEM_PA
+/*
+ * Test-only surface for cross-driver buffer-sharing bring-up (fgpu ↔
+ * kms handshakes before real dmabuf export landed).  World-readable
+ * physical addresses are a KASLR-bypass oracle and hardware-exploit
+ * targeting aid; a stock build MUST NOT expose this.  Build with
+ * -DKMS_DEBUG_GEM_PA when you actually need it, and only then.
+ */
 vm_paddr_t kms_debug_last_gem_pa = 0;
 SYSCTL_QUAD(_kern_kms, OID_AUTO, last_gem_pa, CTLFLAG_RD,
     &kms_debug_last_gem_pa, 0,
     "Physical address (page 0) of the most recently created GEM object. "
-    "Test-only surface for cross-driver buffer-sharing bring-up.");
+    "DEBUG BUILD ONLY.");
+#endif
 
 /*
  * Per-file handle entry.  GEM objects live on the device-side list
@@ -241,15 +250,15 @@ retry_alloc:
 	TAILQ_INSERT_TAIL(&dev->gem_objects, obj, device_link);
 	sx_xunlock(&dev->gem_lock);
 
+#ifdef KMS_DEBUG_GEM_PA
 	/*
 	 * Debug hook — remember the pa of page 0 of the most-recently
-	 * created GEM.  Read via the kern.kms.last_gem_pa sysctl by
-	 * cross-driver test rigs that need to map the same DRAM into
-	 * a peer accelerator's IOMMU (e.g. fgpu on Mali).  Not part
-	 * of any production ABI; strictly for kernel-side wiring of
-	 * PRIME-adjacent handshakes before real dmabuf export lands.
+	 * created GEM.  Read via the kern.kms.last_gem_pa sysctl (also
+	 * DEBUG-only) by cross-driver test rigs.  Compiled out of a
+	 * stock build; see the sysctl decl above for why.
 	 */
 	kms_debug_last_gem_pa = VM_PAGE_TO_PHYS(obj->pages[0]);
+#endif
 
 	return (obj);
 }
