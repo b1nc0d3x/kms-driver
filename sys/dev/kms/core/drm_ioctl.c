@@ -307,6 +307,7 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 		case DRM_IOCTL_MODE_ADDFB:
 		case DRM_IOCTL_MODE_ADDFB2:
 		case DRM_IOCTL_MODE_RMFB:
+		case DRM_IOCTL_MODE_CLOSEFB:
 		case DRM_IOCTL_WAIT_VBLANK:
 			return (EACCES);
 		}
@@ -329,6 +330,7 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 		case DRM_IOCTL_MODE_ADDFB:
 		case DRM_IOCTL_MODE_ADDFB2:
 		case DRM_IOCTL_MODE_RMFB:
+		case DRM_IOCTL_MODE_CLOSEFB:
 		case DRM_IOCTL_MODE_SETGAMMA:
 		case DRM_IOCTL_MODE_CURSOR:
 		case DRM_IOCTL_MODE_CURSOR2:
@@ -682,6 +684,15 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 		    (struct drm_mode_fb_cmd2 *)data));
 	case DRM_IOCTL_MODE_RMFB:
 		return (kms_ioctl_mode_rmfb(file, (uint32_t *)data));
+	case DRM_IOCTL_MODE_CLOSEFB:
+		return (kms_ioctl_mode_closefb(file,
+		    (struct drm_mode_closefb *)data));
+	case DRM_IOCTL_MODE_GETFB:
+		return (kms_ioctl_mode_getfb(file,
+		    (struct drm_mode_fb_cmd *)data));
+	case DRM_IOCTL_MODE_GETFB2:
+		return (kms_ioctl_mode_getfb2(file,
+		    (struct drm_mode_fb_cmd2 *)data));
 	case DRM_IOCTL_MODE_SETCRTC:
 		return (kms_ioctl_mode_setcrtc(file,
 		    (struct drm_mode_crtc *)data));

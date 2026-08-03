@@ -29,6 +29,7 @@ struct drm_mode_map_dumb;
 struct drm_mode_destroy_dumb;
 struct drm_mode_fb_cmd2;
 struct drm_mode_fb_cmd;
+struct drm_mode_closefb;
 struct drm_mode_crtc_page_flip;
 struct drm_mode_cursor;
 struct drm_mode_cursor2;
@@ -88,6 +89,12 @@ int	kms_ioctl_mode_addfb2(struct drm_file *file,
 int	kms_ioctl_mode_addfb(struct drm_file *file,
 	    struct drm_mode_fb_cmd *cmd);
 int	kms_ioctl_mode_rmfb(struct drm_file *file, uint32_t *fb_id);
+int	kms_ioctl_mode_closefb(struct drm_file *file,
+	    struct drm_mode_closefb *arg);
+int	kms_ioctl_mode_getfb(struct drm_file *file,
+	    struct drm_mode_fb_cmd *r);
+int	kms_ioctl_mode_getfb2(struct drm_file *file,
+	    struct drm_mode_fb_cmd2 *r);
 int	kms_ioctl_mode_setcrtc(struct drm_file *file,
 	    struct drm_mode_crtc *r);
 int	kms_ioctl_mode_page_flip(struct drm_file *file,
