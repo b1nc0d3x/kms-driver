@@ -888,6 +888,18 @@ igen_sysctl_vbt_dump(SYSCTL_HANDLER_ARGS)
 #define	PLANE_SIZE(p)		(0x70190 + (p) * 0x1000)
 #define	PLANE_OFFSET(p)		(0x701a4 + (p) * 0x1000)
 
+/*
+ * SKL+ Legacy Gamma Correction (LGC) palette + mode-select register.
+ * 256 entries per pipe, 4 bytes each (32-bit word: [23:16]R [15:8]G
+ * [7:0]B).  Pipe A palette base = 0x4a000, stride 0x800 between pipes.
+ * GAMMA_MODE(pipe) selects the pipeline shape; mode bits [1:0] = 00
+ * picks 8-bit legacy LGC which the LGC_PALETTE feeds.  Enable per
+ * plane via PLANE_CTL_GAMMA_ENA bit 30 (already defined above).
+ */
+#define	LGC_PALETTE(p)		(0x4a000 + (p) * 0x800)	/* 256 × u32 */
+#define	GAMMA_MODE(p)		(0x4a480 + (p) * 0x800)
+#define	  GAMMA_MODE_LEGACY_8BIT	(0u << 0)
+
 static const char *
 igen_plane_format_name(uint32_t f)
 {
@@ -2137,11 +2149,64 @@ igen_cursor_move(struct drm_crtc *crtc, int32_t x, int32_t y)
 	return (0);
 }
 
+/*
+ * SETGAMMA — write the userspace ramp into the pipe's LGC palette.
+ * Xorg / X11 gamma is per-channel 16-bit unsigned (0..0xffff = 0..1.0
+ * output); SKL LGC entries pack an 8-bit-per-channel truncation into
+ * [23:16]R [15:8]G [7:0]B.  Downconvert 16→8 by dropping the low 8
+ * bits.  Sizes: LGC is a fixed 256-entry table, so we only accept
+ * size == 256 (the universal Xorg value); anything else returns
+ * EINVAL and Xorg falls back to identity.
+ *
+ * After writing the ramp, force GAMMA_MODE to 8-bit legacy and set
+ * PLANE_CTL_GAMMA_ENA on the primary plane so the pipeline actually
+ * consults the LUT.  Serialize on scanout_lock because we're touching
+ * PLANE_CTL — the atomic_commit path also RMWs it.
+ *
+ * Single CRTC → pipe A hard-wired.  When we add second-pipe scanout
+ * (multi-monitor via the second port), the pipe index will come from
+ * a crtc→pipe mapping on the softc.
+ */
+static int
+igen_gamma_set(struct drm_crtc *crtc, uint32_t size,
+    const uint16_t *red, const uint16_t *green, const uint16_t *blue)
+{
+	struct igen_softc *sc;
+	uint32_t i, pctl, gmode;
+	int pipe = 0;	/* pipe A */
+
+	if (crtc == NULL)
+		return (EINVAL);
+	if (size != 256)
+		return (EINVAL);
+	sc = crtc->dev->driver_priv;
+
+	sx_xlock(&sc->scanout_lock);
+	for (i = 0; i < 256; i++) {
+		uint32_t r8 = (uint32_t)(red[i]   >> 8) & 0xff;
+		uint32_t g8 = (uint32_t)(green[i] >> 8) & 0xff;
+		uint32_t b8 = (uint32_t)(blue[i]  >> 8) & 0xff;
+		igen_w32(sc, LGC_PALETTE(pipe) + i * 4,
+		    (r8 << 16) | (g8 << 8) | b8);
+	}
+	gmode = igen_r32(sc, GAMMA_MODE(pipe));
+	gmode = (gmode & ~0x3u) | GAMMA_MODE_LEGACY_8BIT;
+	igen_w32(sc, GAMMA_MODE(pipe), gmode);
+	pctl = igen_r32(sc, PLANE_CTL(pipe));
+	if ((pctl & PLANE_CTL_GAMMA_ENA) == 0) {
+		pctl |= PLANE_CTL_GAMMA_ENA;
+		igen_w32(sc, PLANE_CTL(pipe), pctl);
+	}
+	sx_xunlock(&sc->scanout_lock);
+	return (0);
+}
+
 static const struct drm_crtc_funcs igen_crtc_funcs = {
 	.set_config = igen_legacy_set_config,
 	.page_flip = igen_legacy_page_flip,
 	.cursor_set = igen_cursor_set,
 	.cursor_move = igen_cursor_move,
+	.gamma_set = igen_gamma_set,
 };
 static const struct drm_plane_funcs igen_plane_funcs = { 0 };
 static const struct drm_encoder_funcs igen_encoder_funcs = { 0 };
