@@ -562,6 +562,15 @@ kms_ioctl_mode_cursor_common(struct drm_file *file, uint32_t crtc_id,
 	struct drm_crtc *crtc;
 	int error = 0;
 
+	/*
+	 * Only BO + MOVE bits are meaningful.  Reject anything else so a
+	 * misaligned userspace stops failing silently.  Matches Linux
+	 * drm_mode_cursor_common's DRM_MODE_CURSOR_FLAGS mask.
+	 */
+	if ((flags & ~(uint32_t)(DRM_MODE_CURSOR_BO |
+	    DRM_MODE_CURSOR_MOVE)) != 0)
+		return (EINVAL);
+
 	crtc_obj = kms_mode_object_find(file->dev, crtc_id,
 	    DRM_MODE_OBJECT_CRTC);
 	if (crtc_obj == NULL)
