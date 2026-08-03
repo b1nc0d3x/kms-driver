@@ -311,10 +311,23 @@ kms_read(struct cdev *cdev __unused, struct uio *uio, int ioflag)
 		file->events_bytes -= ev->length;
 		mtx_unlock(&file->event_mtx);
 		error = uiomove(ev->data, ev->length, uio);
+		if (error != 0) {
+			/*
+			 * uiomove failed (typically EFAULT — user buffer
+			 * moved out from under us).  Re-queue the event at
+			 * the head so a well-formed retry from userspace
+			 * can consume it; freeing here would silently drop
+			 * a pageflip / vblank event and stall the
+			 * compositor.  Match Linux drm_read on -EFAULT.
+			 */
+			mtx_lock(&file->event_mtx);
+			TAILQ_INSERT_HEAD(&file->events, ev, link);
+			file->events_bytes += ev->length;
+			mtx_unlock(&file->event_mtx);
+			return (error);
+		}
 		free(ev->data, M_KMS);
 		free(ev, M_KMS);
-		if (error != 0)
-			return (error);
 		mtx_lock(&file->event_mtx);
 		ev = TAILQ_FIRST(&file->events);
 	}
