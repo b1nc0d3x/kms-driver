@@ -332,23 +332,36 @@ igen_gtt_bind_gem_at(struct igen_softc *sc, struct drm_gem_object *obj,
 		    GTT_PTE_WRITEABLE | 0x80ULL;
 		igen_gtt_write(sc, first_idx + i, pte);
 	}
-	vm_paddr_t pa0 = VM_PAGE_TO_PHYS(obj->pages[0]);
-	uint32_t *kva0 = (uint32_t *)PHYS_TO_DMAP(pa0);
-	device_printf(sc->dev,
-	    "gtt_bind_gem_at: %zu page(s), softpin=0x%llx (slot 0x%x), "
-	    "pa[0]=0x%llx, pte[0]=0x%llx, readback=0x%llx\n",
-	    obj->npages, (unsigned long long)ggtt_byte_addr, first_idx,
-	    (unsigned long long)pa0,
-	    (unsigned long long)((pa0 & ~0xfffULL) | GTT_PTE_VALID |
-	        GTT_PTE_WRITEABLE),
-	    (unsigned long long)igen_gtt_read(sc, first_idx));
-	device_printf(sc->dev,
-	    "gtt_bind_gem_at: BO[0..7]  = %08x %08x %08x %08x %08x %08x %08x %08x\n",
-	    kva0[0], kva0[1], kva0[2], kva0[3],
-	    kva0[4], kva0[5], kva0[6], kva0[7]);
-	device_printf(sc->dev,
-	    "gtt_bind_gem_at: BO[0x40] = %08x  (post-execbuffer2 store target)\n",
-	    kva0[0x40]);
+	/*
+	 * Per-bind traces gated behind dev.igen.<n>.debug — iris + kwin
+	 * issue EXECBUFFER2 constantly for GL rendering; each batch fires
+	 * one bind_gem_at per BO, so keeping these as unconditional
+	 * device_printfs flooded the serial console at frame rate.  Keep
+	 * the readback (helpful when a BO bound wrong) at level>1; keep
+	 * the post-store view (helpful for post-batch debug) at level>2.
+	 */
+	if (sc->sc_debug > 1) {
+		vm_paddr_t pa0 = VM_PAGE_TO_PHYS(obj->pages[0]);
+		uint32_t *kva0 = (uint32_t *)PHYS_TO_DMAP(pa0);
+
+		device_printf(sc->dev,
+		    "gtt_bind_gem_at: %zu page(s), softpin=0x%llx (slot 0x%x), "
+		    "pa[0]=0x%llx, pte[0]=0x%llx, readback=0x%llx\n",
+		    obj->npages, (unsigned long long)ggtt_byte_addr,
+		    first_idx, (unsigned long long)pa0,
+		    (unsigned long long)((pa0 & ~0xfffULL) | GTT_PTE_VALID |
+		        GTT_PTE_WRITEABLE),
+		    (unsigned long long)igen_gtt_read(sc, first_idx));
+		if (sc->sc_debug > 2) {
+			device_printf(sc->dev,
+			    "gtt_bind_gem_at: BO[0..7]  = %08x %08x %08x %08x %08x %08x %08x %08x\n",
+			    kva0[0], kva0[1], kva0[2], kva0[3],
+			    kva0[4], kva0[5], kva0[6], kva0[7]);
+			device_printf(sc->dev,
+			    "gtt_bind_gem_at: BO[0x40] = %08x  (post-execbuffer2 store target)\n",
+			    kva0[0x40]);
+		}
+	}
 	return (0);
 }
 

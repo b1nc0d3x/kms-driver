@@ -1075,22 +1075,18 @@ igen_i915_gem_execbuffer2(struct drm_file *file,
 		 * Post-dispatch readback of the batch BO from the kernel-
 		 * mapped view: proves via dmesg whether the engine's
 		 * MI_STORE_DWORD_IMM (or similar side-effect) actually
-		 * landed in the physical pages we bound.  The value at
-		 * offset 0x100 is the current proof target for
-		 * exec2_test.c.  Cleaned up once softpin proof is signed
-		 * off.
+		 * landed in the physical pages we bound.  Gated behind
+		 * dev.igen.<n>.debug > 2 — wbinvd on every batch flushed
+		 * the whole CPU cache at frame rate, and iris/kwin issue
+		 * batches constantly; a live GL session was multiple orders
+		 * of magnitude slower with the unconditional wbinvd.
+		 * Enable only for exec2_test-style bring-up runs.
 		 */
-		{
+		if (sc->sc_debug > 2) {
 			struct drm_gem_object *bo = gem_refs[batch_idx];
 			if (bo != NULL && bo->pages != NULL && bo->npages > 0) {
 				vm_paddr_t pa = VM_PAGE_TO_PHYS(bo->pages[0]);
 				uint32_t *kva = (uint32_t *)PHYS_TO_DMAP(pa);
-				/* Kernel direct-map is WB.  GPU writes with UC
-				 * PTE go straight to RAM and bypass CPU cache
-				 * — flush the direct-map cache lines before
-				 * reading so we see what the engine actually
-				 * left in the page.  wbinvd is heavy but this
-				 * path is a diagnostic. */
 				wbinvd();
 				device_printf(sc->dev,
 				    "execbuffer2: post BO[0..7] = %08x %08x %08x %08x %08x %08x %08x %08x\n",
