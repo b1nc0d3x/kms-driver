@@ -155,7 +155,8 @@ kms_hw_dri_acquire(void)
 		sysctl_ctx_init(&kms_hw_dri_ctx);
 		kms_hw_dri_oid = SYSCTL_ADD_NODE(&kms_hw_dri_ctx,
 		    SYSCTL_STATIC_CHILDREN(_hw), OID_AUTO, "dri",
-		    CTLFLAG_RD, NULL, "DRI devices (libdrm compat)");
+		    CTLFLAG_RD | CTLFLAG_MPSAFE, NULL,
+		    "DRI devices (libdrm compat)");
 	}
 	kms_hw_dri_refs++;
 	sx_xunlock(&kms_hw_dri_lock);
@@ -192,7 +193,7 @@ kms_set_busid_pci(struct drm_device *dev, uint32_t domain, uint32_t bus,
 	snprintf(card_name, sizeof(card_name), "%d", dev->minor);
 	card = SYSCTL_ADD_NODE(&dev->busid_sysctl_ctx,
 	    SYSCTL_CHILDREN(kms_hw_dri_oid), OID_AUTO, card_name,
-	    CTLFLAG_RD, NULL, "DRI card");
+	    CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, "DRI card");
 	SYSCTL_ADD_STRING(&dev->busid_sysctl_ctx, SYSCTL_CHILDREN(card),
 	    OID_AUTO, "busid", CTLFLAG_RD, dev->busid, 0,
 	    "PCI bus-id for libdrm drmParsePciBusInfo()");
