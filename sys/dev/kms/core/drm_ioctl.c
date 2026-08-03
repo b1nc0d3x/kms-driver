@@ -41,7 +41,8 @@
  * traced line.
  */
 static int kms_ioctl_trace = 0;
-SYSCTL_NODE(_kern, OID_AUTO, kms, CTLFLAG_RD, NULL, "KMS framework");
+SYSCTL_NODE(_kern, OID_AUTO, kms, CTLFLAG_RD | CTLFLAG_MPSAFE, NULL,
+    "KMS framework");
 SYSCTL_INT(_kern_kms, OID_AUTO, ioctl_trace, CTLFLAG_RWTUN,
     &kms_ioctl_trace, 0,
     "Print every DRM ioctl entry + return (0 off, 1 entry, 2 entry+exit)");
