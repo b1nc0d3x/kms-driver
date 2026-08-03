@@ -215,8 +215,8 @@ static TAILQ_HEAD(, drm_device) kms_devices =
  */
 
 int
-kms_dev_register(const struct drm_driver *driver, void *driver_priv,
-    struct drm_device **out_dev)
+kms_dev_register_versioned(const struct drm_driver *driver, void *driver_priv,
+    size_t caller_devsize, struct drm_device **out_dev)
 {
 	struct drm_device *dev;
 	struct make_dev_args args;
@@ -224,6 +224,24 @@ kms_dev_register(const struct drm_driver *driver, void *driver_priv,
 
 	if (driver == NULL || driver->name == NULL || out_dev == NULL)
 		return (EINVAL);
+
+	/*
+	 * ABI guard.  The caller's sizeof(struct drm_device) is passed
+	 * via the kms_dev_register() macro; it must match ours.  A
+	 * mismatch means the consumer .ko (rk_kms.ko, igen.ko, ...) was
+	 * compiled against a different header layout than the currently-
+	 * loaded kms.ko.  Every field access from the consumer will land
+	 * at the wrong offset.  Refuse the registration with a loud
+	 * diagnostic instead of the "panic during first ioctl" mode the
+	 * 2026-08-03 rk_kms_set_config crash exposed.
+	 */
+	if (caller_devsize != sizeof(struct drm_device)) {
+		printf("kms: struct drm_device ABI mismatch — driver \"%s\" "
+		    "compiled with sizeof=%zu but kms.ko has sizeof=%zu.  "
+		    "Rebuild the whole module set from the current tree.\n",
+		    driver->name, caller_devsize, sizeof(struct drm_device));
+		return (EPROTONOSUPPORT);
+	}
 
 	dev = malloc(sizeof(*dev), M_KMS, M_WAITOK | M_ZERO);
 	sx_init(&dev->dev_lock, "drmdev");
