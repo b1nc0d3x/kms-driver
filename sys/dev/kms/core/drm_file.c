@@ -341,6 +341,53 @@ kms_poll(struct cdev *cdev __unused, int events, struct thread *td)
 	return (revents);
 }
 
+/*
+ * kqueue EVFILT_READ support (M2).  wlroots / Weston / kwin on
+ * FreeBSD reach the DRM fd through libepoll-shim which is kqueue
+ * underneath — without a d_kqfilter, EVFILT_READ registration on
+ * /dev/dri/cardN returns EINVAL and the compositor can't wait on
+ * page-flip events.
+ *
+ * Wired to file->event_select.si_note; selwakeup() in kms_send_event
+ * triggers KNOTE fanout so we don't need a separate wake path.
+ */
+static void
+kms_kqrdetach(struct knote *kn)
+{
+	struct drm_file *file = kn->kn_hook;
+
+	knlist_remove(&file->event_select.si_note, kn, 0);
+}
+
+static int
+kms_kqrevent(struct knote *kn, long hint __unused)
+{
+	struct drm_file *file = kn->kn_hook;
+
+	return (TAILQ_EMPTY(&file->events) ? 0 : 1);
+}
+
+static const struct filterops kms_read_filtops = {
+	.f_isfd		= 1,
+	.f_detach	= kms_kqrdetach,
+	.f_event	= kms_kqrevent,
+};
+
+static int
+kms_kqfilter(struct cdev *cdev __unused, struct knote *kn)
+{
+	struct drm_file *file;
+
+	if (devfs_get_cdevpriv((void **)&file) != 0 || file == NULL)
+		return (ENXIO);
+	if (kn->kn_filter != EVFILT_READ)
+		return (EINVAL);
+	kn->kn_fop = &kms_read_filtops;
+	kn->kn_hook = file;
+	knlist_add(&file->event_select.si_note, kn, 0);
+	return (0);
+}
+
 struct cdevsw kms_cdevsw = {
 	.d_version =		D_VERSION,
 	.d_name =		"kms",
@@ -348,5 +395,6 @@ struct cdevsw kms_cdevsw = {
 	.d_read =		kms_read,
 	.d_ioctl =		kms_ioctl,
 	.d_poll =		kms_poll,
+	.d_kqfilter =		kms_kqfilter,
 	.d_mmap_single =	kms_mmap_single,
 };

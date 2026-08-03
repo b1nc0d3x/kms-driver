@@ -51,6 +51,15 @@ kms_event_queue_init(struct drm_file *file)
 	TAILQ_INIT(&file->events);
 	file->events_bytes = 0;
 	bzero(&file->event_select, sizeof(file->event_select));
+	/*
+	 * Initialize the selinfo's embedded knlist under event_mtx so
+	 * kqueue attach (kms_kqfilter) + selwakeup KNOTE fanout share
+	 * the same lock as the event queue itself.  Without this, an
+	 * EVFILT_READ registration on /dev/dri/cardN would either fault
+	 * on knlist_add (kl_lock == NULL) or race with kms_send_event.
+	 * M2 from the 2026-08-01 review.
+	 */
+	knlist_init_mtx(&file->event_select.si_note, &file->event_mtx);
 }
 
 void
@@ -67,6 +76,7 @@ kms_event_queue_drain(struct drm_file *file)
 	}
 	mtx_unlock(&file->event_mtx);
 	seldrain(&file->event_select);
+	knlist_destroy(&file->event_select.si_note);
 	mtx_destroy(&file->event_mtx);
 }
 
