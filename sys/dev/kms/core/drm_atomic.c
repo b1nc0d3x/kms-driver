@@ -778,6 +778,25 @@ kms_ioctl_mode_atomic(struct drm_file *file, struct drm_mode_atomic *r)
 		return (EINVAL);
 	if (r->count_objs == 0 || r->count_objs > DRM_ATOMIC_MAX_OBJS)
 		return (EINVAL);
+	/*
+	 * Only these four flags are meaningful for MODE_ATOMIC.  Reject
+	 * anything else so a uapi mismatch fails loudly instead of the
+	 * unknown bit reaching a driver's atomic_commit hook and getting
+	 * interpreted differently by different silicon.  Matches Linux
+	 * drm_mode_atomic_ioctl's DRM_MODE_ATOMIC_FLAGS mask.
+	 */
+	if ((r->flags & ~(uint32_t)(DRM_MODE_ATOMIC_TEST_ONLY |
+	    DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_ATOMIC_ALLOW_MODESET |
+	    DRM_MODE_PAGE_FLIP_EVENT)) != 0)
+		return (EINVAL);
+	/*
+	 * TEST_ONLY + NONBLOCK together is nonsensical (there's nothing to
+	 * block on if we're not committing) and Linux rejects it — do the
+	 * same to keep behaviour identical.
+	 */
+	if ((r->flags & DRM_MODE_ATOMIC_TEST_ONLY) != 0 &&
+	    (r->flags & DRM_MODE_ATOMIC_NONBLOCK) != 0)
+		return (EINVAL);
 
 	objs = malloc((size_t)r->count_objs * sizeof(uint32_t), M_KMS,
 	    M_WAITOK);
