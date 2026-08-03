@@ -107,13 +107,21 @@ static int
 kms_prime_fo_mmap(struct file *fp, vm_map_t map __unused,
     vm_offset_t *addr __unused, vm_size_t size, vm_prot_t prot __unused,
     vm_prot_t cap_maxprot __unused, int flags __unused,
-    vm_ooffset_t foff __unused, struct thread *td __unused)
+    vm_ooffset_t foff, struct thread *td __unused)
 {
 	struct kms_prime_file *pf = fp->f_data;
+	vm_ooffset_t end;
 
 	if (pf == NULL || pf->obj == NULL)
 		return (ENXIO);
-	if (size > pf->obj->size)
+	/*
+	 * Reject partial / past-end mappings.  Previous check ignored foff,
+	 * so a caller passing (foff=obj->size-4, size=8) would slide 4 bytes
+	 * past the end into whatever the pager returns for an
+	 * out-of-range offset.  Overflow-check the sum too.
+	 */
+	end = foff + (vm_ooffset_t)size;
+	if (end < foff || end > (vm_ooffset_t)pf->obj->size)
 		return (EINVAL);
 	/*
 	 * The actual vm_object install happens in vm_mmap_object via the
@@ -128,7 +136,7 @@ kms_prime_fo_mmap(struct file *fp, vm_map_t map __unused,
 
 static int
 kms_prime_fo_stat(struct file *fp, struct stat *sb,
-    struct ucred *active_cred __unused)
+    struct ucred *active_cred)
 {
 	struct kms_prime_file *pf = fp->f_data;
 
