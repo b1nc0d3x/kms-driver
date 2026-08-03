@@ -354,6 +354,34 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 		r->pad = 0;
 		return (0);
 	}
+	case DRM_IOCTL_MODE_GET_LEASE: {
+		/*
+		 * Same stub shape as LIST_LESSEES: reflect an empty
+		 * object list back so probes for "what does the lessee
+		 * hold" get a well-formed answer.  We aren't actually
+		 * lessees of anything (CREATE_LEASE is unsupported), so
+		 * zero is the truthful count.
+		 */
+		struct drm_mode_get_lease *r =
+		    (struct drm_mode_get_lease *)data;
+
+		r->count_objects = 0;
+		r->pad = 0;
+		return (0);
+	}
+	case DRM_IOCTL_MODE_CREATE_LEASE:
+	case DRM_IOCTL_MODE_REVOKE_LEASE:
+		/*
+		 * Lease creation / revocation need per-fd object-id
+		 * filtering plumbed through every mode ioctl, which
+		 * isn't landed yet.  Return EOPNOTSUPP so lease-aware
+		 * userspace (kwin_wayland's DRM lease VR path, weston
+		 * headless helpers) can detect the missing surface and
+		 * skip the leased-connector code path cleanly instead
+		 * of assuming the ioctl was reachable and getting stuck
+		 * on an unexpected ENOTTY.
+		 */
+		return (EOPNOTSUPP);
 	case DRM_IOCTL_SET_MASTER: {
 		/*
 		 * Become master on this device.  Demote any other current
