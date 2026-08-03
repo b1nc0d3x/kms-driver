@@ -135,8 +135,11 @@ kms_framebuffer_create(struct drm_file *file,
 	fb->width = fb_cmd->width;
 	fb->height = fb_cmd->height;
 	fb->format = fb_cmd->pixel_format;
-	fb->modifier = (fb_cmd->flags & DRM_MODE_FB_MODIFIERS) ?
-	    fb_cmd->modifier[0] : 0;
+	if (fb_cmd->flags & DRM_MODE_FB_MODIFIERS) {
+		for (i = 0; i < DRM_FORMAT_MAX_PLANES; i++)
+			fb->modifiers[i] = fb_cmd->modifier[i];
+	}
+	/* else: all-zero (linear) via M_ZERO alloc above */
 
 	/*
 	 * Resolve every non-zero handle and pin the GEM object.  We

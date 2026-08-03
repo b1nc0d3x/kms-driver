@@ -33,7 +33,14 @@ struct drm_framebuffer {
 	uint32_t			 pitches[DRM_FORMAT_MAX_PLANES];
 	uint32_t			 offsets[DRM_FORMAT_MAX_PLANES];
 	uint32_t			 handles[DRM_FORMAT_MAX_PLANES];
-	uint64_t			 modifier;
+	/*
+	 * Per-plane DRM format modifier (AFBC, tiled, etc.) as passed
+	 * in via ADDFB2's DRM_MODE_FB_MODIFIERS flag.  Zero on the
+	 * legacy path (linear).  Drivers inspect at scan-out time and
+	 * accept/reject via their plane->funcs->atomic_check hook.
+	 * Storing per-plane (not scalar) so future NV12+AFBC works.
+	 */
+	uint64_t			 modifiers[DRM_FORMAT_MAX_PLANES];
 	/*
 	 * GEM object references held while the framebuffer is alive.
 	 * Phase 6 buffers are single-plane, but the slots are sized so a
