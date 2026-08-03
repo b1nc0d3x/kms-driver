@@ -309,6 +309,11 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 		case DRM_IOCTL_MODE_ADDFB2:
 		case DRM_IOCTL_MODE_RMFB:
 		case DRM_IOCTL_MODE_CLOSEFB:
+		case DRM_IOCTL_MODE_SETGAMMA:
+		case DRM_IOCTL_MODE_CURSOR:
+		case DRM_IOCTL_MODE_CURSOR2:
+		case DRM_IOCTL_MODE_DIRTYFB:
+		case DRM_IOCTL_MODE_OBJ_SETPROPERTY:
 		case DRM_IOCTL_WAIT_VBLANK:
 			return (EACCES);
 		}
@@ -337,6 +342,7 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 		case DRM_IOCTL_MODE_CURSOR2:
 		case DRM_IOCTL_MODE_DIRTYFB:
 		case DRM_IOCTL_MODE_SETPLANE:
+		case DRM_IOCTL_MODE_OBJ_SETPROPERTY:
 			return (EACCES);
 		}
 	}
