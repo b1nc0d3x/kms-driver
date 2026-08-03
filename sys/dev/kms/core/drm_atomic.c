@@ -453,6 +453,28 @@ kms_atomic_get_plane_state(struct drm_atomic_state *state,
 	return (state->plane_states[plane->index]);
 }
 
+int
+kms_atomic_check_planes(struct drm_atomic_state *state)
+{
+	struct drm_plane_state *ps;
+	uint32_t i;
+	int error;
+
+	if (state == NULL || state->plane_states == NULL)
+		return (0);
+	for (i = 0; i < state->num_plane; i++) {
+		ps = state->plane_states[i];
+		if (ps == NULL || ps->plane == NULL ||
+		    ps->plane->funcs == NULL ||
+		    ps->plane->funcs->atomic_check == NULL)
+			continue;
+		error = ps->plane->funcs->atomic_check(ps->plane, ps);
+		if (error != 0)
+			return (error);
+	}
+	return (0);
+}
+
 struct drm_connector_state *
 kms_atomic_get_connector_state(struct drm_atomic_state *state,
     struct drm_connector *connector)

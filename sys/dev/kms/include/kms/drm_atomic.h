@@ -181,4 +181,14 @@ int	kms_atomic_state_set_property(struct drm_atomic_state *state,
 	    struct drm_mode_object *obj, struct drm_property *prop,
 	    uint64_t value);
 
+/*
+ * Fan out per-plane validation.  Walks every non-NULL slot in
+ * state->plane_states and calls that plane's funcs->atomic_check hook
+ * (if set).  Returns the first non-zero errno; on success every touched
+ * plane has been accepted by its driver.  Drivers can call this from
+ * mode_config.funcs->atomic_check to keep per-plane rules where they
+ * belong instead of switch-casing on plane->type in a monolithic hook.
+ */
+int	kms_atomic_check_planes(struct drm_atomic_state *state);
+
 #endif /* _KMS_DRM_ATOMIC_H_ */

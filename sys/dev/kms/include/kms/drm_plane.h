@@ -13,6 +13,7 @@
 
 struct drm_device;
 struct drm_plane;
+struct drm_plane_state;
 struct drm_crtc;
 struct drm_framebuffer;
 
@@ -24,6 +25,17 @@ enum drm_plane_type {
 
 struct drm_plane_funcs {
 	void	(*destroy)(struct drm_plane *plane);
+	/*
+	 * Per-plane validation.  Called by kms_atomic_check_planes for
+	 * every plane touched in the batch after property resolution and
+	 * before any device-wide atomic_check.  Return 0 to accept the
+	 * proposed state, an errno on rejection (typically EINVAL for
+	 * unsupported format/scaling, ENOSPC for out-of-bounds).  Optional
+	 * — a NULL hook means the framework accepts any proposed state
+	 * for this plane (current behaviour, back-compat).
+	 */
+	int	(*atomic_check)(struct drm_plane *plane,
+		    struct drm_plane_state *new_state);
 };
 
 struct drm_plane {
