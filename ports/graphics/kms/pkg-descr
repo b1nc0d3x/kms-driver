@@ -1,0 +1,17 @@
+Native FreeBSD KMS (kernel mode-setting) driver framework.
+
+Written from scratch, no LinuxKPI shim.  Provides drm_device /
+drm_file / drm_gem / drm_prime / drm_atomic / drm_mode_* plumbing and
+the DRM ioctl surface (44 ioctls implemented, poll(2) and EVFILT_READ
+on /dev/dri/cardN, per-plane atomic_check hook, per-plane format
+modifiers).  Xorg's modesetting driver and simple Wayland compositors
+work against it once a hardware driver attaches to a real display
+engine.
+
+This port installs only the framework (kms.ko).  Vendor drivers live
+in sys/dev/kms/drivers/ in the source tree and have their own build
+requirements (rk_kms needs the out-of-tree FUSB302 USB-C PD driver;
+igen targets Intel Gen9+ on amd64).  Build them separately from the
+source drop after installing this port.
+
+Source repository: https://github.com/b1nc0d3x/kms-driver
