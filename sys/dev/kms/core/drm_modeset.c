@@ -168,6 +168,139 @@ kms_ioctl_mode_rmfb(struct drm_file *file, uint32_t *fb_id)
 	return (0);
 }
 
+/*
+ * CLOSEFB is the "modern" version of RMFB — same lifecycle-drop, but
+ * per uapi it must not disable planes that still reference the fb.  We
+ * already have that semantic: cleanup unregisters + drops the creation
+ * ref; live plane bindings keep the fb alive via their own refs until
+ * they're replaced or torn down.  So the implementation is literally
+ * rmfb with a padding check.
+ */
+int
+kms_ioctl_mode_closefb(struct drm_file *file, struct drm_mode_closefb *arg)
+{
+	if (file == NULL || arg == NULL)
+		return (EINVAL);
+	if (arg->pad != 0)
+		return (EINVAL);
+	return (kms_ioctl_mode_rmfb(file, &arg->fb_id));
+}
+
+/*
+ * FourCC → (bpp, depth) for the packed single-plane formats GETFB
+ * legacy expects.  Returns 0 on success, EINVAL for anything the
+ * legacy struct can't describe (planar / paletted / >32 bpp).  depth
+ * is the X11-style visible-bit count (24 for XRGB8888, 30 for
+ * XRGB2101010, 16 for RGB565, 15 for XRGB1555).
+ */
+static int
+kms_fb_format_bpp_depth(uint32_t fourcc, uint32_t *bpp, uint32_t *depth)
+{
+	switch (fourcc) {
+	case DRM_FORMAT_RGB565:
+	case DRM_FORMAT_BGR565:
+		*bpp = 16; *depth = 16; return (0);
+	case DRM_FORMAT_XRGB1555:
+	case DRM_FORMAT_XBGR1555:
+		*bpp = 16; *depth = 15; return (0);
+	case DRM_FORMAT_ARGB1555:
+	case DRM_FORMAT_ABGR1555:
+		*bpp = 16; *depth = 16; return (0);
+	case DRM_FORMAT_RGB888:
+	case DRM_FORMAT_BGR888:
+		*bpp = 24; *depth = 24; return (0);
+	case DRM_FORMAT_XRGB8888:
+	case DRM_FORMAT_XBGR8888:
+	case DRM_FORMAT_RGBX8888:
+	case DRM_FORMAT_BGRX8888:
+		*bpp = 32; *depth = 24; return (0);
+	case DRM_FORMAT_ARGB8888:
+	case DRM_FORMAT_ABGR8888:
+	case DRM_FORMAT_RGBA8888:
+	case DRM_FORMAT_BGRA8888:
+		*bpp = 32; *depth = 32; return (0);
+	case DRM_FORMAT_XRGB2101010:
+	case DRM_FORMAT_XBGR2101010:
+		*bpp = 32; *depth = 30; return (0);
+	case DRM_FORMAT_ARGB2101010:
+	case DRM_FORMAT_ABGR2101010:
+		*bpp = 32; *depth = 30; return (0);
+	}
+	return (EINVAL);
+}
+
+/*
+ * GETFB: fill drm_mode_fb_cmd from a live fb.  Handle exposure follows
+ * Linux — only masters see it, since a raw GEM handle number lets a
+ * non-master compositor peek at another fd's scanout buffer.  Planar
+ * formats can't be described by this legacy struct, so we reject them
+ * with EINVAL and expect the caller to fall back to GETFB2.
+ */
+int
+kms_ioctl_mode_getfb(struct drm_file *file, struct drm_mode_fb_cmd *r)
+{
+	struct drm_mode_object *obj;
+	struct drm_framebuffer *fb;
+	uint32_t bpp, depth;
+	int error;
+
+	if (file == NULL || r == NULL)
+		return (EINVAL);
+	obj = kms_mode_object_find(file->dev, r->fb_id, DRM_MODE_OBJECT_FB);
+	if (obj == NULL)
+		return (ENOENT);
+	fb = __containerof(obj, struct drm_framebuffer, base);
+	error = kms_fb_format_bpp_depth(fb->format, &bpp, &depth);
+	if (error != 0) {
+		kms_mode_object_put(obj);
+		return (error);
+	}
+	r->width  = fb->width;
+	r->height = fb->height;
+	r->pitch  = fb->pitches[0];
+	r->bpp    = bpp;
+	r->depth  = depth;
+	r->handle = file->is_master ? fb->handles[0] : 0;
+	kms_mode_object_put(obj);
+	return (0);
+}
+
+/*
+ * GETFB2: fill drm_mode_fb_cmd2 from a live fb, including per-plane
+ * pitches/offsets/handles/modifier and the source pixel_format.  Same
+ * master-only rule for handles as GETFB.  Unlike GETFB this accepts
+ * any format we recognized on ADDFB2, since the struct can carry
+ * planar layouts.
+ */
+int
+kms_ioctl_mode_getfb2(struct drm_file *file, struct drm_mode_fb_cmd2 *r)
+{
+	struct drm_mode_object *obj;
+	struct drm_framebuffer *fb;
+	int i;
+
+	if (file == NULL || r == NULL)
+		return (EINVAL);
+	obj = kms_mode_object_find(file->dev, r->fb_id, DRM_MODE_OBJECT_FB);
+	if (obj == NULL)
+		return (ENOENT);
+	fb = __containerof(obj, struct drm_framebuffer, base);
+	r->width        = fb->width;
+	r->height       = fb->height;
+	r->pixel_format = fb->format;
+	r->flags        = 0;
+	for (i = 0; i < DRM_FORMAT_MAX_PLANES; i++) {
+		r->pitches[i]  = fb->pitches[i];
+		r->offsets[i]  = fb->offsets[i];
+		r->handles[i]  = file->is_master ? fb->handles[i] : 0;
+		r->modifier[i] = fb->modifiers[i];
+		if (fb->modifiers[i] != 0)
+			r->flags |= DRM_MODE_FB_MODIFIERS;
+	}
+	kms_mode_object_put(obj);
+	return (0);
+}
+
 int
 kms_ioctl_mode_setcrtc(struct drm_file *file, struct drm_mode_crtc *r)
 {
