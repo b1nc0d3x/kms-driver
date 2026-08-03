@@ -454,6 +454,17 @@ kms_ioctl_mode_page_flip(struct drm_file *file,
 	if (file == NULL || r == NULL)
 		return (EINVAL);
 
+	/*
+	 * Reject unknown flag bits per Linux drm_mode_page_flip_ioctl —
+	 * silently ignoring bits userspace didn't understand hides driver
+	 * / uapi mismatches until an unrelated flip regresses in a way
+	 * that's hard to trace.  ASYNC is rejected here because our
+	 * commit path always waits for the next vblank to fire
+	 * FLIP_COMPLETE; asserting it would lie about semantics.
+	 */
+	if ((r->flags & ~(uint32_t)DRM_MODE_PAGE_FLIP_EVENT) != 0)
+		return (EINVAL);
+
 	crtc_obj = kms_mode_object_find(file->dev, r->crtc_id,
 	    DRM_MODE_OBJECT_CRTC);
 	if (crtc_obj == NULL)
