@@ -82,6 +82,16 @@ MALLOC_DECLARE(M_KMS);
 #define	GTT_PTE_SIZE		8
 #define	GTT_PTE_VALID		(1u << 0)
 #define	GTT_PTE_WRITEABLE	(1u << 1)
+/*
+ * GTT window is 8 MiB (BAR0 + 0x800000 .. + 0xfffff8).  At 8 bytes per
+ * PTE that's exactly 0x100000 entries.  H7: without this bound a
+ * caller-supplied entry_idx (traceable back to a userspace-controlled
+ * framebuffer geometry via bind_user_fb) can push the write past the
+ * GTT window into whatever MMIO region follows — a stealthy write-
+ * anywhere primitive.  Enforce the bound at the leaf writer/reader
+ * so no future caller has to remember to pre-validate.
+ */
+#define	GTT_ENTRIES		0x00100000
 
 /*
  * Primary-plane registers needed for the page-flip path.  PLANE_SURF is
@@ -97,9 +107,16 @@ MALLOC_DECLARE(M_KMS);
 uint64_t
 igen_gtt_read(struct igen_softc *sc, uint32_t entry_idx)
 {
-	uint32_t off = GTT_BASE + entry_idx * GTT_PTE_SIZE;
-	uint32_t lo = igen_r32(sc, off);
-	uint32_t hi = igen_r32(sc, off + 4);
+	uint32_t off, lo, hi;
+
+	if (entry_idx >= GTT_ENTRIES) {
+		printf("igen: gtt_read entry_idx=0x%x out of range (max 0x%x)\n",
+		    entry_idx, GTT_ENTRIES - 1);
+		return (0);
+	}
+	off = GTT_BASE + entry_idx * GTT_PTE_SIZE;
+	lo = igen_r32(sc, off);
+	hi = igen_r32(sc, off + 4);
 	return ((uint64_t)hi << 32) | lo;
 }
 
@@ -107,7 +124,23 @@ void
 igen_gtt_write(struct igen_softc *sc, uint32_t entry_idx,
     uint64_t pte)
 {
-	uint32_t off = GTT_BASE + entry_idx * GTT_PTE_SIZE;
+	uint32_t off;
+
+	if (entry_idx >= GTT_ENTRIES) {
+		/*
+		 * H7 backstop.  Callers that walk fb->gem_objs[0] page arrays
+		 * (bind_user_fb, bind_cursor) should already keep first_idx +
+		 * npages under GTT_ENTRIES, but a hostile framebuffer with
+		 * bogus geometry could otherwise pass a huge npages and turn
+		 * this into an MMIO write-anywhere.  Log + refuse instead of
+		 * corrupting adjacent MMIO regions.
+		 */
+		printf("igen: gtt_write entry_idx=0x%x out of range (max 0x%x)"
+		    " — REFUSED (H7 backstop)\n",
+		    entry_idx, GTT_ENTRIES - 1);
+		return;
+	}
+	off = GTT_BASE + entry_idx * GTT_PTE_SIZE;
 	igen_w32(sc, off, (uint32_t)pte);
 	igen_w32(sc, off + 4, (uint32_t)(pte >> 32));
 }
