@@ -770,14 +770,6 @@ igen_i915_query_one(struct drm_i915_query_item *item)
 	return (0);
 }
 
-/*
- * M7: cap num_items.  Without a bound a caller can pass 4G items and
- * spin the kernel through 4G × (copyin + query + copyout) — a
- * user-triggerable DoS.  Linux caps at ~16; we're generous at 64 to
- * survive future iris query batches without inviting abuse.
- */
-#define	IGEN_I915_QUERY_MAX_ITEMS	64
-
 static int
 igen_i915_query(struct drm_file *file __unused, struct drm_i915_query *q)
 {
@@ -785,8 +777,14 @@ igen_i915_query(struct drm_file *file __unused, struct drm_i915_query *q)
 	int error;
 	uint32_t i;
 
-	if (q->num_items > IGEN_I915_QUERY_MAX_ITEMS)
-		return (EINVAL);
+	/*
+	 * M7: cap num_items so a hostile caller can't wedge a kernel
+	 * thread with a 4G-item loop of copyin/copyout.  Linux's iris
+	 * driver caps at ~16 in practice; 64 gives ample headroom for
+	 * any legitimate query enumeration.
+	 */
+	if (q->num_items > 64)
+		return (E2BIG);
 
 	for (i = 0; i < q->num_items; i++) {
 		void *uptr = (void *)(uintptr_t)(q->items_ptr +
