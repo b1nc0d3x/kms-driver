@@ -307,8 +307,29 @@ igen_gtt_bind_gem_at(struct igen_softc *sc, struct drm_gem_object *obj,
 	if ((ggtt_byte_addr & (PAGE_SIZE - 1)) != 0)
 		return (EINVAL);
 
-	uint32_t first_idx = (uint32_t)(ggtt_byte_addr / PAGE_SIZE);
-	uint32_t bind_end = first_idx + (uint32_t)obj->npages;
+	/*
+	 * H4 (2026-08-03 review): do the range math in u64 and reject
+	 * addresses past the physical GGTT.  Previously first_idx was a
+	 * u32 truncation of ggtt_byte_addr/PAGE_SIZE, so a userspace
+	 * softpin near 0xFFFFFF00_00000 would alias to a low index that
+	 * passed the reservation-overlap check, then igen_gtt_write's H7
+	 * backstop would also see the truncated index and let the write
+	 * through.  With i915_dispatch_enable that was arbitrary GGTT
+	 * remap from any unprivileged client.
+	 */
+	uint64_t first_page = ggtt_byte_addr / PAGE_SIZE;
+	uint64_t last_page = first_page + (uint64_t)obj->npages;
+	if (last_page < first_page ||	/* u64 wrap */
+	    last_page > (uint64_t)GTT_ENTRIES) {
+		device_printf(sc->dev,
+		    "gtt_bind_gem_at: softpin=0x%jx npages=%zu"
+		    " past GGTT ceiling (0x%x pages)\n",
+		    (uintmax_t)ggtt_byte_addr, obj->npages, GTT_ENTRIES);
+		return (EINVAL);
+	}
+
+	uint32_t first_idx = (uint32_t)first_page;
+	uint32_t bind_end = (uint32_t)last_page;
 	if (first_idx < rsv_end && bind_end > rsv_start) {
 		device_printf(sc->dev,
 		    "gtt_bind_gem_at: softpin range [0x%x..0x%x)"

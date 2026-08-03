@@ -23,6 +23,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/event.h>
 #include <sys/kernel.h>
 #include <sys/lock.h>
 #include <sys/malloc.h>
@@ -117,6 +118,17 @@ kms_send_event(struct drm_file *file, const void *data, size_t length)
 	TAILQ_INSERT_TAIL(&file->events, ev, link);
 	file->events_bytes += length;
 	wakeup(&file->events);
+	/*
+	 * M1 (2026-08-03 review): selwakeup only walks si_tdlist (poll/
+	 * select waiters); it never fans out to si_note.  Without an
+	 * explicit KNOTE call here, EVFILT_READ registered via
+	 * kms_kqfilter attaches but never fires — epoll-shim compositors
+	 * (wlroots / kwin / weston) block forever on FLIP_COMPLETE.
+	 * si_note's knlist is bound to event_mtx (see
+	 * kms_event_queue_init), so use KNOTE_LOCKED while we still hold
+	 * it.  Matches the pattern in kern/tty.c under t_lock.
+	 */
+	KNOTE_LOCKED(&file->event_select.si_note, 0);
 	mtx_unlock(&file->event_mtx);
 
 	selwakeup(&file->event_select);

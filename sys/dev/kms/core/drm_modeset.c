@@ -508,13 +508,19 @@ kms_ioctl_mode_page_flip(struct drm_file *file,
 		}
 	}
 
-	if (crtc->funcs != NULL && crtc->funcs->page_flip != NULL)
-		error = crtc->funcs->page_flip(crtc, fb, r->flags, r->user_data);
-
-	if (error == 0) {
+	{
 		struct drm_framebuffer *old_fb;
 		bool have_event = (r->flags & DRM_MODE_PAGE_FLIP_EVENT) != 0;
 
+		/*
+		 * M3 (2026-08-03 review): arm pending_flip_file BEFORE calling
+		 * funcs->page_flip — a driver whose vblank IRQ fires between
+		 * hardware programming and our post-call stash would find
+		 * pending_flip_file NULL and drop the FLIP_COMPLETE event on
+		 * the floor.  If page_flip returns error we roll back the arm
+		 * under the same mutex.  Matches Linux drm_atomic_helper_
+		 * page_flip's arm-then-commit shape.
+		 */
 		sx_xlock(&file->dev->mode_config.mutex);
 		old_fb = crtc->primary_fb;
 		/*
@@ -529,21 +535,41 @@ kms_ioctl_mode_page_flip(struct drm_file *file,
 		kms_mode_object_get(&fb->base);
 		crtc->primary_fb = fb;
 		if (have_event) {
-			/*
-			 * If PAGE_FLIP_EVENT was requested, stash the requesting
-			 * file + user cookie so the next vblank IRQ emits a
-			 * FLIP_COMPLETE event.  H4: take a drm_file ref so the
-			 * stash survives a close() that races the IRQ.  H3: also
-			 * stash old_fb (already held via primary_fb ref) so the
-			 * vblank handler can drop it after latch, not before.
-			 */
 			crtc->pending_flip_file = file;
 			crtc->pending_flip_user_data = r->user_data;
 			crtc->pending_flip_old_fb = old_fb;
 			kms_file_get(file);
-			old_fb = NULL;	/* ownership handed to vblank handler */
 		}
 		sx_xunlock(&file->dev->mode_config.mutex);
+
+		if (crtc->funcs != NULL && crtc->funcs->page_flip != NULL)
+			error = crtc->funcs->page_flip(crtc, fb, r->flags,
+			    r->user_data);
+
+		if (error != 0) {
+			/*
+			 * Roll back the arm.  Under mode_config.mutex so a vblank
+			 * handler racing us either sees the armed state (and fires
+			 * FLIP_COMPLETE, spurious but harmless — HW didn't actually
+			 * flip since page_flip failed) or the cleared state.  Rare
+			 * path; simpler to leave the mode_config commit in place
+			 * than to also revert primary_fb.
+			 */
+			sx_xlock(&file->dev->mode_config.mutex);
+			if (have_event && crtc->pending_flip_file == file) {
+				crtc->pending_flip_file = NULL;
+				crtc->pending_flip_old_fb = NULL;
+				kms_file_put(file);
+				have_event = false;
+			}
+			/* undo primary_fb swap */
+			kms_mode_object_put(&fb->base);
+			crtc->primary_fb = old_fb;
+			sx_xunlock(&file->dev->mode_config.mutex);
+			old_fb = NULL;	/* still installed */
+		} else if (have_event) {
+			old_fb = NULL;	/* ownership handed to vblank handler */
+		}
 		if (old_fb != NULL)
 			kms_mode_object_put(&old_fb->base);
 	}

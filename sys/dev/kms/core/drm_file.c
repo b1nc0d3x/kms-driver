@@ -361,8 +361,11 @@ kms_poll(struct cdev *cdev __unused, int events, struct thread *td)
  * /dev/dri/cardN returns EINVAL and the compositor can't wait on
  * page-flip events.
  *
- * Wired to file->event_select.si_note; selwakeup() in kms_send_event
- * triggers KNOTE fanout so we don't need a separate wake path.
+ * Wired to file->event_select.si_note.  Wake path is a
+ * KNOTE_UNLOCKED() called explicitly next to selwakeup() in
+ * kms_send_event — selwakeup itself only walks si_tdlist (poll/select)
+ * and never fans out to si_note.  Missing that KNOTE call was M1 in
+ * the 2026-08-03 review.
  */
 static void
 kms_kqrdetach(struct knote *kn)

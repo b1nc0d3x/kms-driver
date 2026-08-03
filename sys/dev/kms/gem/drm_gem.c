@@ -139,6 +139,17 @@ kms_gem_object_create(struct drm_device *dev, size_t size)
 	size = round_page(size);
 	if (size == 0)
 		return (NULL);
+	/*
+	 * H6 (2026-08-03 review): cap total object size at 256 MiB.
+	 * CREATE_DUMB has its own 256 MiB cap in the dumb path, but
+	 * I915_GEM_CREATE and any other driver-side creator lands here
+	 * with an unchecked userspace-supplied size — the pages-array
+	 * malloc below is npages * sizeof(void*), so a u64 size close to
+	 * SIZE_MAX would kill the kernel with M_WAITOK before the
+	 * contig alloc even ran.  Match the DUMB cap.
+	 */
+	if (size > (256UL << 20))
+		return (NULL);
 	npages = atop(size);
 
 	obj = malloc(sizeof(*obj), M_KMS, M_WAITOK | M_ZERO);
