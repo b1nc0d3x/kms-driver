@@ -575,6 +575,19 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 		struct drm_gem_object *gem = NULL;
 		uint32_t i;
 
+		/*
+		 * DRM_MODE_FB_DIRTY_FLAGS is the union of the two annotation
+		 * bits; reject anything else.  Cap num_clips at the uapi
+		 * DRM_MODE_FB_DIRTY_MAX_CLIPS so a hostile caller can't
+		 * point clips_ptr at a >64-entry array (we cap the flush at
+		 * 64 anyway, but a size check up front lets a badly-crafted
+		 * request fail predictably).
+		 */
+		if ((dc->flags & ~(uint32_t)DRM_MODE_FB_DIRTY_FLAGS) != 0)
+			return (EINVAL);
+		if (dc->num_clips > DRM_MODE_FB_DIRTY_MAX_CLIPS)
+			return (EINVAL);
+
 		obj = kms_mode_object_find(file->dev, dc->fb_id,
 		    DRM_MODE_OBJECT_FB);
 		if (obj == NULL)
