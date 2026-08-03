@@ -24,6 +24,7 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/kernel.h>
+#include <sys/lock.h>
 #include <sys/malloc.h>
 #include <sys/mutex.h>
 #include <sys/proc.h>
@@ -161,6 +162,17 @@ kms_vblank_handler(struct drm_crtc *crtc)
 	struct drm_mode_config *mc;
 	struct drm_file *flip_file = NULL;
 	uint64_t flip_user_data = 0;
+
+	/*
+	 * This handler takes sx_xlock(&mc->mutex) below, so it must run
+	 * in a sleepable context.  Drivers must call it from a taskqueue
+	 * / ithread (not from a bus_setup_intr filter or an IPI handler).
+	 * WITNESS catches the misuse at first fire in an INVARIANTS
+	 * kernel; non-INVARIANTS builds get a debugger drop via KASSERT
+	 * on the sx_assert path a few lines down anyway.
+	 */
+	WITNESS_WARN(WARN_GIANTOK | WARN_SLEEPOK, NULL,
+	    "kms_vblank_handler");
 
 	if (crtc == NULL || crtc->dev == NULL)
 		return;
