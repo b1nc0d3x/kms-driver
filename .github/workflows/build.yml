@@ -1,0 +1,73 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# CI builds the KMS framework (kms.ko) only.  rk_kms depends on a
+# out-of-tree FUSB302 USB-C PD controller driver (dev/iicbus/usb/
+# fusb302_var.h) that isn't in stock FreeBSD src.txz, so it can't
+# be cross-built here — it builds on hardware alongside the fusb302
+# driver.
+
+jobs:
+  cross-build-arm64:
+    name: cross-build kms.ko for arm64 (FreeBSD VM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: cross-build inside FreeBSD 15.0 VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "15.0"
+          usesh: true
+          run: |
+            set -eux
+            uname -a
+            if [ ! -d /usr/src/sys/arm64 ]; then
+              fetch -q https://download.freebsd.org/releases/amd64/15.0-RELEASE/src.txz
+              tar xf src.txz -C /
+            fi
+            echo "=== cross-build kms.ko (aarch64) ==="
+            env MACHINE=arm64 MACHINE_ARCH=aarch64 \
+                CC="cc --target=aarch64-unknown-freebsd15.0" \
+                make -B kms-only
+            file sys/modules/kms/core/kms.ko | grep -q "ARM aarch64" || {
+              echo "FAIL: kms.ko is not aarch64"
+              exit 1
+            }
+            ls -l sys/modules/kms/core/kms.ko
+            echo "=== ok ==="
+
+  native-build-amd64:
+    name: native build kms.ko for amd64 (FreeBSD VM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: native build inside FreeBSD 15.0 VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "15.0"
+          usesh: true
+          run: |
+            set -eux
+            uname -a
+            if [ ! -d /usr/src/sys/amd64 ]; then
+              fetch -q https://download.freebsd.org/releases/amd64/15.0-RELEASE/src.txz
+              tar xf src.txz -C /
+            fi
+            echo "=== native build kms.ko (amd64) ==="
+            make -B kms-only
+            file sys/modules/kms/core/kms.ko | grep -q "x86-64" || {
+              echo "FAIL: kms.ko is not x86-64"
+              exit 1
+            }
+            ls -l sys/modules/kms/core/kms.ko
+            echo "=== ok ==="

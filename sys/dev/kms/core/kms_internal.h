@@ -139,6 +139,14 @@ union drm_wait_vblank;
 
 void	kms_event_queue_init(struct drm_file *file);
 void	kms_event_queue_drain(struct drm_file *file);
+/*
+ * H4 drm_file refcount.  IRQ paths take a ref (kms_file_get) while
+ * moving events from crtc queues to a local ready list under mc->mutex,
+ * then release (kms_file_put) after kms_send_event delivers, so close()
+ * cannot free the file mid-delivery.
+ */
+void	kms_file_get(struct drm_file *file);
+void	kms_file_put(struct drm_file *file);
 int	kms_send_event(struct drm_file *file, const void *data,
 	    size_t length);
 int	kms_send_vblank_event(struct drm_file *file,

@@ -390,6 +390,14 @@ uint32_t igen_gtt_bind_cursor(struct igen_softc *sc,
 	    struct drm_gem_object *obj);
 int	igen_gtt_bind_gem_at(struct igen_softc *sc,
 	    struct drm_gem_object *obj, uint64_t ggtt_byte_addr);
+/*
+ * H5 (2026-08-03 review) — per-file softpin binding tracker + teardown.
+ */
+void	igen_gtt_unbind_range(struct igen_softc *sc, uint32_t first_idx,
+	    uint32_t npages);
+int	igen_softpin_track(struct drm_file *file, uint32_t first_idx,
+	    uint32_t npages);
+void	igen_file_free(struct drm_file *file);
 int	igen_i915_ioctl(struct drm_file *file, u_long cmd, void *data);
 uint64_t igen_gtt_read(struct igen_softc *sc, uint32_t entry_idx);
 void	igen_gtt_write(struct igen_softc *sc, uint32_t entry_idx,

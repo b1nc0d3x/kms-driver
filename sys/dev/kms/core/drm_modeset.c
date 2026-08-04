@@ -370,6 +370,21 @@ kms_ioctl_mode_setcrtc(struct drm_file *file, struct drm_mode_crtc *r)
 	if (r->mode_valid)
 		kms_modeinfo_to_display_mode(&r->mode, &requested_mode);
 
+	/*
+	 * H6 fb-vs-mode geometry check: with a real fb + a real mode,
+	 * (x + hdisplay) and (y + vdisplay) must fit inside the fb's
+	 * dimensions.  Otherwise VOP DMA would scan out past the end
+	 * of the BO — an OOB DMA-read of adjacent kernel/user memory.
+	 * Cast to uint64_t to defeat uint32 wrap on huge x/y values.
+	 */
+	if (r->mode_valid && fb != NULL) {
+		if ((uint64_t)r->x + requested_mode.hdisplay > fb->width ||
+		    (uint64_t)r->y + requested_mode.vdisplay > fb->height) {
+			error = EINVAL;
+			goto out;
+		}
+	}
+
 	set.crtc = crtc;
 	set.fb = fb;
 	set.mode = r->mode_valid ? &requested_mode : NULL;
@@ -464,37 +479,97 @@ kms_ioctl_mode_page_flip(struct drm_file *file,
 	}
 	fb = __containerof(fb_obj, struct drm_framebuffer, base);
 
-	if (crtc->funcs != NULL && crtc->funcs->page_flip != NULL)
-		error = crtc->funcs->page_flip(crtc, fb, r->flags, r->user_data);
+	/*
+	 * H6 PAGE_FLIP geometry check: the new fb must match the
+	 * currently-scanned fb in width, height and format.  Linux
+	 * enforces this in drm_mode_page_flip_ioctl — a mismatch
+	 * would cause VOP to scan OOB or corrupted pixels for at
+	 * least one frame.  Also refuses flip against a CRTC with
+	 * no current scanout fb (nothing to flip away from).
+	 */
+	{
+		struct drm_mode_config *mc = &file->dev->mode_config;
+		struct drm_framebuffer *cur;
+		int mismatch = 0;
 
-	if (error == 0) {
+		sx_slock(&mc->mutex);
+		cur = crtc->primary_fb;
+		if (cur == NULL)
+			mismatch = 1;
+		else if (fb->width != cur->width ||
+		    fb->height != cur->height ||
+		    fb->format != cur->format)
+			mismatch = 2;
+		sx_sunlock(&mc->mutex);
+		if (mismatch != 0) {
+			kms_mode_object_put(fb_obj);
+			kms_mode_object_put(crtc_obj);
+			return (EINVAL);
+		}
+	}
+
+	{
 		struct drm_framebuffer *old_fb;
+		bool have_event = (r->flags & DRM_MODE_PAGE_FLIP_EVENT) != 0;
 
+		/*
+		 * M3 (2026-08-03 review): arm pending_flip_file BEFORE calling
+		 * funcs->page_flip — a driver whose vblank IRQ fires between
+		 * hardware programming and our post-call stash would find
+		 * pending_flip_file NULL and drop the FLIP_COMPLETE event on
+		 * the floor.  If page_flip returns error we roll back the arm
+		 * under the same mutex.  Matches Linux drm_atomic_helper_
+		 * page_flip's arm-then-commit shape.
+		 */
 		sx_xlock(&file->dev->mode_config.mutex);
 		old_fb = crtc->primary_fb;
 		/*
 		 * Take a persistent ref before swapping primary_fb — the
 		 * next RMFB on the outgoing fb must not free storage that
-		 * the CRTC still points at.  Old fb's ref is dropped after
-		 * releasing the lock so the free callback (if it fires)
-		 * doesn't run under mc->mutex.
+		 * the CRTC still points at.  Old fb's ref is dropped either
+		 * inline (event-less flip: nothing scans it after this call
+		 * returns from the driver, keeping current behaviour) or
+		 * deferred to the vblank handler (event flip: H3, VOP is
+		 * still scanning old_fb until latch).
 		 */
 		kms_mode_object_get(&fb->base);
 		crtc->primary_fb = fb;
-		/*
-		 * If PAGE_FLIP_EVENT was requested, stash the requesting
-		 * file + user cookie so the next vblank IRQ emits a
-		 * FLIP_COMPLETE event.  Stub drivers without an IRQ chain
-		 * simply leak the stash — no harm, the cookie storage is
-		 * one pointer.
-		 */
-		if (r->flags & DRM_MODE_PAGE_FLIP_EVENT) {
+		if (have_event) {
 			crtc->pending_flip_file = file;
 			crtc->pending_flip_user_data = r->user_data;
-			printf("kms: page_flip EVENT armed crtc=%u file=%p\n",
-			    crtc->base.id, file);
+			crtc->pending_flip_old_fb = old_fb;
+			kms_file_get(file);
 		}
 		sx_xunlock(&file->dev->mode_config.mutex);
+
+		if (crtc->funcs != NULL && crtc->funcs->page_flip != NULL)
+			error = crtc->funcs->page_flip(crtc, fb, r->flags,
+			    r->user_data);
+
+		if (error != 0) {
+			/*
+			 * Roll back the arm.  Under mode_config.mutex so a vblank
+			 * handler racing us either sees the armed state (and fires
+			 * FLIP_COMPLETE, spurious but harmless — HW didn't actually
+			 * flip since page_flip failed) or the cleared state.  Rare
+			 * path; simpler to leave the mode_config commit in place
+			 * than to also revert primary_fb.
+			 */
+			sx_xlock(&file->dev->mode_config.mutex);
+			if (have_event && crtc->pending_flip_file == file) {
+				crtc->pending_flip_file = NULL;
+				crtc->pending_flip_old_fb = NULL;
+				kms_file_put(file);
+				have_event = false;
+			}
+			/* undo primary_fb swap */
+			kms_mode_object_put(&fb->base);
+			crtc->primary_fb = old_fb;
+			sx_xunlock(&file->dev->mode_config.mutex);
+			old_fb = NULL;	/* still installed */
+		} else if (have_event) {
+			old_fb = NULL;	/* ownership handed to vblank handler */
+		}
 		if (old_fb != NULL)
 			kms_mode_object_put(&old_fb->base);
 	}

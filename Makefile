@@ -1,17 +1,18 @@
-# Top-level standalone build for kms.
+# Top-level standalone build for the kms driver framework + drivers.
 #
 # Targets:
-#   make              build kms.ko + kms_stub.ko for host
-#   make probe        build the userspace drm_probe smoke test
-#   make all          both of the above
-#   make install      install built modules + tools (uses DESTDIR)
+#   make              build kms.ko + rk_kms.ko  (rk_kms needs the
+#                     FUSB302 USB-C PD controller driver installed at
+#                     dev/iicbus/usb/fusb302_var.h — NOT in stock
+#                     FreeBSD src.  Framework-only builds use kms-only)
+#   make kms-only     build just kms.ko (framework only, no HW deps)
+#   make install      install built modules (uses DESTDIR)
 #   make clean        remove build artifacts
 #
-# Cross-build for arm64 from amd64 host:
-#   make TARGET=arm64 TARGET_ARCH=aarch64
-# (Requires a populated /usr/obj/usr/src/arm64.aarch64/tmp cross toolchain
-#  from a prior `make buildkernel TARGET=arm64 TARGET_ARCH=aarch64` in
-#  /usr/src — kms does not ship its own cross toolchain.)
+# Cross-build for arm64 from an amd64 host:
+#   env MACHINE=arm64 MACHINE_ARCH=aarch64 \
+#       CC="cc --target=aarch64-unknown-freebsd15.0" \
+#       make -B
 #
 # Override SYSDIR to point at a non-standard kernel source tree:
 #   make SYSDIR=/path/to/freebsd/sys
@@ -19,24 +20,26 @@
 SYSDIR?=	/usr/src/sys
 SRCTOP:=	${.CURDIR}
 
-.PHONY: all modules probe clean install
+.PHONY: all kms-only modules clean install
 
-all: modules probe
+all: modules
 
-modules:
-	${MAKE} -C ${.CURDIR}/sys/modules/kms \
+kms-only:
+	${MAKE} -C ${.CURDIR}/sys/modules/kms/core \
 	    SRCTOP=${SRCTOP} SYSDIR=${SYSDIR}
 
-probe:
-	${MAKE} -C ${.CURDIR}/sys/dev/kms/tools \
-	    SRCTOP=${SRCTOP}
+modules: kms-only
+	${MAKE} -C ${.CURDIR}/sys/modules/rk_kms \
+	    SRCTOP=${SRCTOP} SYSDIR=${SYSDIR}
 
 clean:
-	${MAKE} -C ${.CURDIR}/sys/modules/kms clean \
+	${MAKE} -C ${.CURDIR}/sys/modules/kms/core clean \
 	    SRCTOP=${SRCTOP} SYSDIR=${SYSDIR} || true
-	${MAKE} -C ${.CURDIR}/sys/dev/kms/tools clean \
-	    SRCTOP=${SRCTOP} || true
+	${MAKE} -C ${.CURDIR}/sys/modules/rk_kms clean \
+	    SRCTOP=${SRCTOP} SYSDIR=${SYSDIR} || true
 
 install:
-	${MAKE} -C ${.CURDIR}/sys/modules/kms install \
-	    SRCTOP=${SRCTOP} SYSDIR=${SYSDIR}
+	${MAKE} -C ${.CURDIR}/sys/modules/kms/core install \
+	    SRCTOP=${SRCTOP} SYSDIR=${SYSDIR} DESTDIR=${DESTDIR}
+	${MAKE} -C ${.CURDIR}/sys/modules/rk_kms install \
+	    SRCTOP=${SRCTOP} SYSDIR=${SYSDIR} DESTDIR=${DESTDIR}

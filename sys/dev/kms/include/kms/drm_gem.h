@@ -117,6 +117,21 @@ struct drm_gem_object *kms_gem_handle_lookup(struct drm_file *file,
 	    uint32_t handle);
 
 /*
+ * H2 mmap-ownership gate: true if `file` holds a handle to `obj`.
+ * Used to block cross-fd BO mapping via device-global mmap_offsets.
+ */
+bool	kms_file_owns_gem(struct drm_file *file,
+	    struct drm_gem_object *obj);
+
+/*
+ * M4 PRIME dedup: returns the handle id if `file` has one for `obj`,
+ * else 0.  drm_prime uses this to keep the 1:1 dmabuf→handle contract
+ * Mesa/gbm expects.
+ */
+uint32_t kms_gem_handle_find_by_obj(struct drm_file *file,
+	    struct drm_gem_object *obj);
+
+/*
  * Release every handle still in a file's handle table.  Invoked from
  * the file dtor so a process that exits with open BOs doesn't leak
  * them.  Safe to call on a file that owns zero handles.

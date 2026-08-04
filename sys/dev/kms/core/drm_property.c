@@ -27,6 +27,7 @@
 #include <sys/sx.h>
 
 #include <kms/drm_device.h>
+#include <kms/drm_file.h>
 #include <kms/drm_mode_config.h>
 #include <kms/drm_mode_object.h>
 #include <kms/drm_property.h>
@@ -243,9 +244,30 @@ kms_object_properties_cleanup(struct drm_mode_object *obj)
 
 /* --- blobs --- */
 
+void
+kms_property_blob_orphan_owner(struct drm_device *dev, struct drm_file *file)
+{
+	struct drm_mode_config *mc;
+	struct drm_mode_object *obj;
+	struct drm_property_blob *blob;
+
+	if (dev == NULL || file == NULL)
+		return;
+	mc = &dev->mode_config;
+	sx_xlock(&mc->mutex);
+	TAILQ_FOREACH(obj, &mc->objects, reg) {
+		if (obj->type != DRM_MODE_OBJECT_BLOB)
+			continue;
+		blob = __containerof(obj, struct drm_property_blob, base);
+		if (blob->owner == file)
+			blob->owner = NULL;
+	}
+	sx_xunlock(&mc->mutex);
+}
+
 struct drm_property_blob *
-kms_property_blob_create(struct drm_device *dev, const void *data,
-    size_t length)
+kms_property_blob_create(struct drm_device *dev, struct drm_file *owner,
+    const void *data, size_t length)
 {
 	struct drm_property_blob *blob;
 	int error;
@@ -255,8 +277,18 @@ kms_property_blob_create(struct drm_device *dev, const void *data,
 	if (length > (16ULL << 20))	/* 16 MiB sanity cap, rule 4 */
 		return (NULL);
 
+	/*
+	 * M2 (2026-08-03 review): cap blobs per file so a client can't
+	 * exhaust kernel memory with 1 MiB blobs.  Only enforced when we
+	 * have an owner (compositor path — kernel-internal blobs from
+	 * modeset construction bypass this).
+	 */
+	if (owner != NULL && owner->blob_count >= KMS_MAX_BLOBS_PER_FILE)
+		return (NULL);
+
 	blob = malloc(sizeof(*blob), M_KMS, M_WAITOK | M_ZERO);
 	blob->dev = dev;
+	blob->owner = owner;
 	blob->length = length;
 	blob->data = malloc(length, M_KMS, M_WAITOK);
 	if (data != NULL)
@@ -271,6 +303,8 @@ kms_property_blob_create(struct drm_device *dev, const void *data,
 		free(blob, M_KMS);
 		return (NULL);
 	}
+	if (owner != NULL)
+		owner->blob_count++;
 	return (blob);
 }
 
@@ -288,8 +322,20 @@ kms_property_blob_find(struct drm_device *dev, uint32_t id)
 void
 kms_property_blob_destroy(struct drm_property_blob *blob)
 {
+	struct drm_file *owner;
+
 	if (blob == NULL)
 		return;
+	/*
+	 * M2 (2026-08-03 review): decrement the owning file's blob count
+	 * so a well-behaved client that creates+destroys blobs at frame
+	 * rate isn't spuriously capped.  Owner may be NULL for orphaned
+	 * blobs (see kms_property_blob_orphan_owner) or kernel-internal
+	 * blobs — skip decrement in that case.
+	 */
+	owner = blob->owner;
+	if (owner != NULL && owner->blob_count > 0)
+		owner->blob_count--;
 	kms_mode_object_unregister(blob->dev, &blob->base);
 	free(blob->data, M_KMS);
 	free(blob, M_KMS);

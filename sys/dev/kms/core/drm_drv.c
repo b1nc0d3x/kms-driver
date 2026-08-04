@@ -45,14 +45,18 @@ SYSCTL_DECL(_kern_kms);
  * for the dri cdev anyway); this lets them read input.  When the last
  * drm_device unregisters, restore to 0600 root:wheel.
  *
- * Gated by kern.kms.input_passthrough (default 1).  Set to 0 to opt
- * out and use external seat management.
+ * Gated by kern.kms.input_passthrough (default 0 per M1 review).  Set
+ * to 1 to opt in — kernel-side seat management is a development
+ * convenience only; upstream prefers devfs.rules or a devd rule.
+ * Keeping this default-off avoids silently widening keyboard perms
+ * on every DRM open.
  */
-static int kms_input_passthrough = 1;
+static int kms_input_passthrough = 0;
 SYSCTL_INT(_kern_kms, OID_AUTO, input_passthrough, CTLFLAG_RWTUN,
     &kms_input_passthrough, 0,
     "Relax /dev/input/event* to 0660 root:video while a DRM device is"
-    " live (built-in seat replacement; default 1 = on)");
+    " live (built-in seat replacement; default 0 = off; set 1 as a"
+    " dev convenience — prefer devfs.rules for production)");
 
 #define	KMS_INPUT_MAX	32	/* event0 .. event31 */
 #define	KMS_GID_VIDEO	44	/* matches FreeBSD's wheel-44 video gid */
@@ -96,6 +100,14 @@ kms_input_grant(void)
 {
 	int n, granted = 0;
 
+	/*
+	 * Low-review (2026-08-03): decision to relax is captured at
+	 * grant-time; the paired revoke MUST fire regardless of the
+	 * current tunable value or the grants_active counter would leak
+	 * across sysctl flips and the /dev/input/event* nodes would stay
+	 * 0660 root:video forever after a passthrough=1 → 0 flip.  The
+	 * tunable check stays at grant only.
+	 */
 	if (!kms_input_passthrough)
 		return;
 
@@ -117,19 +129,35 @@ static void
 kms_input_revoke(void)
 {
 	int n;
-
-	if (!kms_input_passthrough)
-		return;
+	bool do_restore = false;
 
 	sx_xlock(&kms_input_lock);
-	if (--kms_input_grants_active > 0) {
+	if (kms_input_grants_active == 0) {
+		/*
+		 * No grant to pair with — either never on, or the grant
+		 * path short-circuited because the tunable was off at
+		 * grant time (matching short-circuit here).  Not a leak.
+		 */
 		sx_xunlock(&kms_input_lock);
 		return;
 	}
+	if (--kms_input_grants_active == 0)
+		do_restore = true;
+	sx_xunlock(&kms_input_lock);
+
+	if (!do_restore)
+		return;
+
+	/*
+	 * Restore hardcoded 0600 root:wheel rather than the pre-grant
+	 * perms — we never snapshotted them per-file.  Callers who
+	 * wanted a different baseline should re-chmod after passthrough
+	 * closes.  Low-review 2026-08-03 flagged this as an imperfect
+	 * restore; per-file snapshotting deferred.
+	 */
 	for (n = 0; n < KMS_INPUT_MAX; n++) {
 		(void)kms_input_relax_one(n, 0600, 0 /* wheel */);
 	}
-	sx_xunlock(&kms_input_lock);
 	printf("kms: input passthrough off - restored /dev/input/event* to"
 	    " 0600 root:wheel\n");
 }

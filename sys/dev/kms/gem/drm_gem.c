@@ -139,6 +139,17 @@ kms_gem_object_create(struct drm_device *dev, size_t size)
 	size = round_page(size);
 	if (size == 0)
 		return (NULL);
+	/*
+	 * H6 (2026-08-03 review): cap total object size at 256 MiB.
+	 * CREATE_DUMB has its own 256 MiB cap in the dumb path, but
+	 * I915_GEM_CREATE and any other driver-side creator lands here
+	 * with an unchecked userspace-supplied size — the pages-array
+	 * malloc below is npages * sizeof(void*), so a u64 size close to
+	 * SIZE_MAX would kill the kernel with M_WAITOK before the
+	 * contig alloc even ran.  Match the DUMB cap.
+	 */
+	if (size > (256UL << 20))
+		return (NULL);
 	npages = atop(size);
 
 	obj = malloc(sizeof(*obj), M_KMS, M_WAITOK | M_ZERO);
@@ -420,6 +431,55 @@ kms_gem_handle_lookup(struct drm_file *file, uint32_t handle)
 	}
 	sx_sunlock(&file->handle_lock);
 	return (obj);
+}
+
+/*
+ * H2 mmap-ownership gate helper.  Returns true if `file` holds any
+ * handle referencing `obj`.  Used by kms_mmap_single to block
+ * cross-fd BO mapping via device-global mmap_offsets.
+ */
+bool
+kms_file_owns_gem(struct drm_file *file, struct drm_gem_object *obj)
+{
+	struct drm_gem_handle *h;
+	bool owned = false;
+
+	if (file == NULL || obj == NULL)
+		return (false);
+	sx_slock(&file->handle_lock);
+	TAILQ_FOREACH(h, &file->handles, link) {
+		if (h->obj == obj) {
+			owned = true;
+			break;
+		}
+	}
+	sx_sunlock(&file->handle_lock);
+	return (owned);
+}
+
+/*
+ * M4 PRIME dedup helper.  Returns the handle id if `file` already has
+ * a handle referencing `obj`, or 0 if none.  Linux DRM PRIME contract
+ * is 1:1 — importing the same dmabuf twice on one drm_file must
+ * return the SAME handle so Mesa/gbm's caches stay coherent.
+ */
+uint32_t
+kms_gem_handle_find_by_obj(struct drm_file *file, struct drm_gem_object *obj)
+{
+	struct drm_gem_handle *h;
+	uint32_t id = 0;
+
+	if (file == NULL || obj == NULL)
+		return (0);
+	sx_slock(&file->handle_lock);
+	TAILQ_FOREACH(h, &file->handles, link) {
+		if (h->obj == obj) {
+			id = h->id;
+			break;
+		}
+	}
+	sx_sunlock(&file->handle_lock);
+	return (id);
 }
 
 void

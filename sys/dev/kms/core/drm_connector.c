@@ -121,7 +121,7 @@ kms_connector_update_edid(struct drm_connector *connector, const void *data,
 	if (data == NULL || length == 0) {
 		blob = NULL;
 	} else {
-		blob = kms_property_blob_create(dev, data, length);
+		blob = kms_property_blob_create(dev, NULL, data, length);
 		if (blob == NULL)
 			return (ENOMEM);
 	}

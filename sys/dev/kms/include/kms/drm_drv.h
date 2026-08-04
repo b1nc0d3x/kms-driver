@@ -35,6 +35,18 @@ struct drm_driver {
 	 * unchanged if this hook is NULL.
 	 */
 	int		(*ioctl)(struct drm_file *file, u_long cmd, void *data);
+
+	/*
+	 * H5 (2026-08-03 review): per-file teardown callback.  Called from
+	 * kms_file_dtor after mode_config scrubbing and blob orphan, before
+	 * the final kms_file_put.  Drivers use this to release per-file
+	 * state stashed in file->driver_priv (e.g. igen walks its softpin
+	 * bindings list and calls igen_gtt_unbind_range for each) — so
+	 * GGTT PTEs don't outlive the fd and point at freed pages.
+	 *
+	 * May be NULL if the driver has no per-file state.
+	 */
+	void		(*file_free)(struct drm_file *file);
 };
 
 /*

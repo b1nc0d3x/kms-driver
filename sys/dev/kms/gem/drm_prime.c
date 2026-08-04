@@ -112,7 +112,7 @@ kms_prime_fo_mmap(struct file *fp, vm_map_t map __unused,
 	struct kms_prime_file *pf = fp->f_data;
 	vm_ooffset_t end;
 
-	if (pf == NULL || pf->obj == NULL)
+	if (pf == NULL || pf->obj == NULL || pf->obj->pager == NULL)
 		return (ENXIO);
 	/*
 	 * Reject partial / past-end mappings.  Previous check ignored foff,
@@ -250,12 +250,22 @@ kms_ioctl_prime_fd_to_handle(struct drm_file *file,
 	}
 
 	/*
-	 * Create a fresh handle on the importing drm_file pointing at the
-	 * same underlying GEM.  kms_gem_handle_create takes its own ref on
-	 * success and balances it on internal-failure, so we must not
-	 * double-get here — a stray get with only an error-path put leaks
-	 * one ref per successful import (pinning the wired contig pages
-	 * for the life of the driver).
+	 * M4 PRIME dedup: if this file already holds a handle for this
+	 * dmabuf's underlying GEM, return the SAME handle id.  Linux
+	 * DRM PRIME is 1:1 — Mesa/gbm cache BO→handle mappings and
+	 * close() the handle once, so returning two ids for one obj
+	 * causes a use-after-close on the second cached handle.
+	 */
+	handle = kms_gem_handle_find_by_obj(file, pf->obj);
+	if (handle != 0) {
+		fdrop(fp, curthread);
+		args->handle = handle;
+		return (0);
+	}
+	/*
+	 * No existing handle — create fresh.  kms_gem_handle_create takes
+	 * its own ref on success and balances it on internal-failure, so
+	 * we must not double-get here.
 	 */
 	error = kms_gem_handle_create(file, pf->obj, &handle);
 	fdrop(fp, curthread);

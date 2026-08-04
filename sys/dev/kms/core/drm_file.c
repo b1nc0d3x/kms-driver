@@ -12,6 +12,7 @@
 #include <sys/mutex.h>
 #include <sys/poll.h>
 #include <sys/queue.h>
+#include <sys/refcount.h>
 #include <sys/selinfo.h>
 #include <sys/sx.h>
 #include <sys/uio.h>
@@ -22,11 +23,64 @@
 
 #include <kms/drm_crtc.h>
 #include <kms/drm_device.h>
+#include <kms/drm_drv.h>
 #include <kms/drm_file.h>
+#include <kms/drm_framebuffer.h>
 #include <kms/drm_gem.h>
 #include <kms/drm_mode_config.h>
+#include <kms/drm_property.h>
 
 #include "kms_internal.h"
+
+/*
+ * H4 drm_file refcount helpers.  IRQ paths in drm_events.c hold a ref
+ * across the "detach event under mc->mutex → send it after dropping the
+ * lock" window so a concurrent close() can't free file out from under
+ * the delivery.
+ */
+void
+kms_file_get(struct drm_file *file)
+{
+	if (file != NULL)
+		refcount_acquire(&file->refs);
+}
+
+static void kms_file_free(struct drm_file *file);
+
+void
+kms_file_put(struct drm_file *file)
+{
+	if (file != NULL && refcount_release(&file->refs))
+		kms_file_free(file);
+}
+
+/*
+ * Actually free the drm_file's storage + drop the device ref.  Runs
+ * only when the last reference goes away — either from kms_file_dtor
+ * (nothing else was holding a ref) or from an IRQ handler completing
+ * the last in-flight event delivery after close() already ran.
+ */
+static void
+kms_file_free(struct drm_file *file)
+{
+	struct drm_device *dev;
+
+	if (file == NULL)
+		return;
+	dev = file->dev;
+	kms_gem_release_all(file);
+	sx_destroy(&file->handle_lock);
+	kms_syncobj_release_all(file);
+	sx_destroy(&file->syncobj_lock);
+	kms_event_queue_drain(file);
+	free(file, M_KMS);
+	/*
+	 * Drop the device reference acquired in open.  If we're the last
+	 * holder (registry already released its initial ref via
+	 * dev_unregister), this frees the device storage.
+	 */
+	kms_device_release(dev);
+}
 
 static void
 kms_file_dtor(void *data)
@@ -50,52 +104,66 @@ kms_file_dtor(void *data)
 
 	/*
 	 * Scrub every reference the mode_config still holds to this
-	 * drm_file BEFORE we free it.  A vblank IRQ that fires between
-	 * here and the free would otherwise dereference a dangling
-	 * pointer: `crtc->pending_flip_file` and every
-	 * `pending_vblank_events` entry can point at us.
+	 * drm_file that HASN'T already been detached to an IRQ-side
+	 * ready list.  Entries still queued here get their pe->file ref
+	 * released as we free them.  Entries the vblank handler has
+	 * already moved to its local ready list keep an extra ref via
+	 * kms_file_get() so their kms_send_event runs safely after we
+	 * drop this file's d_open ref below.
 	 *
-	 * Under mc->mutex so the vblank handler (drm_events.c:kms_vblank_
-	 * handler) sees a consistent view — either the entry is still
-	 * queued (before we take the lock) or it's gone (after).
+	 * Under mc->mutex so the vblank handler sees a consistent view.
 	 */
 	mc = &dev->mode_config;
+	/*
+	 * M2 (2026-08-03 review): orphan any property blobs the closing
+	 * file created, so no other client can destroy them via
+	 * DESTROYPROPBLOB after we drop below.  Blobs stay reachable by
+	 * id; only the master can then destroy them.
+	 */
+	kms_property_blob_orphan_owner(dev, file);
 	sx_xlock(&mc->mutex);
 	TAILQ_FOREACH(obj, &mc->crtcs, link) {
 		crtc = __containerof(obj, struct drm_crtc, base);
 		if (crtc->pending_flip_file == file) {
 			crtc->pending_flip_file = NULL;
 			crtc->pending_flip_user_data = 0;
+			/* Drop the ref taken at PAGE_FLIP arm-time. */
+			refcount_release(&file->refs);
+			if (crtc->pending_flip_old_fb != NULL) {
+				kms_mode_object_put(
+				    &crtc->pending_flip_old_fb->base);
+				crtc->pending_flip_old_fb = NULL;
+			}
 		}
 		TAILQ_FOREACH_SAFE(pe, &crtc->pending_vblank_events,
 		    link, pe_next) {
 			if (pe->file != file)
 				continue;
 			TAILQ_REMOVE(&crtc->pending_vblank_events, pe, link);
+			/* Drop the ref taken at WAIT_VBLANK queue-time. */
+			refcount_release(&file->refs);
 			free(pe, M_KMS);
 		}
 	}
 	sx_xunlock(&mc->mutex);
 
 	/*
-	 * Walk the handle table and drop the ref each one holds.  Done
-	 * outside dev_lock since gem_object_put may take dev->gem_lock
-	 * and we never want a lock ordering edge from dev_lock down to
-	 * gem_lock.
+	 * H5 (2026-08-03 review): give the driver a chance to release
+	 * per-file state stashed in file->driver_priv — most importantly
+	 * igen's softpin GGTT bindings that would otherwise outlive the
+	 * fd and keep PTEs pointing at freed pages.  Called after we
+	 * detached from mc->pending lists (so IRQs won't reference this
+	 * file's driver state) but before kms_file_put releases the
+	 * storage (so the driver still has a valid `file`).
 	 */
-	kms_gem_release_all(file);
-	sx_destroy(&file->handle_lock);
-	kms_syncobj_release_all(file);
-	sx_destroy(&file->syncobj_lock);
-	kms_event_queue_drain(file);
+	if (dev->driver != NULL && dev->driver->file_free != NULL) {
+		dev->driver->file_free(file);
+		file->driver_priv = NULL;
+	}
 
-	free(file, M_KMS);
-	/*
-	 * Drop the device reference acquired in open.  If we're the last
-	 * holder (registry already released its initial ref via
-	 * dev_unregister), this frees the device storage.
-	 */
-	kms_device_release(dev);
+	/* Drop the d_open reference.  Frees storage if refs hits 0. */
+	kms_file_put(file);
+	(void)dev;
 }
 
 static int
@@ -120,6 +188,7 @@ kms_open(struct cdev *cdev, int oflags __unused, int devtype __unused,
 
 	file = malloc(sizeof(*file), M_KMS, M_WAITOK | M_ZERO);
 	file->dev = dev;
+	refcount_init(&file->refs, 1);	/* d_open ref, dropped in dtor */
 	file->authenticated = false;
 	file->is_master = false;
 	/*
@@ -162,48 +231,66 @@ kms_open(struct cdev *cdev, int oflags __unused, int devtype __unused,
 }
 
 /*
- * Userspace mmap on the cdev — page-at-a-time variant.  Returns the
- * physical address that backs a specific byte offset within a GEM
- * object's MAP_DUMB region, with an explicit memattr so the resulting
- * PTE gets the right cache-attribute bits.
+ * Userspace mmap on the cdev.  MAP_DUMB returned an mmap_offset; the
+ * userspace mmap() syscall carries that offset to us and we map it
+ * back to the GEM object that owns it, then hand back the pre-built
+ * cdev_pager.  vm_object_reference bumps the pager's refcount so it
+ * outlives the GEM object's handle-table ref (lets userspace keep
+ * a live mapping past DESTROY_DUMB, matching Linux semantics).
  *
- * We take this path (instead of d_mmap_single with a cdev_pager) so
- * we control the memattr per PTE.  On arm64 the cdev_pager MGTDEVICE
- * path silently drops per-page memattr for FICTITIOUS pages, which
- * left Xorg's writes stranded in a cached alias that the VOP DMA
- * never observed.  Direct d_mmap forces UNCACHEABLE PTEs so user
- * writes land in DRAM in time for scan-out.
+ * Reverted from d_mmap (page-at-a-time) after H1 review flagged a
+ * page UAF: d_mmap never held a pager ref, so GEM_CLOSE freed the
+ * pages while userspace still had valid PTEs to them.  The pager
+ * already has VM_MEMATTR_UNCACHEABLE (via vm_object_set_memattr in
+ * kms_gem_object_create on arm64) + per-page pmap_page_set_memattr,
+ * so the original reason for d_mmap (memattr control) is now handled
+ * by the pager itself.  d_mmap_single lifetime semantics are correct.
  */
 static int
-kms_mmap(struct cdev *cdev, vm_ooffset_t offset, vm_paddr_t *paddr,
-    int nprot __unused, vm_memattr_t *memattr)
+kms_mmap_single(struct cdev *cdev, vm_ooffset_t *offset, vm_size_t size,
+    vm_object_t *object, int prot __unused)
 {
 	struct drm_device *dev;
+	struct drm_file *file;
 	struct drm_gem_object *obj;
-	uint64_t base;
-	uint32_t page_idx;
 
 	dev = cdev->si_drv1;
 	if (dev == NULL)
 		return (ENXIO);
 
-	obj = kms_gem_object_lookup_offset_containing(dev, (uint64_t)offset,
-	    &base);
+	/*
+	 * H2 ownership check: mmap offsets are device-global, so any
+	 * open of /dev/dri/cardN could otherwise walk offsets and map a
+	 * different fd's BOs (including the compositor's scanout fb).
+	 * Require the calling drm_file to hold at least one handle
+	 * that references the same GEM object.  Mirrors Linux's
+	 * drm_vma_node_allow() gate.
+	 */
+	if (devfs_get_cdevpriv((void **)&file) != 0 || file == NULL)
+		return (EACCES);
+
+	obj = kms_gem_object_lookup_offset(dev, (uint64_t)*offset);
 	if (obj == NULL)
 		return (EINVAL);
-	page_idx = (uint32_t)((offset - base) / PAGE_SIZE);
-	if (page_idx >= obj->npages) {
+	if (size > obj->size) {
 		kms_gem_object_put(obj);
 		return (EINVAL);
 	}
-	*paddr = VM_PAGE_TO_PHYS(obj->pages[page_idx]);
-	if (memattr != NULL) {
-#ifdef __aarch64__
-		*memattr = VM_MEMATTR_UNCACHEABLE;
-#else
-		*memattr = VM_MEMATTR_DEFAULT;
-#endif
+	if (!kms_file_owns_gem(file, obj)) {
+		kms_gem_object_put(obj);
+		return (EACCES);
 	}
+
+	/*
+	 * Bump the pager's reference for the user mapping.  The lookup
+	 * already pinned the GEM object via its own refcount; the put
+	 * below drops that and leaves only the pager ref to keep pages
+	 * alive while the mapping exists.
+	 */
+	vm_object_reference(obj->pager);
+	*object = obj->pager;
+	*offset = 0;	/* page index within the returned vm_object */
+
 	kms_gem_object_put(obj);
 	return (0);
 }
@@ -297,8 +384,11 @@ kms_poll(struct cdev *cdev __unused, int events, struct thread *td)
  * /dev/dri/cardN returns EINVAL and the compositor can't wait on
  * page-flip events.
  *
- * Wired to file->event_select.si_note; selwakeup() in kms_send_event
- * triggers KNOTE fanout so we don't need a separate wake path.
+ * Wired to file->event_select.si_note.  Wake path is a
+ * KNOTE_UNLOCKED() called explicitly next to selwakeup() in
+ * kms_send_event — selwakeup itself only walks si_tdlist (poll/select)
+ * and never fans out to si_note.  Missing that KNOTE call was M1 in
+ * the 2026-08-03 review.
  */
 static void
 kms_kqrdetach(struct knote *kn)
@@ -345,5 +435,5 @@ struct cdevsw kms_cdevsw = {
 	.d_ioctl =		kms_ioctl,
 	.d_poll =		kms_poll,
 	.d_kqfilter =		kms_kqfilter,
-	.d_mmap =		kms_mmap,
+	.d_mmap_single =	kms_mmap_single,
 };

@@ -1911,6 +1911,12 @@ static const struct drm_driver igen_driver = {
 	.minor		= 6,
 	.patchlevel	= 0,
 	.ioctl		= igen_i915_ioctl,
+	/*
+	 * H5 (2026-08-03 review): teardown per-file softpin bindings on
+	 * fd close so GGTT PTEs don't outlive the client and point at
+	 * pages the kernel has since freed.
+	 */
+	.file_free	= igen_file_free,
 };
 
 /*
