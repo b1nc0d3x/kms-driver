@@ -36,6 +36,10 @@
 #include <machine/bus.h>
 #include <machine/resource.h>
 
+#include <vm/vm.h>
+#include <vm/vm_param.h>
+#include <vm/vm_page.h>
+
 #include <dev/virtio/virtio.h>
 #include <dev/virtio/virtqueue.h>
 #include <dev/virtio/gpu/virtio_gpu.h>
@@ -47,6 +51,7 @@
 #include <kms/drm_drv.h>
 #include <kms/drm_encoder.h>
 #include <kms/drm_framebuffer.h>
+#include <kms/drm_gem.h>
 #include <kms/drm_mode_config.h>
 #include <kms/drm_modes.h>
 #include <kms/drm_plane.h>
@@ -112,6 +117,17 @@ struct virtio_kms_softc {
 	struct virtio_kms_scanout scanouts[VIRTIO_KMS_MAX_SCANOUTS];
 
 	/*
+	 * Currently-attached host resource (Phase D).  Single-scanout
+	 * for now, so at most one framebuffer is live at a time.  A
+	 * resource_id of 0 means "no resource attached"; the ID itself
+	 * is the framebuffer's drm_mode_object.id (framework-assigned,
+	 * unique per drm_device, always non-zero for live objects).
+	 */
+	uint32_t		 active_resource_id;
+	uint32_t		 active_width;
+	uint32_t		 active_height;
+
+	/*
 	 * Mode-config topology (Phase C).  Single-scanout for now;
 	 * multi-scanout is Phase F.  Objects embed directly in the softc
 	 * so their lifetime is trivially bounded by attach/detach.
@@ -132,6 +148,7 @@ struct virtio_kms_softc {
 /* Forward decls for the mode-config layer used by attach. */
 static int	virtio_kms_topology_init(struct virtio_kms_softc *sc);
 static void	virtio_kms_topology_teardown(struct virtio_kms_softc *sc);
+static void	virtio_kms_release_active(struct virtio_kms_softc *sc);
 static const struct drm_mode_config_funcs virtio_kms_mode_config_funcs;
 
 /*
@@ -407,6 +424,7 @@ virtio_kms_detach(device_t dev)
 	struct virtio_kms_softc *sc = device_get_softc(dev);
 
 	if (sc->drm_dev != NULL) {
+		virtio_kms_release_active(sc);
 		virtio_kms_topology_teardown(sc);
 		kms_dev_unregister(sc->drm_dev);
 		sc->drm_dev = NULL;
@@ -414,6 +432,332 @@ virtio_kms_detach(device_t dev)
 	mtx_destroy(&sc->mtx);
 	sx_destroy(&sc->ctrl_sx);
 	sx_destroy(&sc->sx);
+	return (0);
+}
+
+/*
+ * ============================================================
+ * Phase D: virtio_gpu 2D protocol wrappers
+ * ============================================================
+ *
+ * The five commands the atomic_commit path uses:
+ *   RESOURCE_CREATE_2D    — allocate a host-side surface
+ *   RESOURCE_ATTACH_BACKING — associate guest pages as its backing
+ *   SET_SCANOUT           — point a scanout at the resource
+ *   TRANSFER_TO_HOST_2D   — push guest bytes to the host surface
+ *   RESOURCE_FLUSH        — make the surface visible on the scanout
+ *
+ * Plus RESOURCE_UNREF on framebuffer destroy.  All use the shared
+ * virtio_kms_req_resp helper from Phase B.
+ *
+ * Response validation is uniform: any non-OK_NODATA return type
+ * from the host is logged and turned into EIO.  Fence IDs are
+ * allocated from sc->next_fence.
+ */
+
+static int
+virtio_kms_cmd_common_check(struct virtio_kms_softc *sc,
+    const char *op, const struct virtio_gpu_ctrl_hdr *resp)
+{
+	if (le32toh(resp->type) != VIRTIO_GPU_RESP_OK_NODATA) {
+		device_printf(sc->dev,
+		    "%s: unexpected resp type 0x%x\n",
+		    op, le32toh(resp->type));
+		return (EIO);
+	}
+	return (0);
+}
+
+static int
+virtio_kms_resource_create_2d(struct virtio_kms_softc *sc,
+    uint32_t resource_id, uint32_t format, uint32_t width, uint32_t height)
+{
+	struct {
+		struct virtio_gpu_resource_create_2d	req;
+		char					pad;
+		struct virtio_gpu_ctrl_hdr		resp;
+	} s;
+	int error;
+
+	bzero(&s, sizeof(s));
+	s.req.hdr.type = htole32(VIRTIO_GPU_CMD_RESOURCE_CREATE_2D);
+	s.req.hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
+	s.req.hdr.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
+	s.req.resource_id = htole32(resource_id);
+	s.req.format = htole32(format);
+	s.req.width = htole32(width);
+	s.req.height = htole32(height);
+
+	error = virtio_kms_req_resp(sc, &s.req, sizeof(s.req),
+	    &s.resp, sizeof(s.resp));
+	if (error != 0)
+		return (error);
+	return (virtio_kms_cmd_common_check(sc, "resource_create_2d",
+	    &s.resp));
+}
+
+static int
+virtio_kms_resource_unref(struct virtio_kms_softc *sc, uint32_t resource_id)
+{
+	struct {
+		struct virtio_gpu_resource_unref	req;
+		char					pad;
+		struct virtio_gpu_ctrl_hdr		resp;
+	} s;
+	int error;
+
+	bzero(&s, sizeof(s));
+	s.req.hdr.type = htole32(VIRTIO_GPU_CMD_RESOURCE_UNREF);
+	s.req.hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
+	s.req.hdr.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
+	s.req.resource_id = htole32(resource_id);
+
+	error = virtio_kms_req_resp(sc, &s.req, sizeof(s.req),
+	    &s.resp, sizeof(s.resp));
+	if (error != 0)
+		return (error);
+	return (virtio_kms_cmd_common_check(sc, "resource_unref", &s.resp));
+}
+
+/*
+ * Attach the GEM object's pages as scatter-gather backing for the
+ * host resource.  Each guest page becomes one virtio_gpu_mem_entry.
+ * Real dumb buffers created by the framework are backed by wired
+ * contiguous pages so this loop compresses into a small (or single)
+ * SG list, but we don't assume contiguity — the spec allows any
+ * mix and coalescing runs of adjacent physical pages is a Phase F
+ * optimisation.
+ *
+ * The request size is variable (base header + nr_entries mem entries).
+ * We malloc a heap buffer sized for the actual page count rather than
+ * embed a huge fixed-size array in the struct.
+ */
+static int
+virtio_kms_attach_backing(struct virtio_kms_softc *sc, uint32_t resource_id,
+    struct drm_gem_object *gem)
+{
+	struct virtio_gpu_resource_attach_backing *att;
+	struct virtio_gpu_mem_entry *mem;
+	struct virtio_gpu_ctrl_hdr resp;
+	size_t reqlen;
+	uint32_t npages, i;
+	int error;
+
+	if (gem == NULL || gem->pages == NULL || gem->npages == 0)
+		return (EINVAL);
+	npages = (uint32_t)gem->npages;
+
+	reqlen = sizeof(*att) + npages * sizeof(*mem);
+	att = malloc(reqlen, M_VIRTIO_KMS, M_WAITOK | M_ZERO);
+
+	att->hdr.type = htole32(VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING);
+	att->hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
+	att->hdr.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
+	att->resource_id = htole32(resource_id);
+	att->nr_entries = htole32(npages);
+
+	mem = (struct virtio_gpu_mem_entry *)(att + 1);
+	for (i = 0; i < npages; i++) {
+		mem[i].addr = htole64(VM_PAGE_TO_PHYS(gem->pages[i]));
+		mem[i].length = htole32(PAGE_SIZE);
+	}
+
+	bzero(&resp, sizeof(resp));
+	error = virtio_kms_req_resp(sc, att, reqlen, &resp, sizeof(resp));
+	free(att, M_VIRTIO_KMS);
+	if (error != 0)
+		return (error);
+	return (virtio_kms_cmd_common_check(sc, "attach_backing", &resp));
+}
+
+static int
+virtio_kms_detach_backing(struct virtio_kms_softc *sc, uint32_t resource_id)
+{
+	struct {
+		struct virtio_gpu_resource_detach_backing req;
+		char					pad;
+		struct virtio_gpu_ctrl_hdr		resp;
+	} s;
+	int error;
+
+	bzero(&s, sizeof(s));
+	s.req.hdr.type = htole32(VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING);
+	s.req.hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
+	s.req.hdr.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
+	s.req.resource_id = htole32(resource_id);
+
+	error = virtio_kms_req_resp(sc, &s.req, sizeof(s.req),
+	    &s.resp, sizeof(s.resp));
+	if (error != 0)
+		return (error);
+	return (virtio_kms_cmd_common_check(sc, "detach_backing", &s.resp));
+}
+
+static int
+virtio_kms_set_scanout(struct virtio_kms_softc *sc, uint32_t scanout_id,
+    uint32_t resource_id, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+	struct {
+		struct virtio_gpu_set_scanout	req;
+		char				pad;
+		struct virtio_gpu_ctrl_hdr	resp;
+	} s;
+	int error;
+
+	bzero(&s, sizeof(s));
+	s.req.hdr.type = htole32(VIRTIO_GPU_CMD_SET_SCANOUT);
+	s.req.hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
+	s.req.hdr.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
+	s.req.scanout_id = htole32(scanout_id);
+	s.req.resource_id = htole32(resource_id);
+	s.req.r.x = htole32(x);
+	s.req.r.y = htole32(y);
+	s.req.r.width = htole32(w);
+	s.req.r.height = htole32(h);
+
+	error = virtio_kms_req_resp(sc, &s.req, sizeof(s.req),
+	    &s.resp, sizeof(s.resp));
+	if (error != 0)
+		return (error);
+	return (virtio_kms_cmd_common_check(sc, "set_scanout", &s.resp));
+}
+
+static int
+virtio_kms_transfer_to_host_2d(struct virtio_kms_softc *sc,
+    uint32_t resource_id, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+	struct {
+		struct virtio_gpu_transfer_to_host_2d	req;
+		char					pad;
+		struct virtio_gpu_ctrl_hdr		resp;
+	} s;
+	int error;
+
+	bzero(&s, sizeof(s));
+	s.req.hdr.type = htole32(VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D);
+	s.req.hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
+	s.req.hdr.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
+	s.req.resource_id = htole32(resource_id);
+	s.req.offset = htole64(0);	/* whole surface for now */
+	s.req.r.x = htole32(x);
+	s.req.r.y = htole32(y);
+	s.req.r.width = htole32(w);
+	s.req.r.height = htole32(h);
+
+	error = virtio_kms_req_resp(sc, &s.req, sizeof(s.req),
+	    &s.resp, sizeof(s.resp));
+	if (error != 0)
+		return (error);
+	return (virtio_kms_cmd_common_check(sc, "transfer_to_host_2d",
+	    &s.resp));
+}
+
+static int
+virtio_kms_resource_flush(struct virtio_kms_softc *sc, uint32_t resource_id,
+    uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+	struct {
+		struct virtio_gpu_resource_flush	req;
+		char					pad;
+		struct virtio_gpu_ctrl_hdr		resp;
+	} s;
+	int error;
+
+	bzero(&s, sizeof(s));
+	s.req.hdr.type = htole32(VIRTIO_GPU_CMD_RESOURCE_FLUSH);
+	s.req.hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
+	s.req.hdr.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
+	s.req.resource_id = htole32(resource_id);
+	s.req.r.x = htole32(x);
+	s.req.r.y = htole32(y);
+	s.req.r.width = htole32(w);
+	s.req.r.height = htole32(h);
+
+	error = virtio_kms_req_resp(sc, &s.req, sizeof(s.req),
+	    &s.resp, sizeof(s.resp));
+	if (error != 0)
+		return (error);
+	return (virtio_kms_cmd_common_check(sc, "resource_flush", &s.resp));
+}
+
+/*
+ * Detach + unref the currently-attached host resource, if any.
+ * Called from atomic_commit before wiring a fresh framebuffer, and
+ * from the framebuffer .destroy hook so a dying fb doesn't leave a
+ * host resource dangling.
+ */
+static void
+virtio_kms_release_active(struct virtio_kms_softc *sc)
+{
+	if (sc->active_resource_id == 0)
+		return;
+	(void)virtio_kms_detach_backing(sc, sc->active_resource_id);
+	(void)virtio_kms_resource_unref(sc, sc->active_resource_id);
+	sc->active_resource_id = 0;
+	sc->active_width = 0;
+	sc->active_height = 0;
+}
+
+/*
+ * Wire a framebuffer to scanout 0 (Phase D single-scanout).  Steps:
+ *   1. If a different resource is already live, tear it down.
+ *   2. If this fb's resource_id isn't live yet, CREATE_2D +
+ *      ATTACH_BACKING with the GEM object's page list.
+ *   3. SET_SCANOUT → resource_id, sized to fb geometry.
+ *   4. TRANSFER + FLUSH the full surface so the host paints
+ *      whatever's already in guest RAM.
+ *
+ * On any protocol error we roll back to no-active-resource so the
+ * next commit gets a clean CREATE.
+ */
+static int
+virtio_kms_atomic_bind_fb(struct virtio_kms_softc *sc,
+    struct drm_framebuffer *fb)
+{
+	uint32_t rid = fb->base.id;
+	uint32_t w = fb->width;
+	uint32_t h = fb->height;
+	int error;
+
+	if (rid == 0 || rid == sc->active_resource_id) {
+		/*
+		 * Zero-id can't happen for a live fb; same-id means we're
+		 * re-committing a page-flip.  Reuse the resource: just do
+		 * a TRANSFER + FLUSH.
+		 */
+		if (rid == 0)
+			return (EINVAL);
+		error = virtio_kms_transfer_to_host_2d(sc, rid, 0, 0, w, h);
+		if (error == 0)
+			error = virtio_kms_resource_flush(sc, rid, 0, 0, w, h);
+		return (error);
+	}
+
+	virtio_kms_release_active(sc);
+
+	error = virtio_kms_resource_create_2d(sc, rid,
+	    VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM, w, h);
+	if (error != 0)
+		return (error);
+	error = virtio_kms_attach_backing(sc, rid, fb->gem_objs[0]);
+	if (error != 0) {
+		(void)virtio_kms_resource_unref(sc, rid);
+		return (error);
+	}
+	error = virtio_kms_set_scanout(sc, 0, rid, 0, 0, w, h);
+	if (error != 0) {
+		(void)virtio_kms_detach_backing(sc, rid);
+		(void)virtio_kms_resource_unref(sc, rid);
+		return (error);
+	}
+	(void)virtio_kms_transfer_to_host_2d(sc, rid, 0, 0, w, h);
+	(void)virtio_kms_resource_flush(sc, rid, 0, 0, w, h);
+
+	sc->active_resource_id = rid;
+	sc->active_width = w;
+	sc->active_height = h;
+	VKMS_DPRINTF(sc, "bound resource %u (%ux%u) to scanout 0\n",
+	    rid, w, h);
 	return (0);
 }
 
@@ -554,11 +898,78 @@ virtio_kms_atomic_check(struct drm_device *dev __unused,
  * + RESOURCE_FLUSH for each mode_changed / active_changed CRTC,
  * using the framebuffer routed to that CRTC's primary plane.
  */
-static int
-virtio_kms_atomic_commit(struct drm_device *dev __unused,
-    struct drm_atomic_state *state __unused, bool nonblock __unused)
+/*
+ * Pick the framebuffer routed to a specific CRTC out of the atomic
+ * state.  Single primary plane per CRTC in Phase D, so the first
+ * plane_state whose crtc field matches wins.  Returns NULL when
+ * no plane is routed (blanking / partial disable).
+ */
+static struct drm_framebuffer *
+virtio_kms_atomic_pick_fb(struct drm_atomic_state *state,
+    struct drm_crtc *crtc)
 {
-	return (0);
+	uint32_t i;
+
+	for (i = 0; i < state->num_plane; i++) {
+		const struct drm_plane_state *ps = state->plane_states[i];
+
+		if (ps == NULL || ps->crtc != crtc || ps->fb == NULL)
+			continue;
+		return (ps->fb);
+	}
+	return (NULL);
+}
+
+/*
+ * Atomic commit: for every crtc with mode_changed or active_changed,
+ * either bind the routed framebuffer to scanout 0 (Phase D single-
+ * scanout) or clear the scanout when the CRTC is being blanked.
+ * Page-flip-only paths (fb changed, mode unchanged) also route here;
+ * virtio_kms_atomic_bind_fb detects same-resource_id and does a
+ * cheap TRANSFER + FLUSH.
+ */
+static int
+virtio_kms_atomic_commit(struct drm_device *dev,
+    struct drm_atomic_state *state, bool nonblock __unused)
+{
+	struct virtio_kms_softc *sc = virtio_kms_dev_to_sc(dev);
+	uint32_t i;
+	int error = 0;
+
+	if (state == NULL)
+		return (EINVAL);
+
+	sx_xlock(&sc->sx);
+	for (i = 0; i < state->num_crtc; i++) {
+		const struct drm_crtc_state *cs = state->crtc_states[i];
+		struct drm_framebuffer *fb;
+
+		if (cs == NULL)
+			continue;
+		if (!cs->active) {
+			virtio_kms_release_active(sc);
+			continue;
+		}
+		fb = virtio_kms_atomic_pick_fb(state, cs->crtc);
+		if (fb == NULL) {
+			/*
+			 * Active CRTC with no plane routed — treat as
+			 * blank until a plane_state supplies an fb.  Real
+			 * userspace never actually hits this on Phase D
+			 * (setcrtc always routes primary) so no big deal.
+			 */
+			virtio_kms_release_active(sc);
+			continue;
+		}
+		error = virtio_kms_atomic_bind_fb(sc, fb);
+		if (error != 0) {
+			device_printf(sc->dev,
+			    "atomic_commit: bind_fb rc=%d\n", error);
+			break;
+		}
+	}
+	sx_xunlock(&sc->sx);
+	return (error);
 }
 
 static const struct drm_mode_config_funcs virtio_kms_mode_config_funcs = {
