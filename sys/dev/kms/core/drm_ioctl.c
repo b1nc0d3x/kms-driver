@@ -81,7 +81,9 @@ drm_ioctl_version(struct drm_file *file, struct drm_version *v)
 	 * 5th-review L-1: snapshot drv once with atomic_load_ptr so a
 	 * concurrent kms_dev_unregister NULLing dev->driver is observed
 	 * as a stable value across the multiple field accesses below.
-	 * Reject a torn-close call with ENXIO.
+	 * Aligned pointer stores are single-copy atomic on amd64/arm64
+	 * so a torn load isn't the risk; observing NULL after unregister
+	 * ran between ioctl entry and field deref is.  Return ENXIO.
 	 */
 	drv = (const struct drm_driver *)atomic_load_ptr(&file->dev->driver);
 	if (drv == NULL)

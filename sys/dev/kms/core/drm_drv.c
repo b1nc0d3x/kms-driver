@@ -481,7 +481,7 @@ kms_dev_unregister(struct drm_device *dev)
 	 * reader relies on comes from sx_xunlock below, NOT from the
 	 * atomic macro itself.  The macro pair exists to (a) document
 	 * the H2 store/load contract for future readers, (b) block
-	 * compiler re-ordering of these two dependent stores against
+	 * compiler re-ordering of this paired store sequence against
 	 * other volatile-typed accesses in the same function.
 	 */
 	sx_xlock(&dev->dev_lock);
