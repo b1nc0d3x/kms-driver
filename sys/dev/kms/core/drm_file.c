@@ -156,10 +156,14 @@ kms_file_dtor(void *data)
 	 * file's driver state) but before kms_file_put releases the
 	 * storage (so the driver still has a valid `file`).
 	 *
-	 * 3rd-review L-3: snapshot dev->driver with atomic_load_ptr so a
-	 * concurrent kms_dev_unregister setting it to NULL under dev_lock
-	 * is observed atomically here.  Without the snapshot we'd race a
-	 * torn 8-byte load on some architectures and could deref garbage.
+	 * 3rd-review L-3 / 4th-review L-B: snapshot dev->driver with
+	 * atomic_load_ptr, paired with atomic_store_ptr on the writer
+	 * side in kms_dev_unregister.  On amd64/arm64 aligned pointer
+	 * stores are single-copy atomic so a torn load isn't the actual
+	 * risk; the atomic pair documents the read-side of the H2
+	 * invariant and gives the compiler a fence hint against
+	 * re-ordering the two dependent loads (dev->driver, then
+	 * drv->file_free).
 	 */
 	{
 		const struct drm_driver *drv =

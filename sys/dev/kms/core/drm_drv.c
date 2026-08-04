@@ -473,10 +473,17 @@ kms_dev_unregister(struct drm_device *dev)
 	 * derefs -- must fail closed rather than touch freed softc storage.
 	 * Take dev_lock so an in-flight callback either sees the old pair
 	 * atomically or the NULL pair, never a half-updated view.
+	 *
+	 * 4th-review L-C: mirror the reader-side atomic_load_ptr in
+	 * kms_file_dtor with atomic_store_ptr here.  On amd64/arm64 both
+	 * expand to plain volatile stores so this is a documentation move
+	 * -- the intent is that any future reader that skips dev_lock (a
+	 * fast-path callback, an assertion) sees the store as ordered
+	 * against the sx_xunlock's release fence via the atomic pair.
 	 */
 	sx_xlock(&dev->dev_lock);
-	dev->driver_priv = NULL;
-	dev->driver = NULL;
+	atomic_store_ptr(&dev->driver_priv, NULL);
+	atomic_store_ptr(&dev->driver, NULL);
 	sx_xunlock(&dev->dev_lock);
 
 	kms_device_release(dev);
