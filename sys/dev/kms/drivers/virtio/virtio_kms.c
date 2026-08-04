@@ -28,7 +28,6 @@
 #include <sys/kernel.h>
 #include <sys/malloc.h>
 #include <sys/module.h>
-#include <sys/mutex.h>
 #include <sys/sglist.h>
 #include <sys/sx.h>
 #include <sys/sysctl.h>
@@ -108,7 +107,7 @@ struct virtio_kms_softc {
 	struct drm_device	*drm_dev;
 
 	struct sx		 sx;		/* driver-wide serializer */
-	struct mtx		 mtx;		/* short critical sections */
+	bool			 detaching;	/* atomic_commit gate */
 
 	/* virtio plumbing (Phase B). */
 	struct virtqueue	*ctrl_vq;	/* command / response */
@@ -235,6 +234,24 @@ virtio_kms_alloc_queues(struct virtio_kms_softc *sc)
 }
 
 /*
+ * All Phase D command paths use virtqueue_poll for completion, so we
+ * don't want a used-buffer interrupt firing the generic virtio ISR
+ * with our NULL callback (VQ_ALLOC_INFO_INIT above passes NULL for
+ * _intr).  Disable notifications on both queues after alloc.  Config-
+ * change events (hotplug) still come through the device's dedicated
+ * config-change vector -- this only silences per-queue completion IRQs.
+ * Review #2.
+ */
+static void
+virtio_kms_disable_queue_intr(struct virtio_kms_softc *sc)
+{
+	if (sc->ctrl_vq != NULL)
+		virtqueue_disable_intr(sc->ctrl_vq);
+	if (sc->cursor_vq != NULL)
+		virtqueue_disable_intr(sc->cursor_vq);
+}
+
+/*
  * Synchronous request / response over ctrl_vq.  Mirrors the in-base
  * driver's vtgpu_req_resp: build a two-segment sglist (req is device-
  * read, resp is device-write), enqueue with 1 readable + 1 writable
@@ -347,11 +364,11 @@ virtio_kms_probe(device_t dev)
 	device_set_desc(dev, VIRTIO_KMS_DRIVER_DESC);
 	/*
 	 * Beat the in-base virtio_gpu(4) at BUS_PROBE_VENDOR.  In-base
-	 * driver stays loadable and keeps its fbio hooks; console
-	 * ownership handover is done at firstopen/lastclose time
-	 * (Phase E), not by driver replacement.
+	 * uses BUS_PROBE_DEFAULT on virtio_mmio too, so we can't rely on
+	 * tie-breaking there -- use BUS_PROBE_VENDOR+1 to ensure a
+	 * deterministic win.  Review #17.
 	 */
-	return (BUS_PROBE_VENDOR);
+	return (BUS_PROBE_VENDOR + 1);
 }
 
 static int
@@ -365,7 +382,6 @@ virtio_kms_attach(device_t dev)
 	sc->next_fence = 1;
 	sx_init(&sc->sx, "virtio_kms");
 	sx_init(&sc->ctrl_sx, "virtio_kms ctrl");
-	mtx_init(&sc->mtx, "virtio_kms", NULL, MTX_DEF);
 	TASK_INIT(&sc->hotplug_task, 0, virtio_kms_hotplug_task, sc);
 
 	virtio_set_feature_desc(dev, virtio_kms_feature_desc);
@@ -383,6 +399,7 @@ virtio_kms_attach(device_t dev)
 		device_printf(dev, "setup_intr failed: %d\n", error);
 		goto fail_locks;
 	}
+	virtio_kms_disable_queue_intr(sc);
 
 	error = virtio_kms_fetch_display_info(sc);
 	if (error != 0) {
@@ -441,7 +458,6 @@ virtio_kms_attach(device_t dev)
 	return (0);
 
 fail_locks:
-	mtx_destroy(&sc->mtx);
 	sx_destroy(&sc->ctrl_sx);
 	sx_destroy(&sc->sx);
 	return (error);
@@ -452,6 +468,17 @@ virtio_kms_detach(device_t dev)
 {
 	struct virtio_kms_softc *sc = device_get_softc(dev);
 
+	/*
+	 * Detach-gate atomic_commit: any in-flight ATOMIC ioctl coming
+	 * out of a file that opened before kms_dev_unregister returns
+	 * will hit the sc->detaching check and return without touching
+	 * ctrl_vq.  Set under sc->sx so commit_bind_fb never crosses it.
+	 * Review #6.
+	 */
+	sx_xlock(&sc->sx);
+	sc->detaching = true;
+	sx_xunlock(&sc->sx);
+
 	taskqueue_drain(taskqueue_thread, &sc->hotplug_task);
 	if (sc->drm_dev != NULL) {
 		virtio_kms_release_active(sc);
@@ -459,7 +486,6 @@ virtio_kms_detach(device_t dev)
 		kms_dev_unregister(sc->drm_dev);
 		sc->drm_dev = NULL;
 	}
-	mtx_destroy(&sc->mtx);
 	sx_destroy(&sc->ctrl_sx);
 	sx_destroy(&sc->sx);
 	return (0);
@@ -550,54 +576,47 @@ virtio_kms_resource_unref(struct virtio_kms_softc *sc, uint32_t resource_id)
 }
 
 /*
- * Attach the GEM object's pages as scatter-gather backing for the
- * host resource.  Each guest page becomes one virtio_gpu_mem_entry.
- * Real dumb buffers created by the framework are backed by wired
- * contiguous pages so this loop compresses into a small (or single)
- * SG list, but we don't assume contiguity — the spec allows any
- * mix and coalescing runs of adjacent physical pages is a Phase F
- * optimisation.
+ * Attach the GEM object's pages as backing for the host resource.
+ * `kms_gem_object_create` uses `vm_page_alloc_noobj_contig` so every
+ * GEM object is a single contiguous physical run — we exploit that
+ * and send exactly one virtio_gpu_mem_entry (npages*PAGE_SIZE at
+ * page[0]'s physical address) rather than one entry per page.  That
+ * keeps attach_backing under the direct-descriptor limit even for
+ * multi-MB framebuffers where a per-page SG list would exceed the
+ * virtqueue ring's segment count (Review #1).
  *
- * The request size is variable (base header + nr_entries mem entries).
- * We malloc a heap buffer sized for the actual page count rather than
- * embed a huge fixed-size array in the struct.
+ * If a future kms_gem allocator ever hands out scattered pages this
+ * assumption breaks and the routine must fall back to a page walk +
+ * indirect descriptor negotiation.
  */
 static int
 virtio_kms_attach_backing(struct virtio_kms_softc *sc, uint32_t resource_id,
     struct drm_gem_object *gem)
 {
-	struct virtio_gpu_resource_attach_backing *att;
-	struct virtio_gpu_mem_entry *mem;
-	struct virtio_gpu_ctrl_hdr resp;
-	size_t reqlen;
-	uint32_t npages, i;
+	struct {
+		struct virtio_gpu_resource_attach_backing	req;
+		struct virtio_gpu_mem_entry			mem[1];
+		char						pad;
+		struct virtio_gpu_ctrl_hdr			resp;
+	} s;
 	int error;
 
 	if (gem == NULL || gem->pages == NULL || gem->npages == 0)
 		return (EINVAL);
-	npages = (uint32_t)gem->npages;
 
-	reqlen = sizeof(*att) + npages * sizeof(*mem);
-	att = malloc(reqlen, M_VIRTIO_KMS, M_WAITOK | M_ZERO);
+	bzero(&s, sizeof(s));
+	s.req.hdr.type = htole32(VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING);
+	s.req.hdr.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
+	s.req.resource_id = htole32(resource_id);
+	s.req.nr_entries = htole32(1);
+	s.mem[0].addr = htole64(VM_PAGE_TO_PHYS(gem->pages[0]));
+	s.mem[0].length = htole32((uint32_t)(gem->npages * PAGE_SIZE));
 
-	att->hdr.type = htole32(VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING);
-	att->hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
-	att->hdr.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
-	att->resource_id = htole32(resource_id);
-	att->nr_entries = htole32(npages);
-
-	mem = (struct virtio_gpu_mem_entry *)(att + 1);
-	for (i = 0; i < npages; i++) {
-		mem[i].addr = htole64(VM_PAGE_TO_PHYS(gem->pages[i]));
-		mem[i].length = htole32(PAGE_SIZE);
-	}
-
-	bzero(&resp, sizeof(resp));
-	error = virtio_kms_req_resp(sc, att, reqlen, &resp, sizeof(resp));
-	free(att, M_VIRTIO_KMS);
+	error = virtio_kms_req_resp(sc, &s.req,
+	    sizeof(s.req) + sizeof(s.mem), &s.resp, sizeof(s.resp));
 	if (error != 0)
 		return (error);
-	return (virtio_kms_cmd_common_check(sc, "attach_backing", &resp));
+	return (virtio_kms_cmd_common_check(sc, "attach_backing", &s.resp));
 }
 
 static int
@@ -712,15 +731,21 @@ virtio_kms_resource_flush(struct virtio_kms_softc *sc, uint32_t resource_id,
 
 /*
  * Detach + unref the currently-attached host resource, if any.
- * Called from atomic_commit before wiring a fresh framebuffer, and
- * from the framebuffer .destroy hook so a dying fb doesn't leave a
- * host resource dangling.
+ * Called from atomic_commit before wiring a fresh framebuffer, from
+ * atomic_commit when a CRTC is being blanked, and from detach.
+ *
+ * Order matters: SET_SCANOUT(resource_id=0) FIRST so the host stops
+ * scanning the resource, then DETACH_BACKING, then RESOURCE_UNREF.
+ * Skipping the SET_SCANOUT lets the host briefly scan pages that
+ * DETACH_BACKING just released, which is the virtio-gpu equivalent
+ * of the H3 flip-fb-hold race we fixed in kms core.  Review #8/#9.
  */
 static void
 virtio_kms_release_active(struct virtio_kms_softc *sc)
 {
 	if (sc->active_resource_id == 0)
 		return;
+	(void)virtio_kms_set_scanout(sc, 0, 0, 0, 0, 0, 0);
 	(void)virtio_kms_detach_backing(sc, sc->active_resource_id);
 	(void)virtio_kms_resource_unref(sc, sc->active_resource_id);
 	sc->active_resource_id = 0;
@@ -780,8 +805,20 @@ virtio_kms_atomic_bind_fb(struct virtio_kms_softc *sc,
 		(void)virtio_kms_resource_unref(sc, rid);
 		return (error);
 	}
-	(void)virtio_kms_transfer_to_host_2d(sc, rid, 0, 0, w, h);
-	(void)virtio_kms_resource_flush(sc, rid, 0, 0, w, h);
+	error = virtio_kms_transfer_to_host_2d(sc, rid, 0, 0, w, h);
+	if (error == 0)
+		error = virtio_kms_resource_flush(sc, rid, 0, 0, w, h);
+	if (error != 0) {
+		/*
+		 * Roll back to no-active-resource: next commit will do a
+		 * clean CREATE + ATTACH rather than treating a dead resource
+		 * as page-flippable.  Review #7.
+		 */
+		(void)virtio_kms_set_scanout(sc, scanout_id, 0, 0, 0, 0, 0);
+		(void)virtio_kms_detach_backing(sc, rid);
+		(void)virtio_kms_resource_unref(sc, rid);
+		return (error);
+	}
 
 	sc->active_resource_id = rid;
 	sc->active_width = w;
@@ -831,7 +868,9 @@ virtio_kms_connector_to_scanout(struct virtio_kms_softc *sc,
     struct drm_connector *connector)
 {
 	uint32_t idx = (uint32_t)(connector - &sc->connector[0]);
-	return (idx < VIRTIO_KMS_MAX_SCANOUTS ? idx : 0);
+	KASSERT(idx < VIRTIO_KMS_MAX_SCANOUTS,
+	    ("virtio_kms: connector %p not in sc->connector[]", connector));
+	return (idx);
 }
 
 /*
@@ -986,6 +1025,24 @@ virtio_kms_atomic_check(struct drm_device *dev __unused,
 		    cs->mode.clock == 0)
 			return (EINVAL);
 	}
+	/*
+	 * Reject an active plane whose fb has no GEM backing before
+	 * commit hits the wire.  Compositors get "check failed" (which
+	 * they retry with a different config) instead of a mid-commit
+	 * "commit failed" that looks like a driver crash.  Review #14.
+	 * Also reject fb whose stride isn't tightly packed -- virtio-gpu
+	 * 2D TRANSFER assumes pitch == width * bpp (Review #16).
+	 */
+	for (i = 0; i < state->num_plane; i++) {
+		const struct drm_plane_state *ps = state->plane_states[i];
+
+		if (ps == NULL || ps->fb == NULL)
+			continue;
+		if (ps->fb->gem_objs[0] == NULL)
+			return (EINVAL);
+		if (ps->fb->pitches[0] != ps->fb->width * 4)
+			return (EINVAL);
+	}
 	return (0);
 }
 
@@ -1030,6 +1087,9 @@ virtio_kms_atomic_commit(struct drm_device *dev,
     struct drm_atomic_state *state, bool nonblock __unused)
 {
 	struct virtio_kms_softc *sc = virtio_kms_dev_to_sc(dev);
+	struct drm_framebuffer *bind_fb;
+	uint32_t bind_scanout;
+	bool have_bind, saw_blank;
 	uint32_t i;
 	int error = 0;
 
@@ -1037,33 +1097,51 @@ virtio_kms_atomic_commit(struct drm_device *dev,
 		return (EINVAL);
 
 	sx_xlock(&sc->sx);
+	/* Detach-gate: virtqueues may be torn down.  Review #6. */
+	if (sc->detaching) {
+		sx_xunlock(&sc->sx);
+		return (ENXIO);
+	}
+
+	/*
+	 * Two-pass walk to avoid releasing a resource we just bound.
+	 * Phase D has one active resource at a time, so we pick the
+	 * first active+routed CRTC as the bind target and treat any
+	 * other CRTC's blank as a bystander until a subsequent commit
+	 * that carries no bind target.  Review #15.
+	 */
+	have_bind = false;
+	saw_blank = false;
+	bind_fb = NULL;
+	bind_scanout = 0;
 	for (i = 0; i < state->num_crtc; i++) {
 		const struct drm_crtc_state *cs = state->crtc_states[i];
-		struct drm_framebuffer *fb;
 
 		if (cs == NULL)
 			continue;
 		if (!cs->active) {
-			virtio_kms_release_active(sc);
+			saw_blank = true;
 			continue;
 		}
-		fb = virtio_kms_atomic_pick_fb(state, cs->crtc);
-		if (fb == NULL) {
-			/*
-			 * Active CRTC with no plane routed — treat as
-			 * blank until a plane_state supplies an fb.  Real
-			 * userspace never actually hits this on Phase D
-			 * (setcrtc always routes primary) so no big deal.
-			 */
-			virtio_kms_release_active(sc);
-			continue;
+		if (!have_bind) {
+			struct drm_framebuffer *fb;
+
+			fb = virtio_kms_atomic_pick_fb(state, cs->crtc);
+			if (fb != NULL) {
+				bind_fb = fb;
+				bind_scanout = cs->crtc->index;
+				have_bind = true;
+			}
 		}
-		error = virtio_kms_atomic_bind_fb(sc, fb, cs->crtc->index);
-		if (error != 0) {
+	}
+
+	if (have_bind) {
+		error = virtio_kms_atomic_bind_fb(sc, bind_fb, bind_scanout);
+		if (error != 0)
 			device_printf(sc->dev,
 			    "atomic_commit: bind_fb rc=%d\n", error);
-			break;
-		}
+	} else if (saw_blank) {
+		virtio_kms_release_active(sc);
 	}
 	sx_xunlock(&sc->sx);
 	return (error);
@@ -1224,18 +1302,33 @@ virtio_kms_hotplug_task(void *arg, int pending __unused)
 	    offsetof(struct virtio_gpu_config, events_clear),
 	    &clear, sizeof(clear));
 
+	/*
+	 * Refresh cached geometry + invalidate cached EDID blobs under
+	 * sc->sx, but DROP sc->sx before calling into framework helpers
+	 * that acquire mode_config.mutex (kms_connector_modes_clear /
+	 * kms_connector_hotplug).  atomic_commit acquires
+	 * mode_config.mutex first then sc->sx -- reversing that order
+	 * here would AB/BA deadlock a compositor commit against a
+	 * hotplug event.  Review #5.
+	 */
 	sx_xlock(&sc->sx);
-
-	/* Refresh cached geometry + invalidate cached EDID blobs. */
 	(void)virtio_kms_fetch_display_info(sc);
 	n = sc->num_scanouts;
+	if (n == 0)
+		n = 1;
 	if (n > VIRTIO_KMS_MAX_SCANOUTS)
 		n = VIRTIO_KMS_MAX_SCANOUTS;
 	for (i = 0; i < n; i++)
 		sc->scanouts[i].edid_len = 0;
+	sx_xunlock(&sc->sx);
 
-	/* Update connector status + notify userspace. */
-	for (i = 0; i < VIRTIO_KMS_MAX_SCANOUTS; i++) {
+	/*
+	 * Walk only slots that topology_init has actually initialised.
+	 * Walking [0, VIRTIO_KMS_MAX_SCANOUTS) touched connector[]
+	 * entries with NULL ->dev and NULL mode-list heads, tripping a
+	 * NULL deref inside kms_connector_modes_clear.  Review #12.
+	 */
+	for (i = 0; i < n; i++) {
 		enum drm_connector_status status =
 		    (i < sc->num_scanouts && sc->scanouts[i].enabled != 0)
 		    ? connector_status_connected
@@ -1245,7 +1338,6 @@ virtio_kms_hotplug_task(void *arg, int pending __unused)
 		kms_connector_modes_clear(&sc->connector[i]);
 		kms_connector_hotplug(&sc->connector[i], status);
 	}
-	sx_xunlock(&sc->sx);
 
 	device_printf(sc->dev,
 	    "hotplug: %u scanouts, event acked\n", sc->num_scanouts);
