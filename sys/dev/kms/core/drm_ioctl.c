@@ -234,6 +234,21 @@ drm_ioctl_get_cap(struct drm_file *file __unused, struct drm_get_cap *c)
 	case DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP:
 		c->value = 0;
 		return (0);
+	case DRM_CAP_ATOMIC:
+		/*
+		 * Advertise atomic support only if the driver actually
+		 * installed atomic_check + atomic_commit hooks in its
+		 * mode_config_funcs.  Drivers with NULL hooks (e.g. rk_kms
+		 * legacy) get c->value=0 so Xorg falls back to SETCRTC.
+		 */
+		{
+			const struct drm_mode_config_funcs *mcf =
+			    file->dev->mode_config.funcs;
+			c->value = (mcf != NULL &&
+			    mcf->atomic_check != NULL &&
+			    mcf->atomic_commit != NULL) ? 1 : 0;
+		}
+		return (0);
 	}
 	return (EINVAL);
 }

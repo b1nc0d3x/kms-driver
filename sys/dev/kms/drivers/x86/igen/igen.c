@@ -1973,15 +1973,25 @@ igen_program_scanout(struct igen_softc *sc, struct drm_framebuffer *fb)
 		return;
 	}
 
-	/* PLANE_STRIDE encodes bytes-per-row / 64. */
-	stride = fb->pitches[0] / 64;
+	/*
+	 * STRIDE encoding is gen-dependent.  On HSW/BDW (legacy DSPSTRIDE at
+	 * 0x70188), the register stores bytes-per-row directly -- Linux i915
+	 * confirms this via BDW MBP register dump 2026-08-04:
+	 *   DSPASTRIDE = 0x00002800 = 10240 bytes = 2560 pixels * 4bpp
+	 * On SKL+ (PLANE_STRIDE at 0x70188 but for the SKL-shape primary),
+	 * the register uses /64 encoding.  Split on gen so both work.
+	 */
+	if (sc->gen == IGEN_GEN_HSW)
+		stride = fb->pitches[0];
+	else
+		stride = fb->pitches[0] / 64;
 	igen_w32(sc, PLANE_STRIDE(0), stride);
 	igen_w32(sc, PLANE_SURF(0), surf);
-	DPRINTF(sc, 1,
+	device_printf(sc->dev,
 	    "program_scanout: fb %u (%ux%u pitch=%u) -> PLANE_SURF=0x%08x"
-	    " STRIDE=%u\n",
+	    " STRIDE=0x%08x (gen=%d)\n",
 	    fb->base.id, fb->width, fb->height, fb->pitches[0],
-	    surf, stride);
+	    surf, stride, sc->gen);
 }
 
 static int
@@ -2035,6 +2045,22 @@ igen_legacy_set_config(struct drm_mode_set *set)
 				return (perr);
 			}
 		}
+	}
+
+	/*
+	 * Apple HSW/BDW eDP handoff: firmware left DSPCNTR with TILED_X set
+	 * (for the EFI FB) and TRICKLE_FEED_DISABLE clear.  Our GEM-backed
+	 * user fbs are linear.  Fix DSPCNTR each set_config so plane fetch
+	 * decodes correctly.  Same rewrite Xorg would get via atomic_commit
+	 * on kernels that use it -- we're on the legacy SETCRTC path here
+	 * because kms doesn't advertise atomic yet.  hsw_panel_on covers the
+	 * DSPCNTR + PIPE_SRCSZ + M/N programming; program_scanout below
+	 * overwrites STRIDE + SURF with the caller's fb.  Ground truth:
+	 * project_igen_apple_edp_handoff_2026_08_04.md.
+	 */
+	if (sc->gen == IGEN_GEN_HSW &&
+	    (sc->quirks & IGEN_QUIRK_APPLE_EDP_HANDOFF) != 0) {
+		(void)igen_hsw_panel_on(sc);
 	}
 
 	crtc->mode = *set->mode;

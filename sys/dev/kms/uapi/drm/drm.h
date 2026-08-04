@@ -786,6 +786,19 @@ struct drm_gem_open {
  */
 #define DRM_CAP_SYNCOBJ_TIMELINE	0x14
 /**
+ * DRM_CAP_ATOMIC (non-upstream: userspace-side probe)
+ *
+ * Query whether the driver honours DRM_MODE_ATOMIC.  Linux doesn't
+ * carry an equivalent GET_CAP -- clients set DRM_CLIENT_CAP_ATOMIC
+ * via SET_CLIENT_CAP and get success/EINVAL.  We accept GET_CAP for
+ * this as a convenience for userland tools (drmGetCap wrappers) that
+ * would otherwise fall back to EINVAL and pick the legacy SETCRTC
+ * path.
+ *
+ * Uses ID 0x40 to steer clear of any future upstream assignment.
+ */
+#define DRM_CAP_ATOMIC			0x40
+/**
  * DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP
  *
  * If set to 1, the driver supports &DRM_MODE_PAGE_FLIP_ASYNC for atomic
