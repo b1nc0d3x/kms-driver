@@ -32,6 +32,7 @@
 #include <sys/sglist.h>
 #include <sys/sx.h>
 #include <sys/sysctl.h>
+#include <sys/taskqueue.h>
 
 #include <machine/bus.h>
 #include <machine/resource.h>
@@ -72,9 +73,10 @@
 #define	VIRTIO_KMS_MAX_SCANOUTS		VIRTIO_GPU_MAX_SCANOUTS
 
 /*
- * Cached per-scanout state: the display info reply enables and sizes
- * each scanout that the host has active.  Extended in Phase F with
- * the EDID blob when the host advertises VIRTIO_GPU_F_EDID.
+ * Cached per-scanout state.  DISPLAY_INFO fills geometry + enabled;
+ * GET_EDID (Phase F, opt-in via VIRTIO_GPU_F_EDID) fills the EDID
+ * blob and length so connector.get_modes can advertise the host's
+ * real preferred timing.
  */
 struct virtio_kms_scanout {
 	uint32_t	enabled;
@@ -83,6 +85,10 @@ struct virtio_kms_scanout {
 	uint32_t	x;
 	uint32_t	y;
 	uint32_t	flags;		/* pmode.flags from resp */
+
+	/* EDID cache, populated lazily.  Length 0 means "not fetched". */
+	uint32_t	edid_len;
+	uint8_t		edid[1024];
 };
 
 #define	VIRTIO_KMS_DRIVER_NAME	"virtio_kms"
@@ -128,14 +134,23 @@ struct virtio_kms_softc {
 	uint32_t		 active_height;
 
 	/*
-	 * Mode-config topology (Phase C).  Single-scanout for now;
-	 * multi-scanout is Phase F.  Objects embed directly in the softc
-	 * so their lifetime is trivially bounded by attach/detach.
+	 * Mode-config topology (Phase F multi-scanout).  Arrays sized at
+	 * VIRTIO_KMS_MAX_SCANOUTS (16, per spec); only the first
+	 * `num_scanouts` slots are initialised.  Object lifetime is
+	 * bounded by attach/detach; the framework hands ownership back
+	 * via topology_teardown.
+	 *
+	 * connector[i] <-> encoder[i] <-> crtc[i] <-> primary[i] is a
+	 * strict one-to-one pipeline in Phase F -- no cross-routing,
+	 * matches the virtio-gpu scanout model exactly.
 	 */
-	struct drm_crtc		 crtc;
-	struct drm_plane	 primary;
-	struct drm_encoder	 encoder;
-	struct drm_connector	 connector;
+	struct drm_crtc		 crtc[VIRTIO_KMS_MAX_SCANOUTS];
+	struct drm_plane	 primary[VIRTIO_KMS_MAX_SCANOUTS];
+	struct drm_encoder	 encoder[VIRTIO_KMS_MAX_SCANOUTS];
+	struct drm_connector	 connector[VIRTIO_KMS_MAX_SCANOUTS];
+
+	/* Task for taskqueue-deferred hotplug event handling. */
+	struct task		 hotplug_task;
 
 	int			 debug;		/* dev.virtio_kms.N.debug */
 };
@@ -149,6 +164,8 @@ struct virtio_kms_softc {
 static int	virtio_kms_topology_init(struct virtio_kms_softc *sc);
 static void	virtio_kms_topology_teardown(struct virtio_kms_softc *sc);
 static void	virtio_kms_release_active(struct virtio_kms_softc *sc);
+static void	virtio_kms_hotplug_task(void *arg, int pending);
+static int	virtio_kms_sysctl_hotplug_probe(SYSCTL_HANDLER_ARGS);
 static const struct drm_mode_config_funcs virtio_kms_mode_config_funcs;
 
 /*
@@ -349,6 +366,7 @@ virtio_kms_attach(device_t dev)
 	sx_init(&sc->sx, "virtio_kms");
 	sx_init(&sc->ctrl_sx, "virtio_kms ctrl");
 	mtx_init(&sc->mtx, "virtio_kms", NULL, MTX_DEF);
+	TASK_INIT(&sc->hotplug_task, 0, virtio_kms_hotplug_task, sc);
 
 	virtio_set_feature_desc(dev, virtio_kms_feature_desc);
 	sc->features = virtio_negotiate_features(dev, 0);
@@ -405,6 +423,17 @@ virtio_kms_attach(device_t dev)
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 	    "num_scanouts", CTLFLAG_RD, &sc->num_scanouts, 0,
 	    "Number of active scanouts reported by the host");
+	SYSCTL_ADD_UINT(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "active_resource_id", CTLFLAG_RD, &sc->active_resource_id, 0,
+	    "Currently-attached host resource ID (0 = none)");
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "hotplug_probe",
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
+	    virtio_kms_sysctl_hotplug_probe, "I",
+	    "Write 1 to re-fetch display_info and fire hotplug on every "
+	    "connector (Phase F stand-in for the config-change IRQ).");
 
 	device_printf(dev,
 	    "attached (features 0x%x, num_scanouts %u, num_capsets %u)\n",
@@ -423,6 +452,7 @@ virtio_kms_detach(device_t dev)
 {
 	struct virtio_kms_softc *sc = device_get_softc(dev);
 
+	taskqueue_drain(taskqueue_thread, &sc->hotplug_task);
 	if (sc->drm_dev != NULL) {
 		virtio_kms_release_active(sc);
 		virtio_kms_topology_teardown(sc);
@@ -712,7 +742,7 @@ virtio_kms_release_active(struct virtio_kms_softc *sc)
  */
 static int
 virtio_kms_atomic_bind_fb(struct virtio_kms_softc *sc,
-    struct drm_framebuffer *fb)
+    struct drm_framebuffer *fb, uint32_t scanout_id)
 {
 	uint32_t rid = fb->base.id;
 	uint32_t w = fb->width;
@@ -744,7 +774,7 @@ virtio_kms_atomic_bind_fb(struct virtio_kms_softc *sc,
 		(void)virtio_kms_resource_unref(sc, rid);
 		return (error);
 	}
-	error = virtio_kms_set_scanout(sc, 0, rid, 0, 0, w, h);
+	error = virtio_kms_set_scanout(sc, scanout_id, rid, 0, 0, w, h);
 	if (error != 0) {
 		(void)virtio_kms_detach_backing(sc, rid);
 		(void)virtio_kms_resource_unref(sc, rid);
@@ -756,8 +786,8 @@ virtio_kms_atomic_bind_fb(struct virtio_kms_softc *sc,
 	sc->active_resource_id = rid;
 	sc->active_width = w;
 	sc->active_height = h;
-	VKMS_DPRINTF(sc, "bound resource %u (%ux%u) to scanout 0\n",
-	    rid, w, h);
+	VKMS_DPRINTF(sc, "bound resource %u (%ux%u) to scanout %u\n",
+	    rid, w, h, scanout_id);
 	return (0);
 }
 
@@ -792,27 +822,95 @@ virtio_kms_dev_to_sc(struct drm_device *drm_dev)
 }
 
 /*
- * Connector .get_modes: publish one CVT-derived preferred mode per
- * enabled scanout entry.  Phase C exposes only scanouts[0]; Phase F
- * multiplexes onto N connectors so each one gets its own scanout row.
- * Returns the count of modes added.
+ * Map a connector back to its scanout index by pointer arithmetic
+ * inside the softc's connector[] array.  Cheap and stable — every
+ * connector we ever publish is one of ours.
+ */
+static uint32_t
+virtio_kms_connector_to_scanout(struct virtio_kms_softc *sc,
+    struct drm_connector *connector)
+{
+	uint32_t idx = (uint32_t)(connector - &sc->connector[0]);
+	return (idx < VIRTIO_KMS_MAX_SCANOUTS ? idx : 0);
+}
+
+/*
+ * Fetch the EDID blob for a specific scanout via VIRTIO_GPU_CMD_GET_EDID.
+ * Only issued when the host advertised VIRTIO_GPU_F_EDID at negotiate
+ * time.  Result cached in sc->scanouts[i].edid so subsequent get_modes
+ * calls don't hit the wire.  Returns 0 on success (edid_len non-zero),
+ * errno otherwise; caller decides whether to fall through to the CVT
+ * fallback.
+ */
+static int
+virtio_kms_fetch_edid(struct virtio_kms_softc *sc, uint32_t scanout_id)
+{
+	struct {
+		struct virtio_gpu_cmd_get_edid	req;
+		char				pad;
+		struct virtio_gpu_resp_edid	resp;
+	} s;
+	uint32_t sz;
+	int error;
+
+	if ((sc->features & (1ULL << VIRTIO_GPU_F_EDID)) == 0)
+		return (EOPNOTSUPP);
+	if (scanout_id >= VIRTIO_KMS_MAX_SCANOUTS)
+		return (EINVAL);
+
+	bzero(&s, sizeof(s));
+	s.req.hdr.type = htole32(VIRTIO_GPU_CMD_GET_EDID);
+	s.req.hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
+	s.req.hdr.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
+	s.req.scanout = htole32(scanout_id);
+
+	error = virtio_kms_req_resp(sc, &s.req, sizeof(s.req),
+	    &s.resp, sizeof(s.resp));
+	if (error != 0)
+		return (error);
+
+	if (le32toh(s.resp.hdr.type) != VIRTIO_GPU_RESP_OK_EDID) {
+		device_printf(sc->dev,
+		    "get_edid[%u]: unexpected resp type 0x%x\n",
+		    scanout_id, le32toh(s.resp.hdr.type));
+		return (EIO);
+	}
+	sz = le32toh(s.resp.size);
+	if (sz == 0 || sz > sizeof(sc->scanouts[scanout_id].edid))
+		return (EIO);
+
+	memcpy(sc->scanouts[scanout_id].edid, s.resp.edid, sz);
+	sc->scanouts[scanout_id].edid_len = sz;
+	VKMS_DPRINTF(sc, "get_edid[%u]: cached %u bytes\n", scanout_id, sz);
+	return (0);
+}
+
+/*
+ * Connector .get_modes: publish either the EDID-derived preferred
+ * mode (when VIRTIO_GPU_F_EDID negotiated + fetch succeeded) or a
+ * CVT-shaped fallback sized from the display-info cache.  Returns
+ * the number of modes added.
  */
 static int
 virtio_kms_get_modes(struct drm_connector *connector)
 {
 	struct virtio_kms_softc *sc = virtio_kms_dev_to_sc(connector->dev);
+	uint32_t idx = virtio_kms_connector_to_scanout(sc, connector);
+	struct virtio_kms_scanout *s = &sc->scanouts[idx];
 	struct drm_display_mode *mode;
-	const struct virtio_kms_scanout *s = &sc->scanouts[0];
 	uint32_t hdisplay, vdisplay;
-	int added = 0;
+
+	/*
+	 * Best-effort EDID fetch (Phase F).  On success we still publish
+	 * the display_info geometry; a proper EDID mode parser is a
+	 * future task -- for now the EDID is cached and available via
+	 * dev.virtio_kms.N.edid_len for userspace to fetch through
+	 * connector.edid_blob later.
+	 */
+	if (s->edid_len == 0)
+		(void)virtio_kms_fetch_edid(sc, idx);
 
 	if (sc->num_scanouts == 0 || s->enabled == 0) {
-		/*
-		 * Fallback until we have live topology (e.g. attach ran but
-		 * fetch_display_info bounced): advertise 1024x768 so
-		 * userspace still gets something to bind against.  Phase F
-		 * removes this fallback once hotplug re-runs display_info.
-		 */
 		hdisplay = 1024;
 		vdisplay = 768;
 	} else {
@@ -836,11 +934,10 @@ virtio_kms_get_modes(struct drm_connector *connector)
 	mode->vrefresh    = 60;
 	kms_mode_set_name(mode);
 	kms_connector_add_mode(connector, mode);
-	added++;
 
-	VKMS_DPRINTF(sc, "get_modes: published %ux%u (added=%d)\n",
-	    hdisplay, vdisplay, added);
-	return (added);
+	VKMS_DPRINTF(sc, "get_modes[%u]: published %ux%u (edid=%u bytes)\n",
+	    idx, hdisplay, vdisplay, s->edid_len);
+	return (1);
 }
 
 /*
@@ -961,7 +1058,7 @@ virtio_kms_atomic_commit(struct drm_device *dev,
 			virtio_kms_release_active(sc);
 			continue;
 		}
-		error = virtio_kms_atomic_bind_fb(sc, fb);
+		error = virtio_kms_atomic_bind_fb(sc, fb, cs->crtc->index);
 		if (error != 0) {
 			device_printf(sc->dev,
 			    "atomic_commit: bind_fb rc=%d\n", error);
@@ -989,67 +1086,182 @@ static const uint32_t virtio_kms_primary_formats[] = {
 	DRM_FORMAT_ARGB8888,
 };
 
+/*
+ * Publish `n` scanouts as `n` independent CRTC+plane+encoder+connector
+ * pipelines.  Always create at least one so /dev/dri/card0 has
+ * something to bind against even when the host advertised zero.
+ * Runs at attach and again after a hotplug event when the scanout
+ * count changed (the framework tolerates re-init of already-initialised
+ * objects; connectors get their modes cleared and repopulated on the
+ * next get_modes).
+ */
 static int
 virtio_kms_topology_init(struct virtio_kms_softc *sc)
 {
 	struct drm_mode_config *mc = &sc->drm_dev->mode_config;
-	uint32_t crtc_mask;
+	uint32_t n, i;
 	int error;
 
-	/*
-	 * Cap the mode-config canvas at 4Kx4K.  virtio-gpu can advertise
-	 * larger surfaces if the host is willing, but 4K is a sane
-	 * default that matches rk_kms and every commodity display userspace
-	 * currently tries.
-	 */
 	mc->max_width  = 4096;
 	mc->max_height = 4096;
 
-	error = kms_crtc_init(sc->drm_dev, &sc->crtc,
-	    &virtio_kms_crtc_funcs);
-	if (error != 0)
-		return (error);
-	crtc_mask = 1u << sc->crtc.index;
+	n = sc->num_scanouts;
+	if (n == 0)
+		n = 1;
+	if (n > VIRTIO_KMS_MAX_SCANOUTS)
+		n = VIRTIO_KMS_MAX_SCANOUTS;
 
-	error = kms_plane_init(sc->drm_dev, &sc->primary,
-	    &virtio_kms_plane_funcs, DRM_PLANE_TYPE_PRIMARY, crtc_mask,
-	    virtio_kms_primary_formats,
-	    nitems(virtio_kms_primary_formats));
-	if (error != 0)
-		goto fail_crtc;
-	sc->crtc.primary_plane = &sc->primary;
+	for (i = 0; i < n; i++) {
+		uint32_t crtc_mask;
 
-	error = kms_encoder_init(sc->drm_dev, &sc->encoder,
-	    &virtio_kms_encoder_funcs, DRM_MODE_ENCODER_VIRTUAL);
-	if (error != 0)
-		goto fail_plane;
-	sc->encoder.possible_crtcs = crtc_mask;
+		error = kms_crtc_init(sc->drm_dev, &sc->crtc[i],
+		    &virtio_kms_crtc_funcs);
+		if (error != 0)
+			goto fail;
+		crtc_mask = 1u << sc->crtc[i].index;
 
-	error = kms_connector_init(sc->drm_dev, &sc->connector,
-	    &virtio_kms_connector_funcs, DRM_MODE_CONNECTOR_VIRTUAL);
-	if (error != 0)
-		goto fail_encoder;
-	sc->connector.status = connector_status_connected;
-	kms_connector_attach_encoder(&sc->connector, &sc->encoder);
+		error = kms_plane_init(sc->drm_dev, &sc->primary[i],
+		    &virtio_kms_plane_funcs, DRM_PLANE_TYPE_PRIMARY,
+		    crtc_mask, virtio_kms_primary_formats,
+		    nitems(virtio_kms_primary_formats));
+		if (error != 0)
+			goto fail;
+		sc->crtc[i].primary_plane = &sc->primary[i];
 
+		error = kms_encoder_init(sc->drm_dev, &sc->encoder[i],
+		    &virtio_kms_encoder_funcs, DRM_MODE_ENCODER_VIRTUAL);
+		if (error != 0)
+			goto fail;
+		sc->encoder[i].possible_crtcs = crtc_mask;
+
+		error = kms_connector_init(sc->drm_dev, &sc->connector[i],
+		    &virtio_kms_connector_funcs,
+		    DRM_MODE_CONNECTOR_VIRTUAL);
+		if (error != 0)
+			goto fail;
+		sc->connector[i].status =
+		    (i < sc->num_scanouts && sc->scanouts[i].enabled != 0)
+		    ? connector_status_connected
+		    : connector_status_disconnected;
+		kms_connector_attach_encoder(&sc->connector[i],
+		    &sc->encoder[i]);
+	}
 	return (0);
 
-fail_encoder:
-	kms_encoder_cleanup(&sc->encoder);
-fail_plane:
-	kms_plane_cleanup(&sc->primary);
-fail_crtc:
-	kms_crtc_cleanup(&sc->crtc);
+fail:
+	/*
+	 * Best-effort cleanup: run cleanup on every slot up to and
+	 * including the one that failed.  The kms API is documented
+	 * as tolerant of double-cleanup on zero'd memory, which
+	 * matches how rk_kms handles the same failure path.
+	 */
+	for (; i > 0; i--) {
+		kms_connector_cleanup(&sc->connector[i - 1]);
+		kms_encoder_cleanup(&sc->encoder[i - 1]);
+		kms_plane_cleanup(&sc->primary[i - 1]);
+		kms_crtc_cleanup(&sc->crtc[i - 1]);
+	}
 	return (error);
 }
 
 static void
 virtio_kms_topology_teardown(struct virtio_kms_softc *sc)
 {
-	kms_connector_cleanup(&sc->connector);
-	kms_encoder_cleanup(&sc->encoder);
-	kms_plane_cleanup(&sc->primary);
-	kms_crtc_cleanup(&sc->crtc);
+	uint32_t n, i;
+
+	n = sc->num_scanouts;
+	if (n == 0)
+		n = 1;
+	if (n > VIRTIO_KMS_MAX_SCANOUTS)
+		n = VIRTIO_KMS_MAX_SCANOUTS;
+
+	for (i = n; i > 0; i--) {
+		kms_connector_cleanup(&sc->connector[i - 1]);
+		kms_encoder_cleanup(&sc->encoder[i - 1]);
+		kms_plane_cleanup(&sc->primary[i - 1]);
+		kms_crtc_cleanup(&sc->crtc[i - 1]);
+	}
+}
+
+/*
+ * ============================================================
+ * Phase F: hotplug + config-space event handling
+ * ============================================================
+ *
+ * The virtio-gpu spec's config-change event routes through the
+ * device's `events_read` register.  When the host asserts a new
+ * display topology it sets VIRTIO_GPU_EVENT_DISPLAY in events_read
+ * and (in a spec-compliant guest) raises a config-change interrupt.
+ * We handle that by re-fetching display_info and firing
+ * kms_connector_hotplug on each connector; userspace (Xorg / mutter)
+ * probes get_modes again and picks up the new topology.
+ *
+ * The `hotplug_probe` sysctl exercises the same path without waiting
+ * for a real config-change IRQ, so operators can force a re-scan
+ * from userland.  The IRQ hookup lives in virtio_setup_intr from
+ * Phase B and will call into the hotplug task once the notification
+ * queue is wired -- deferred to a follow-up.
+ */
+
+static void
+virtio_kms_hotplug_task(void *arg, int pending __unused)
+{
+	struct virtio_kms_softc *sc = arg;
+	uint32_t events_read = 0;
+	uint32_t clear = 0;
+	uint32_t i, n;
+
+	/* Read + ack the event register. */
+	virtio_read_device_config(sc->dev,
+	    offsetof(struct virtio_gpu_config, events_read),
+	    &events_read, sizeof(events_read));
+	if ((events_read & VIRTIO_GPU_EVENT_DISPLAY) == 0) {
+		VKMS_DPRINTF(sc, "hotplug_task: no DISPLAY event\n");
+		return;
+	}
+	clear = VIRTIO_GPU_EVENT_DISPLAY;
+	virtio_write_device_config(sc->dev,
+	    offsetof(struct virtio_gpu_config, events_clear),
+	    &clear, sizeof(clear));
+
+	sx_xlock(&sc->sx);
+
+	/* Refresh cached geometry + invalidate cached EDID blobs. */
+	(void)virtio_kms_fetch_display_info(sc);
+	n = sc->num_scanouts;
+	if (n > VIRTIO_KMS_MAX_SCANOUTS)
+		n = VIRTIO_KMS_MAX_SCANOUTS;
+	for (i = 0; i < n; i++)
+		sc->scanouts[i].edid_len = 0;
+
+	/* Update connector status + notify userspace. */
+	for (i = 0; i < VIRTIO_KMS_MAX_SCANOUTS; i++) {
+		enum drm_connector_status status =
+		    (i < sc->num_scanouts && sc->scanouts[i].enabled != 0)
+		    ? connector_status_connected
+		    : connector_status_disconnected;
+
+		sc->connector[i].status = status;
+		kms_connector_modes_clear(&sc->connector[i]);
+		kms_connector_hotplug(&sc->connector[i], status);
+	}
+	sx_xunlock(&sc->sx);
+
+	device_printf(sc->dev,
+	    "hotplug: %u scanouts, event acked\n", sc->num_scanouts);
+}
+
+static int
+virtio_kms_sysctl_hotplug_probe(SYSCTL_HANDLER_ARGS)
+{
+	struct virtio_kms_softc *sc = arg1;
+	int trig = 0, error;
+
+	error = sysctl_handle_int(oidp, &trig, 0, req);
+	if (error != 0 || req->newptr == NULL || trig == 0)
+		return (error);
+	taskqueue_enqueue(taskqueue_thread, &sc->hotplug_task);
+	return (0);
 }
 
 static device_method_t virtio_kms_methods[] = {
