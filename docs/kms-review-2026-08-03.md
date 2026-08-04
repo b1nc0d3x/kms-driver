@@ -4,6 +4,28 @@ Third-party review after the last round (H1 d_mmap UAF, H2 cross-fd
 BO read, H3 flip-fb release timing, H4 vblank/close race, H5 no
 DRM_MASTER gate) all closed.  New findings, ranked by severity.
 
+## Landing status (as of 97d7d7e)
+
+| Finding | Status | Commit |
+|-|-|-|
+| H1 mmap access control | **already fixed** in prior-review pass | kms_mmap_single + kms_file_owns_gem |
+| H2 vblank UAF | **already addressed** by prior H4 refcount | drm_events.c:329 kms_file_get |
+| H3 modeset master gate (OBJ_SETPROPERTY) | **landed** | 25efd57 |
+| H4 igen GGTT u64 truncation | **landed** | 42acf1a |
+| H5 GGTT never unbound | **deferred** — 1-2 days, gated by i915_dispatch_enable=0 default | — |
+| H6 GEM_CREATE size cap | **landed** | 42acf1a |
+| M1 kqueue KNOTE_LOCKED | **landed** | 42acf1a |
+| M2 blob ownership + orphan | **landed** (per-file cap deferred with H5) | 9506a18 |
+| M3 flip event ordering | **landed** | 42acf1a |
+| M4 render-node deny list expansion | **landed** | 25efd57 |
+| Low: input passthrough counter | **landed** | 97d7d7e |
+| Low: prime_fo_mmap NULL check | **landed** | 97d7d7e |
+| Low: drm_modeset.c:494 printf | **not reproduced** — older-revision artifact | — |
+
+Cross-builds: kms.ko (arm64) + igen.ko (amd64) clean at 97d7d7e.
+Runtime verification on armbsd still pending (needs reboot to load
+new kms.ko).
+
 ## High
 
 ### H1 (new) — kms_mmap has no per-file access control
