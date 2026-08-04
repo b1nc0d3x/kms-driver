@@ -541,13 +541,40 @@ igen_hsw_panel_on(struct igen_softc *sc)
 	 * return.  No PIPE_CONF write, no STATE poll.
 	 */
 
+	/*
+	 * Auxiliary programming derived from Linux i915 BDW register dump
+	 * (Ubuntu at 192.168.1.72, 2026-08-04):
+	 *
+	 *   PIPE_MISC (0x70030) = 0x00400000  bit 22 = DITHER_ENABLE
+	 *   CHICKEN_PIPESL_A (0x420b0) = 0x00400001  HSW/BDW plane-fetch
+	 *      chicken bits (bit 22, bit 0 — clock gating + prefetch)
+	 *   WM_LINETIME_A (0x45270) = 0x00400051  IPS_LINETIME=0x40,
+	 *      LINETIME=0x51 (values for 2560x1600 60Hz; scale-appropriate
+	 *      for 2880x1800 too since watermarks are conservative)
+	 *
+	 * Without these three, the plane fetches pixel data but the transcoder
+	 * doesn't lock timing correctly with the plane's fetch cadence, giving
+	 * the classic B&W vertical column artifact (misaligned burst reads
+	 * ending mid-row).  Ground truth: matches Linux i915 for HSW/BDW eDP
+	 * plane bring-up.
+	 */
+#define	HSW_PIPE_MISC(p)		(0x00070030u + (p) * 0x1000u)
+#define	HSW_CHICKEN_PIPESL_A		0x000420b0u
+#define	HSW_WM_LINETIME_A		0x00045270u
+	igen_w32(sc, HSW_PIPE_MISC(0), 0x00400000u);
+	igen_w32(sc, HSW_CHICKEN_PIPESL_A, 0x00400001u);
+	igen_w32(sc, HSW_WM_LINETIME_A, 0x00400051u);
+
 	device_printf(sc->dev,
 	    "hsw_panel_on: apple-handoff shape (PIPE_A stays off; TRANS_EDP"
 	    " drives panel)  DSPACNTR=0x%08x DSPASTRIDE=0x%08x"
-	    " DSPASURF=0x%08x  M=0x%08x N=0x%08x\n",
+	    " DSPASURF=0x%08x  M=0x%08x N=0x%08x  PIPE_MISC=0x%08x"
+	    " WM_LINETIME=0x%08x\n",
 	    igen_r32(sc, HSW_DSPCNTR(0)),
 	    igen_r32(sc, HSW_DSPSTRIDE(0)),
-	    igen_r32(sc, HSW_DSPSURF(0)), m, n);
+	    igen_r32(sc, HSW_DSPSURF(0)), m, n,
+	    igen_r32(sc, HSW_PIPE_MISC(0)),
+	    igen_r32(sc, HSW_WM_LINETIME_A));
 	return (0);
 }
 
