@@ -190,9 +190,15 @@ kms_framebuffer_create(struct drm_file *file,
 	{
 		const struct drm_framebuffer_funcs *funcs =
 		    &drm_framebuffer_default_funcs;
-		if (file->dev->driver != NULL &&
-		    file->dev->driver->framebuffer_funcs != NULL)
-			funcs = file->dev->driver->framebuffer_funcs;
+		/*
+		 * 5th-review L-1: snapshot dev->driver so the null-check and
+		 * the .framebuffer_funcs deref see the same pointer.
+		 */
+		const struct drm_driver *drv = (const struct drm_driver *)
+		    atomic_load_ptr(&file->dev->driver);
+
+		if (drv != NULL && drv->framebuffer_funcs != NULL)
+			funcs = drv->framebuffer_funcs;
 		error = kms_framebuffer_init(file->dev, fb, funcs);
 	}
 	if (error != 0)

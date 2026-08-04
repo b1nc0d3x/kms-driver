@@ -474,12 +474,15 @@ kms_dev_unregister(struct drm_device *dev)
 	 * Take dev_lock so an in-flight callback either sees the old pair
 	 * atomically or the NULL pair, never a half-updated view.
 	 *
-	 * 4th-review L-C: mirror the reader-side atomic_load_ptr in
-	 * kms_file_dtor with atomic_store_ptr here.  On amd64/arm64 both
-	 * expand to plain volatile stores so this is a documentation move
-	 * -- the intent is that any future reader that skips dev_lock (a
-	 * fast-path callback, an assertion) sees the store as ordered
-	 * against the sx_xunlock's release fence via the atomic pair.
+	 * 4th-review L-C / 5th-review L-2: mirror the reader-side
+	 * atomic_load_ptr in kms_file_dtor with atomic_store_ptr here.
+	 * On amd64/arm64 both expand to plain volatile stores, so this
+	 * is a documentation move -- the release fence pairing the
+	 * reader relies on comes from sx_xunlock below, NOT from the
+	 * atomic macro itself.  The macro pair exists to (a) document
+	 * the H2 store/load contract for future readers, (b) block
+	 * compiler re-ordering of these two dependent stores against
+	 * other volatile-typed accesses in the same function.
 	 */
 	sx_xlock(&dev->dev_lock);
 	atomic_store_ptr(&dev->driver_priv, NULL);

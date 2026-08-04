@@ -77,7 +77,15 @@ drm_ioctl_version(struct drm_file *file, struct drm_version *v)
 	const struct drm_driver *drv;
 	int error;
 
-	drv = file->dev->driver;
+	/*
+	 * 5th-review L-1: snapshot drv once with atomic_load_ptr so a
+	 * concurrent kms_dev_unregister NULLing dev->driver is observed
+	 * as a stable value across the multiple field accesses below.
+	 * Reject a torn-close call with ENXIO.
+	 */
+	drv = (const struct drm_driver *)atomic_load_ptr(&file->dev->driver);
+	if (drv == NULL)
+		return (ENXIO);
 	v->version_major = drv->major;
 	v->version_minor = drv->minor;
 	v->version_patchlevel = drv->patchlevel;
@@ -100,21 +108,28 @@ drm_ioctl_get_unique(struct drm_file *file, struct drm_unique *u)
 }
 
 static int
-drm_ioctl_set_version(struct drm_file *file __unused,
+drm_ioctl_set_version(struct drm_file *file,
     struct drm_set_version *v)
 {
+	const struct drm_driver *drv;
+
 	/*
 	 * Userspace requests a DRM-interface version; we report ours
 	 * back and accept whatever they asked for as long as the major
 	 * matches.  drm_interface_version is 1.4 (legacy DRI) for now;
 	 * later phases bump to advertise DRI3 / atomic / etc.
+	 *
+	 * 5th-review L-1: atomic snapshot as in drm_ioctl_version.
 	 */
 	if (v->drm_di_major != -1 && v->drm_di_major != 1)
 		return (EINVAL);
+	drv = (const struct drm_driver *)atomic_load_ptr(&file->dev->driver);
+	if (drv == NULL)
+		return (ENXIO);
 	v->drm_di_major = 1;
 	v->drm_di_minor = 4;
-	v->drm_dd_major = file->dev->driver->major;
-	v->drm_dd_minor = file->dev->driver->minor;
+	v->drm_dd_major = drv->major;
+	v->drm_dd_minor = drv->minor;
 	return (0);
 }
 
@@ -771,7 +786,19 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 		return (kms_ioctl_mode_cursor2(file,
 		    (struct drm_mode_cursor2 *)data));
 	}
-	if (file->dev->driver != NULL && file->dev->driver->ioctl != NULL)
-		return (file->dev->driver->ioctl(file, cmd, data));
+	/*
+	 * 5th-review L-1: snapshot dev->driver once so the null-check and
+	 * the ioctl dispatch see the same pointer -- a concurrent
+	 * kms_dev_unregister writing NULL between the check and the deref
+	 * would otherwise trip a NULL deref.
+	 */
+	{
+		const struct drm_driver *drv =
+		    (const struct drm_driver *)
+		    atomic_load_ptr(&file->dev->driver);
+
+		if (drv != NULL && drv->ioctl != NULL)
+			return (drv->ioctl(file, cmd, data));
+	}
 	return (ENOTTY);
 }
