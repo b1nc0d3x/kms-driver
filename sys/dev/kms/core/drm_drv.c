@@ -100,6 +100,14 @@ kms_input_grant(void)
 {
 	int n, granted = 0;
 
+	/*
+	 * Low-review (2026-08-03): decision to relax is captured at
+	 * grant-time; the paired revoke MUST fire regardless of the
+	 * current tunable value or the grants_active counter would leak
+	 * across sysctl flips and the /dev/input/event* nodes would stay
+	 * 0660 root:video forever after a passthrough=1 → 0 flip.  The
+	 * tunable check stays at grant only.
+	 */
 	if (!kms_input_passthrough)
 		return;
 
@@ -121,19 +129,35 @@ static void
 kms_input_revoke(void)
 {
 	int n;
-
-	if (!kms_input_passthrough)
-		return;
+	bool do_restore = false;
 
 	sx_xlock(&kms_input_lock);
-	if (--kms_input_grants_active > 0) {
+	if (kms_input_grants_active == 0) {
+		/*
+		 * No grant to pair with — either never on, or the grant
+		 * path short-circuited because the tunable was off at
+		 * grant time (matching short-circuit here).  Not a leak.
+		 */
 		sx_xunlock(&kms_input_lock);
 		return;
 	}
+	if (--kms_input_grants_active == 0)
+		do_restore = true;
+	sx_xunlock(&kms_input_lock);
+
+	if (!do_restore)
+		return;
+
+	/*
+	 * Restore hardcoded 0600 root:wheel rather than the pre-grant
+	 * perms — we never snapshotted them per-file.  Callers who
+	 * wanted a different baseline should re-chmod after passthrough
+	 * closes.  Low-review 2026-08-03 flagged this as an imperfect
+	 * restore; per-file snapshotting deferred.
+	 */
 	for (n = 0; n < KMS_INPUT_MAX; n++) {
 		(void)kms_input_relax_one(n, 0600, 0 /* wheel */);
 	}
-	sx_xunlock(&kms_input_lock);
 	printf("kms: input passthrough off - restored /dev/input/event* to"
 	    " 0600 root:wheel\n");
 }

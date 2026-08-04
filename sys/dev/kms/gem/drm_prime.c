@@ -112,7 +112,7 @@ kms_prime_fo_mmap(struct file *fp, vm_map_t map __unused,
 	struct kms_prime_file *pf = fp->f_data;
 	vm_ooffset_t end;
 
-	if (pf == NULL || pf->obj == NULL)
+	if (pf == NULL || pf->obj == NULL || pf->obj->pager == NULL)
 		return (ENXIO);
 	/*
 	 * Reject partial / past-end mappings.  Previous check ignored foff,
