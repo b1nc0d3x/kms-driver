@@ -85,13 +85,13 @@ struct drm_driver {
  * exact failure mode of the 2026-08-03 rk_kms_set_config crash after a
  * next_magic field was removed without a matched-set rebuild.
  */
-int	kms_dev_register_versioned(const struct drm_driver *driver,
-	    void *driver_priv, size_t caller_devsize,
+int	kms_dev_register_versioned2(const struct drm_driver *driver,
+	    void *driver_priv, size_t caller_devsize, size_t caller_drvsize,
 	    struct drm_device **out_dev);
 
 #define	kms_dev_register(drv, priv, out) \
-	kms_dev_register_versioned((drv), (priv), \
-	    sizeof(struct drm_device), (out))
+	kms_dev_register_versioned2((drv), (priv), \
+	    sizeof(struct drm_device), sizeof(struct drm_driver), (out))
 
 /*
  * Unregister.  Removes the cdev so no new open()s succeed; existing

@@ -61,7 +61,7 @@ EXPORT_SYMS=	M_KMS \
 		kms_connector_update_edid \
 		kms_crtc_cleanup \
 		kms_crtc_init \
-		kms_dev_register_versioned \
+		kms_dev_register_versioned2 \
 		kms_dev_unregister \
 		kms_encoder_cleanup \
 		kms_encoder_init \

@@ -243,8 +243,8 @@ static TAILQ_HEAD(, drm_device) kms_devices =
  */
 
 int
-kms_dev_register_versioned(const struct drm_driver *driver, void *driver_priv,
-    size_t caller_devsize, struct drm_device **out_dev)
+kms_dev_register_versioned2(const struct drm_driver *driver, void *driver_priv,
+    size_t caller_devsize, size_t caller_drvsize, struct drm_device **out_dev)
 {
 	struct drm_device *dev;
 	struct make_dev_args args;
@@ -262,12 +262,28 @@ kms_dev_register_versioned(const struct drm_driver *driver, void *driver_priv,
 	 * at the wrong offset.  Refuse the registration with a loud
 	 * diagnostic instead of the "panic during first ioctl" mode the
 	 * 2026-08-03 rk_kms_set_config crash exposed.
+	 *
+	 * 2nd-review M4: same guard on struct drm_driver.  When kms.ko
+	 * gains a new descriptor field (e.g. .framebuffer_funcs, .file_free)
+	 * an old driver .ko compiled against the shorter layout would leave
+	 * that field uninitialised (garbage past its .rodata) and the
+	 * framework would deref it later.  Check both sizes; only both-match
+	 * passes.  The bump from kms_dev_register_versioned to _versioned2
+	 * is intentional -- an old .ko referencing the old symbol will fail
+	 * kldload cleanly instead of stack-corrupting on the wrong argc.
 	 */
 	if (caller_devsize != sizeof(struct drm_device)) {
 		printf("kms: struct drm_device ABI mismatch — driver \"%s\" "
 		    "compiled with sizeof=%zu but kms.ko has sizeof=%zu.  "
 		    "Rebuild the whole module set from the current tree.\n",
 		    driver->name, caller_devsize, sizeof(struct drm_device));
+		return (EPROTONOSUPPORT);
+	}
+	if (caller_drvsize != sizeof(struct drm_driver)) {
+		printf("kms: struct drm_driver ABI mismatch — driver \"%s\" "
+		    "compiled with sizeof=%zu but kms.ko has sizeof=%zu.  "
+		    "Rebuild the whole module set from the current tree.\n",
+		    driver->name, caller_drvsize, sizeof(struct drm_driver));
 		return (EPROTONOSUPPORT);
 	}
 
@@ -439,6 +455,21 @@ kms_dev_unregister(struct drm_device *dev)
 		kms_hw_dri_release();
 	}
 	kms_input_revoke();
+
+	/*
+	 * 2nd-review H2: NULL out driver_priv + driver before dropping the
+	 * initial registry ref.  If any file references survive (compositor
+	 * had /dev/dri/cardN open when the driver detached), later callbacks
+	 * from that file's teardown -- fb .destroy from RMFB, driver_priv
+	 * derefs -- must fail closed rather than touch freed softc storage.
+	 * Take dev_lock so an in-flight callback either sees the old pair
+	 * atomically or the NULL pair, never a half-updated view.
+	 */
+	sx_xlock(&dev->dev_lock);
+	dev->driver_priv = NULL;
+	dev->driver = NULL;
+	sx_xunlock(&dev->dev_lock);
+
 	kms_device_release(dev);
 }
 

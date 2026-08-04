@@ -143,6 +143,7 @@ struct virtio_kms_softc {
 	 * unique per drm_device, always non-zero for live objects).
 	 */
 	uint32_t		 active_resource_id;
+	uint32_t		 active_scanout_id;	/* 2nd-review M1 */
 	uint32_t		 active_width;
 	uint32_t		 active_height;
 
@@ -513,7 +514,31 @@ static int
 virtio_kms_detach(device_t dev)
 {
 	struct virtio_kms_softc *sc = device_get_softc(dev);
+	uint32_t live_fbs;
 
+	/*
+	 * 2nd-review H1: refuse to detach while any framebuffer is still
+	 * tracked.  The drm_device may outlive kms_dev_unregister if a
+	 * compositor still has /dev/dri/cardN open, and a later RMFB (or
+	 * file dtor scrubbing mode_config) would fire our fb .destroy hook
+	 * against a softc newbus already freed.  Force the admin to shut
+	 * the compositor down before detach/kldunload.
+	 */
+	sx_xlock(&sc->sx);
+	live_fbs = 0;
+	{
+		struct virtio_kms_fb_entry *e;
+
+		LIST_FOREACH(e, &sc->fb_map, link)
+			live_fbs++;
+	}
+	if (live_fbs != 0) {
+		sx_xunlock(&sc->sx);
+		device_printf(sc->dev,
+		    "detach: %u framebuffer(s) still tracked, EBUSY\n",
+		    live_fbs);
+		return (EBUSY);
+	}
 	/*
 	 * Detach-gate atomic_commit: any in-flight ATOMIC ioctl coming
 	 * out of a file that opened before kms_dev_unregister returns
@@ -521,28 +546,22 @@ virtio_kms_detach(device_t dev)
 	 * ctrl_vq.  Set under sc->sx so commit_bind_fb never crosses it.
 	 * Review #6.
 	 */
-	sx_xlock(&sc->sx);
 	sc->detaching = true;
 	sx_xunlock(&sc->sx);
 
 	taskqueue_drain(taskqueue_thread, &sc->hotplug_task);
 	if (sc->drm_dev != NULL) {
-		struct virtio_kms_fb_entry *e, *tmp;
-
+		/*
+		 * 2nd-review L3: release_active talks to the host over
+		 * ctrl_vq; hold sc->sx just like every other caller of
+		 * that helper so a future assert(SX_XLOCKED) doesn't panic.
+		 */
+		sx_xlock(&sc->sx);
 		virtio_kms_release_active(sc);
+		sx_xunlock(&sc->sx);
 		virtio_kms_topology_teardown(sc);
 		kms_dev_unregister(sc->drm_dev);
 		sc->drm_dev = NULL;
-		/*
-		 * Any fbs still tracked at detach have their host resources
-		 * already gone (fb_destroy runs from framework tear-down
-		 * during kms_dev_unregister with sc->detaching set, so it
-		 * skips the protocol calls).  Just free the tracker slots.
-		 */
-		LIST_FOREACH_SAFE(e, &sc->fb_map, link, tmp) {
-			LIST_REMOVE(e, link);
-			free(e, M_VIRTIO_KMS);
-		}
 	}
 	sx_destroy(&sc->ctrl_sx);
 	sx_destroy(&sc->sx);
@@ -779,6 +798,13 @@ virtio_kms_resource_flush(struct virtio_kms_softc *sc, uint32_t resource_id,
  * later release the host resource.  Caller holds sc->sx.  Idempotent
  * for the same (fb, rid) pair; a duplicate insert would signal a
  * driver bug (fb bound twice with different rids).
+ *
+ * 2nd-review L1: resource_id piggybacks on fb->base.id, the framework's
+ * per-mode_object id.  Reuse across RMFB+ADDFB2 is safe because
+ * virtio_kms_req_resp fully serialises ctrl-vq traffic under ctrl_sx --
+ * the RESOURCE_UNREF from the destroy hook completes on the host side
+ * before the next RESOURCE_CREATE_2D dispatches.  Do NOT pipeline
+ * ctrl-vq commands without revisiting this invariant.
  */
 static void
 virtio_kms_fb_track(struct virtio_kms_softc *sc,
@@ -816,9 +842,24 @@ virtio_kms_fb_track(struct virtio_kms_softc *sc,
 static void
 virtio_kms_fb_destroy(struct drm_framebuffer *fb)
 {
-	struct virtio_kms_softc *sc = virtio_kms_dev_to_sc(fb->dev);
+	struct virtio_kms_softc *sc;
 	struct virtio_kms_fb_entry *e, *tmp;
 	uint32_t rid = 0;
+
+	/*
+	 * 2nd-review H1/H2: if the framework NULLed driver_priv at
+	 * kms_dev_unregister time (driver already gone), the softc is
+	 * either freed or being freed.  Skip protocol calls; free the
+	 * fb allocation per contract.  This should not normally fire
+	 * because virtio_kms_detach refuses EBUSY while fbs are tracked,
+	 * but keep the guard as belt-and-braces against a stray drop
+	 * from a file dtor that races detach.
+	 */
+	sc = virtio_kms_dev_to_sc(fb->dev);
+	if (sc == NULL) {
+		free(fb, M_KMS);
+		return;
+	}
 
 	sx_xlock(&sc->sx);
 	LIST_FOREACH_SAFE(e, &sc->fb_map, link, tmp) {
@@ -863,10 +904,19 @@ virtio_kms_release_active(struct virtio_kms_softc *sc)
 {
 	if (sc->active_resource_id == 0)
 		return;
-	(void)virtio_kms_set_scanout(sc, 0, 0, 0, 0, 0, 0);
+	/*
+	 * 2nd-review M1: SET_SCANOUT(0) MUST target the same scanout the
+	 * resource was bound to.  Hardcoding scanout_id=0 leaves any
+	 * non-zero scanout scanning a resource we're about to detach +
+	 * unref, which is the exact race SET_SCANOUT-first-then-detach
+	 * ordering was supposed to close.
+	 */
+	(void)virtio_kms_set_scanout(sc, sc->active_scanout_id, 0,
+	    0, 0, 0, 0);
 	(void)virtio_kms_detach_backing(sc, sc->active_resource_id);
 	(void)virtio_kms_resource_unref(sc, sc->active_resource_id);
 	sc->active_resource_id = 0;
+	sc->active_scanout_id = 0;
 	sc->active_width = 0;
 	sc->active_height = 0;
 }
@@ -939,6 +989,7 @@ virtio_kms_atomic_bind_fb(struct virtio_kms_softc *sc,
 	}
 
 	sc->active_resource_id = rid;
+	sc->active_scanout_id = scanout_id;	/* 2nd-review M1 */
 	sc->active_width = w;
 	sc->active_height = h;
 
@@ -1069,6 +1120,14 @@ virtio_kms_get_modes(struct drm_connector *connector)
 	 * gate so subsequent get_modes calls don't hit the wire again
 	 * on a host that refuses GET_EDID.  Hotplug clears it.
 	 * Review #22.
+	 *
+	 * 2nd-review L4: the blob is cached in sc->scanouts[idx].edid but
+	 * NOT parsed -- the timing published below is CVT-shaped from the
+	 * display-info geometry, not the EDID DTD.  Compositors read the
+	 * EDID blob directly via the connector's EDID property, so the
+	 * cache still serves that path.  A parser lands with an EDID-DTD
+	 * timing when a real modeset user complains that the CVT clock
+	 * misses their monitor's exact pixel clock.  TODO: parse DTD.
 	 */
 	if (!s->edid_tried) {
 		s->edid_tried = true;
@@ -1158,15 +1217,36 @@ virtio_kms_atomic_check(struct drm_device *dev __unused,
 	 * "commit failed" that looks like a driver crash.  Review #14.
 	 * Also reject fb whose stride isn't tightly packed -- virtio-gpu
 	 * 2D TRANSFER assumes pitch == width * bpp (Review #16).
+	 *
+	 * 2nd-review M2: Phase D routes a single primary plane per CRTC.
+	 * If a compositor batches multiple planes onto the same CRTC (a
+	 * primary + an overlay), atomic_pick_fb silently truncates to the
+	 * first match -- reject the batch instead so the compositor sees a
+	 * clean check failure rather than silent-dropped planes.
 	 */
 	for (i = 0; i < state->num_plane; i++) {
 		const struct drm_plane_state *ps = state->plane_states[i];
+		uint32_t j, per_crtc;
 
 		if (ps == NULL || ps->fb == NULL)
 			continue;
 		if (ps->fb->gem_objs[0] == NULL)
 			return (EINVAL);
 		if (ps->fb->pitches[0] != ps->fb->width * 4)
+			return (EINVAL);
+		if (ps->crtc == NULL)
+			continue;
+		per_crtc = 0;
+		for (j = 0; j < state->num_plane; j++) {
+			const struct drm_plane_state *ps2 =
+			    state->plane_states[j];
+
+			if (ps2 == NULL || ps2->fb == NULL)
+				continue;
+			if (ps2->crtc == ps->crtc)
+				per_crtc++;
+		}
+		if (per_crtc > 1)
 			return (EINVAL);
 	}
 	return (0);
@@ -1322,14 +1402,23 @@ virtio_kms_topology_init(struct virtio_kms_softc *sc)
 	 * [topology_n, n) get published; slots [0, topology_n) are
 	 * assumed already initialised and get their connector.status
 	 * refreshed elsewhere (hotplug_task loop).  Review #13.
+	 *
+	 * 2nd-review M3: track per-step init progress in `partial` so the
+	 * fail-path unwinds exactly the objects it registered.  The old
+	 * coarse "clean everything from topology_n..i" loop would either
+	 * skip the current slot's crtc[i] (i unchanged when kms_plane_init
+	 * failed) or run kms_connector_cleanup on a slot where
+	 * kms_connector_init was never called.
 	 */
 	for (i = sc->topology_n; i < n; i++) {
 		uint32_t crtc_mask;
+		int partial = 0;	/* 1=crtc, 2=+plane, 3=+encoder, 4=+connector */
 
 		error = kms_crtc_init(sc->drm_dev, &sc->crtc[i],
 		    &virtio_kms_crtc_funcs);
 		if (error != 0)
 			goto fail;
+		partial = 1;
 		crtc_mask = 1u << sc->crtc[i].index;
 
 		error = kms_plane_init(sc->drm_dev, &sc->primary[i],
@@ -1337,42 +1426,61 @@ virtio_kms_topology_init(struct virtio_kms_softc *sc)
 		    crtc_mask, virtio_kms_primary_formats,
 		    nitems(virtio_kms_primary_formats));
 		if (error != 0)
-			goto fail;
+			goto fail_partial;
+		partial = 2;
 		sc->crtc[i].primary_plane = &sc->primary[i];
 
 		error = kms_encoder_init(sc->drm_dev, &sc->encoder[i],
 		    &virtio_kms_encoder_funcs, DRM_MODE_ENCODER_VIRTUAL);
 		if (error != 0)
-			goto fail;
+			goto fail_partial;
+		partial = 3;
 		sc->encoder[i].possible_crtcs = crtc_mask;
 
 		error = kms_connector_init(sc->drm_dev, &sc->connector[i],
 		    &virtio_kms_connector_funcs,
 		    DRM_MODE_CONNECTOR_VIRTUAL);
 		if (error != 0)
-			goto fail;
+			goto fail_partial;
+		partial = 4;
 		sc->connector[i].status =
 		    (i < sc->num_scanouts && sc->scanouts[i].enabled != 0)
 		    ? connector_status_connected
 		    : connector_status_disconnected;
 		kms_connector_attach_encoder(&sc->connector[i],
 		    &sc->encoder[i]);
+
+		/* Slot i fully published; loop advances. */
+		continue;
+
+fail_partial:
+		/* Unwind only what got initialized in this iter. */
+		if (partial >= 3)
+			kms_encoder_cleanup(&sc->encoder[i]);
+		if (partial >= 2)
+			kms_plane_cleanup(&sc->primary[i]);
+		if (partial >= 1)
+			kms_crtc_cleanup(&sc->crtc[i]);
+		goto fail;
 	}
 	sc->topology_n = n;
 	return (0);
 
 fail:
 	/*
-	 * Best-effort cleanup: run cleanup on every slot up to and
-	 * including the one that failed IN THIS GROW-STEP; already-
-	 * published slots (i < topology_n at entry) stay live so
-	 * concurrent GETCONNECTOR ioctls don't crash.
+	 * Unwind previously-completed slots in this grow-step: slots
+	 * [sc->topology_n, i) were fully initialised (all four objects)
+	 * before we hit the failure.  The current-slot partial cleanup
+	 * already ran at fail_partial.  Already-published slots
+	 * (< sc->topology_n at entry) stay live so concurrent
+	 * GETCONNECTOR ioctls don't crash.
 	 */
-	for (; i > sc->topology_n; i--) {
-		kms_connector_cleanup(&sc->connector[i - 1]);
-		kms_encoder_cleanup(&sc->encoder[i - 1]);
-		kms_plane_cleanup(&sc->primary[i - 1]);
-		kms_crtc_cleanup(&sc->crtc[i - 1]);
+	while (i > sc->topology_n) {
+		i--;
+		kms_connector_cleanup(&sc->connector[i]);
+		kms_encoder_cleanup(&sc->encoder[i]);
+		kms_plane_cleanup(&sc->primary[i]);
+		kms_crtc_cleanup(&sc->crtc[i]);
 	}
 	return (error);
 }
@@ -1436,10 +1544,18 @@ virtio_kms_hotplug_task(void *arg, int pending __unused)
 	 * Refresh cached geometry + invalidate cached EDID blobs under
 	 * sc->sx, but DROP sc->sx before calling into framework helpers
 	 * that acquire mode_config.mutex (kms_connector_modes_clear /
-	 * kms_connector_hotplug).  atomic_commit acquires
-	 * mode_config.mutex first then sc->sx -- reversing that order
-	 * here would AB/BA deadlock a compositor commit against a
-	 * hotplug event.  Review #5.
+	 * kms_connector_hotplug).
+	 *
+	 * Lock order: hotplug takes sc->sx briefly, then framework helpers
+	 * take mode_config.mutex.  So sc->sx -> mc->mutex is the direction.
+	 * Any future path that takes mc->mutex and calls back into driver
+	 * code holding sc->sx would AB/BA.  Today no such caller exists
+	 * (atomic_commit is dispatched WITHOUT mc->mutex per
+	 * drm_atomic.c:940; the PAGE_FLIP_EVENT arm block that does take
+	 * mc->mutex fires AFTER atomic_commit returns), but connector
+	 * .get_modes wrappers added by future work must not hold sc->sx
+	 * on entry.  2nd-review L2 (previous comment was inverted).
+	 * Review #5.
 	 *
 	 * If num_scanouts grew past our current topology_n we
 	 * republish the additional pipes here so the hotplug loop's
