@@ -12,6 +12,7 @@
 #include <drm/drm_mode.h>
 
 #include <kms/drm_device.h>
+#include <kms/drm_drv.h>
 #include <kms/drm_file.h>
 #include <kms/drm_framebuffer.h>
 #include <kms/drm_gem.h>
@@ -176,8 +177,24 @@ kms_framebuffer_create(struct drm_file *file,
 		}
 	}
 
-	error = kms_framebuffer_init(file->dev, fb,
-	    &drm_framebuffer_default_funcs);
+	/*
+	 * Pick the driver's per-fb funcs override if the driver supplied
+	 * one at kms_dev_register time, otherwise fall back to the
+	 * framework default that just free()s the fb allocation.  The
+	 * driver's .destroy fires from kms_framebuffer_free_obj on the
+	 * last mode_object put, AFTER every GEM ref is dropped -- drivers
+	 * that stash per-fb state (virtio_kms host resource, tegra host
+	 * bo, etc.) use this to release it exactly when the fb is torn
+	 * down, no map or manual bookkeeping required.
+	 */
+	{
+		const struct drm_framebuffer_funcs *funcs =
+		    &drm_framebuffer_default_funcs;
+		if (file->dev->driver != NULL &&
+		    file->dev->driver->framebuffer_funcs != NULL)
+			funcs = file->dev->driver->framebuffer_funcs;
+		error = kms_framebuffer_init(file->dev, fb, funcs);
+	}
 	if (error != 0)
 		goto fail;
 

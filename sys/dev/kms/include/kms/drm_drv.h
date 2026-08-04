@@ -12,6 +12,7 @@
 #include <kms/drm_device.h>
 
 struct drm_file;
+struct drm_framebuffer_funcs;
 
 /*
  * Driver descriptor.  Filled in by the hardware driver and passed to
@@ -47,6 +48,25 @@ struct drm_driver {
 	 * May be NULL if the driver has no per-file state.
 	 */
 	void		(*file_free)(struct drm_file *file);
+
+	/*
+	 * Optional per-driver framebuffer_funcs override.  When non-NULL,
+	 * kms_framebuffer_create hands this pointer to kms_framebuffer_init
+	 * instead of the framework's default.  The driver's `.destroy`
+	 * fires on the last drop of the drm_mode_object refcount, AFTER
+	 * the framework has released every GEM ref held by the fb --
+	 * drivers use this to detach their own per-fb state (e.g.
+	 * virtio_kms releases the host-side virtio_gpu resource that was
+	 * created in atomic_bind_fb).
+	 *
+	 * Contract: the driver's `.destroy` MUST call `free(fb, M_KMS)`
+	 * after doing its own cleanup -- the framework does not free the
+	 * fb allocation itself.  Match the shape of
+	 * drm_framebuffer_default_funcs.destroy in drm_framebuffer.c.
+	 *
+	 * NULL for drivers that don't need to track per-fb state.
+	 */
+	const struct drm_framebuffer_funcs *framebuffer_funcs;
 };
 
 /*

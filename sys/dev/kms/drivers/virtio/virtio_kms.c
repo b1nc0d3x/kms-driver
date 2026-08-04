@@ -28,6 +28,7 @@
 #include <sys/kernel.h>
 #include <sys/malloc.h>
 #include <sys/module.h>
+#include <sys/queue.h>
 #include <sys/sglist.h>
 #include <sys/sx.h>
 #include <sys/sysctl.h>
@@ -102,6 +103,7 @@ struct virtio_kms_scanout {
 #define	VIRTIO_KMS_DRIVER_DATE	"20260804"
 
 MALLOC_DEFINE(M_VIRTIO_KMS, "virtio_kms", "VirtIO KMS driver");
+MALLOC_DECLARE(M_KMS);	/* framework allocator, used by fb_destroy */
 
 /*
  * Per-instance state.  Attach fills the softc, kms_dev_register hands
@@ -138,6 +140,17 @@ struct virtio_kms_softc {
 	uint32_t		 active_resource_id;
 	uint32_t		 active_width;
 	uint32_t		 active_height;
+
+	/*
+	 * Framebuffer -> host resource_id map (Review #10/#11).  Every
+	 * fb that atomic_bind_fb ever calls CREATE_2D + ATTACH_BACKING
+	 * for gets an entry in fb_map; virtio_kms_fb_destroy walks the
+	 * list on last-put to release the matching host resource.  A
+	 * small linked list is fine -- production compositors keep 2-3
+	 * fbs (front, back, cursor).  The entry struct is at file scope
+	 * below.
+	 */
+	LIST_HEAD(virtio_kms_fb_map, virtio_kms_fb_entry) fb_map;
 
 	/*
 	 * Mode-config topology (Phase F multi-scanout).  Arrays sized at
@@ -180,12 +193,26 @@ static void	virtio_kms_topology_teardown(struct virtio_kms_softc *sc);
 static void	virtio_kms_release_active(struct virtio_kms_softc *sc);
 static void	virtio_kms_hotplug_task(void *arg, int pending);
 static int	virtio_kms_sysctl_hotplug_probe(SYSCTL_HANDLER_ARGS);
+static inline struct virtio_kms_softc *virtio_kms_dev_to_sc(
+    struct drm_device *drm_dev);
 static const struct drm_mode_config_funcs virtio_kms_mode_config_funcs;
+
+/*
+ * Framebuffer -> host resource_id tracking entry.  See fb_map above.
+ * File-scope so LIST_HEAD in the softc has a complete tag to point at.
+ */
+struct virtio_kms_fb_entry {
+	LIST_ENTRY(virtio_kms_fb_entry)	 link;
+	const struct drm_framebuffer	*fb;
+	uint32_t			 resource_id;
+};
 
 /*
  * Driver descriptor.  driver_features=0 for now; ATOMIC / RENDER caps
  * flip on once the topology and command queue are wired.
  */
+static const struct drm_framebuffer_funcs virtio_kms_framebuffer_funcs;
+
 static const struct drm_driver virtio_kms_driver = {
 	.name		= VIRTIO_KMS_DRIVER_NAME,
 	.desc		= VIRTIO_KMS_DRIVER_DESC,
@@ -194,6 +221,7 @@ static const struct drm_driver virtio_kms_driver = {
 	.minor		= 1,
 	.patchlevel	= 0,
 	.driver_features = 0,
+	.framebuffer_funcs = &virtio_kms_framebuffer_funcs,
 };
 
 static struct virtio_feature_desc virtio_kms_feature_desc[] = {
@@ -397,6 +425,7 @@ virtio_kms_attach(device_t dev)
 	sc->next_fence = 1;
 	sx_init(&sc->sx, "virtio_kms");
 	sx_init(&sc->ctrl_sx, "virtio_kms ctrl");
+	LIST_INIT(&sc->fb_map);
 	TASK_INIT(&sc->hotplug_task, 0, virtio_kms_hotplug_task, sc);
 
 	virtio_set_feature_desc(dev, virtio_kms_feature_desc);
@@ -496,10 +525,22 @@ virtio_kms_detach(device_t dev)
 
 	taskqueue_drain(taskqueue_thread, &sc->hotplug_task);
 	if (sc->drm_dev != NULL) {
+		struct virtio_kms_fb_entry *e, *tmp;
+
 		virtio_kms_release_active(sc);
 		virtio_kms_topology_teardown(sc);
 		kms_dev_unregister(sc->drm_dev);
 		sc->drm_dev = NULL;
+		/*
+		 * Any fbs still tracked at detach have their host resources
+		 * already gone (fb_destroy runs from framework tear-down
+		 * during kms_dev_unregister with sc->detaching set, so it
+		 * skips the protocol calls).  Just free the tracker slots.
+		 */
+		LIST_FOREACH_SAFE(e, &sc->fb_map, link, tmp) {
+			LIST_REMOVE(e, link);
+			free(e, M_VIRTIO_KMS);
+		}
 	}
 	sx_destroy(&sc->ctrl_sx);
 	sx_destroy(&sc->sx);
@@ -745,6 +786,79 @@ virtio_kms_resource_flush(struct virtio_kms_softc *sc, uint32_t resource_id,
 }
 
 /*
+ * Register an fb -> resource_id mapping so virtio_kms_fb_destroy can
+ * later release the host resource.  Caller holds sc->sx.  Idempotent
+ * for the same (fb, rid) pair; a duplicate insert would signal a
+ * driver bug (fb bound twice with different rids).
+ */
+static void
+virtio_kms_fb_track(struct virtio_kms_softc *sc,
+    const struct drm_framebuffer *fb, uint32_t resource_id)
+{
+	struct virtio_kms_fb_entry *e;
+
+	sx_assert(&sc->sx, SA_XLOCKED);
+	LIST_FOREACH(e, &sc->fb_map, link) {
+		if (e->fb == fb) {
+			KASSERT(e->resource_id == resource_id,
+			    ("virtio_kms: fb %p tracked with rid %u, now %u",
+			    fb, e->resource_id, resource_id));
+			return;
+		}
+	}
+	e = malloc(sizeof(*e), M_VIRTIO_KMS, M_WAITOK | M_ZERO);
+	e->fb = fb;
+	e->resource_id = resource_id;
+	LIST_INSERT_HEAD(&sc->fb_map, e, link);
+}
+
+/*
+ * Framebuffer .destroy hook (Review #10/#11).  Fires from
+ * kms_framebuffer_free_obj on the last drop of the fb's mode_object
+ * refcount, AFTER every GEM ref is released.  We pull the fb's slot
+ * out of sc->fb_map, and -- if that resource_id was still on a
+ * scanout -- send SET_SCANOUT(0), DETACH_BACKING, RESOURCE_UNREF so
+ * the host doesn't scan freed guest memory.  If the fb wasn't the
+ * currently-active one but still had a host resource (created by a
+ * bind that was later swapped away), we still send DETACH + UNREF.
+ *
+ * Contract from drm_drv.h: must free(fb, M_KMS) before returning.
+ */
+static void
+virtio_kms_fb_destroy(struct drm_framebuffer *fb)
+{
+	struct virtio_kms_softc *sc = virtio_kms_dev_to_sc(fb->dev);
+	struct virtio_kms_fb_entry *e, *tmp;
+	uint32_t rid = 0;
+
+	sx_xlock(&sc->sx);
+	LIST_FOREACH_SAFE(e, &sc->fb_map, link, tmp) {
+		if (e->fb == fb) {
+			rid = e->resource_id;
+			LIST_REMOVE(e, link);
+			free(e, M_VIRTIO_KMS);
+			break;
+		}
+	}
+	if (rid != 0 && !sc->detaching) {
+		if (sc->active_resource_id == rid) {
+			/* release_active handles the SET_SCANOUT->0 dance. */
+			virtio_kms_release_active(sc);
+		} else {
+			(void)virtio_kms_detach_backing(sc, rid);
+			(void)virtio_kms_resource_unref(sc, rid);
+		}
+	}
+	sx_xunlock(&sc->sx);
+
+	free(fb, M_KMS);
+}
+
+static const struct drm_framebuffer_funcs virtio_kms_framebuffer_funcs = {
+	.destroy = virtio_kms_fb_destroy,
+};
+
+/*
  * Detach + unref the currently-attached host resource, if any.
  * Called from atomic_commit before wiring a fresh framebuffer, from
  * atomic_commit when a CRTC is being blanked, and from detach.
@@ -838,6 +952,15 @@ virtio_kms_atomic_bind_fb(struct virtio_kms_softc *sc,
 	sc->active_resource_id = rid;
 	sc->active_width = w;
 	sc->active_height = h;
+
+	/*
+	 * Register the fb -> rid mapping so virtio_kms_fb_destroy can
+	 * release the host resource when the fb dies -- even if the fb
+	 * is swapped away from being active first and RMFB'd later.
+	 * Review #10/#11.
+	 */
+	virtio_kms_fb_track(sc, fb, rid);
+
 	VKMS_DPRINTF(sc, "bound resource %u (%ux%u) to scanout %u\n",
 	    rid, w, h, scanout_id);
 	return (0);
