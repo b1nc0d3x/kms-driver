@@ -40,8 +40,19 @@
 #include <dev/virtio/virtqueue.h>
 #include <dev/virtio/gpu/virtio_gpu.h>
 
+#include <kms/drm_atomic.h>
+#include <kms/drm_connector.h>
+#include <kms/drm_crtc.h>
 #include <kms/drm_device.h>
 #include <kms/drm_drv.h>
+#include <kms/drm_encoder.h>
+#include <kms/drm_framebuffer.h>
+#include <kms/drm_mode_config.h>
+#include <kms/drm_modes.h>
+#include <kms/drm_plane.h>
+
+#include <drm/drm_fourcc.h>
+#include <drm/drm_mode.h>
 
 #include "virtio_if.h"
 
@@ -100,6 +111,16 @@ struct virtio_kms_softc {
 	uint32_t		 num_scanouts;	/* clamped to MAX */
 	struct virtio_kms_scanout scanouts[VIRTIO_KMS_MAX_SCANOUTS];
 
+	/*
+	 * Mode-config topology (Phase C).  Single-scanout for now;
+	 * multi-scanout is Phase F.  Objects embed directly in the softc
+	 * so their lifetime is trivially bounded by attach/detach.
+	 */
+	struct drm_crtc		 crtc;
+	struct drm_plane	 primary;
+	struct drm_encoder	 encoder;
+	struct drm_connector	 connector;
+
 	int			 debug;		/* dev.virtio_kms.N.debug */
 };
 
@@ -107,6 +128,11 @@ struct virtio_kms_softc {
 	if ((sc)->debug > 0)						\
 		device_printf((sc)->dev, __VA_ARGS__);			\
 } while (0)
+
+/* Forward decls for the mode-config layer used by attach. */
+static int	virtio_kms_topology_init(struct virtio_kms_softc *sc);
+static void	virtio_kms_topology_teardown(struct virtio_kms_softc *sc);
+static const struct drm_mode_config_funcs virtio_kms_mode_config_funcs;
 
 /*
  * Driver descriptor.  driver_features=0 for now; ATOMIC / RENDER caps
@@ -338,6 +364,22 @@ virtio_kms_attach(device_t dev)
 		goto fail_locks;
 	}
 
+	/*
+	 * Install the atomic hooks BEFORE topology_init so any
+	 * userspace-visible ATOMIC ioctl that races the attach path
+	 * takes the real check + commit dispatch rather than the
+	 * framework's legacy property-table fallback.
+	 */
+	sc->drm_dev->mode_config.funcs = &virtio_kms_mode_config_funcs;
+
+	error = virtio_kms_topology_init(sc);
+	if (error != 0) {
+		device_printf(dev, "topology_init failed: %d\n", error);
+		kms_dev_unregister(sc->drm_dev);
+		sc->drm_dev = NULL;
+		goto fail_locks;
+	}
+
 	SYSCTL_ADD_INT(device_get_sysctl_ctx(dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 	    "debug", CTLFLAG_RW, &sc->debug, 0,
@@ -365,6 +407,7 @@ virtio_kms_detach(device_t dev)
 	struct virtio_kms_softc *sc = device_get_softc(dev);
 
 	if (sc->drm_dev != NULL) {
+		virtio_kms_topology_teardown(sc);
 		kms_dev_unregister(sc->drm_dev);
 		sc->drm_dev = NULL;
 	}
@@ -372,6 +415,230 @@ virtio_kms_detach(device_t dev)
 	sx_destroy(&sc->ctrl_sx);
 	sx_destroy(&sc->sx);
 	return (0);
+}
+
+/*
+ * ============================================================
+ * Phase C: mode-config topology
+ * ============================================================
+ *
+ * Single scanout so far: one CRTC + one primary plane + one
+ * writeback-flavour virtual encoder + one virtual connector.  The
+ * connector's `get_modes` hook consumes the cached sc->scanouts[0]
+ * entry populated by Phase B's fetch_display_info, so userspace
+ * (Xorg / Wayland / kmscube probe) sees whatever geometry the host
+ * currently advertises.
+ *
+ * Phase F extends to N scanouts, at which point CRTC/plane/encoder/
+ * connector each grow into per-scanout arrays.  Phase D wires the
+ * atomic_commit body to actually push a SET_SCANOUT down ctrl_vq;
+ * this commit only sets the funcs table so the property-driven ATOMIC
+ * path can drive the framework's own state machine.
+ */
+
+/*
+ * Look up the softc from any of the four topology objects by walking
+ * back through drm_dev->driver_priv.  Cheaper than embedding a back
+ * pointer in each object.
+ */
+static inline struct virtio_kms_softc *
+virtio_kms_dev_to_sc(struct drm_device *drm_dev)
+{
+	return ((struct virtio_kms_softc *)drm_dev->driver_priv);
+}
+
+/*
+ * Connector .get_modes: publish one CVT-derived preferred mode per
+ * enabled scanout entry.  Phase C exposes only scanouts[0]; Phase F
+ * multiplexes onto N connectors so each one gets its own scanout row.
+ * Returns the count of modes added.
+ */
+static int
+virtio_kms_get_modes(struct drm_connector *connector)
+{
+	struct virtio_kms_softc *sc = virtio_kms_dev_to_sc(connector->dev);
+	struct drm_display_mode *mode;
+	const struct virtio_kms_scanout *s = &sc->scanouts[0];
+	uint32_t hdisplay, vdisplay;
+	int added = 0;
+
+	if (sc->num_scanouts == 0 || s->enabled == 0) {
+		/*
+		 * Fallback until we have live topology (e.g. attach ran but
+		 * fetch_display_info bounced): advertise 1024x768 so
+		 * userspace still gets something to bind against.  Phase F
+		 * removes this fallback once hotplug re-runs display_info.
+		 */
+		hdisplay = 1024;
+		vdisplay = 768;
+	} else {
+		hdisplay = s->width;
+		vdisplay = s->height;
+	}
+
+	mode = kms_mode_create();
+	if (mode == NULL)
+		return (0);
+	mode->hdisplay = hdisplay;
+	mode->vdisplay = vdisplay;
+	mode->hsync_start = hdisplay + 88;
+	mode->hsync_end   = hdisplay + 88 + 44;
+	mode->htotal      = hdisplay + 88 + 44 + 148;
+	mode->vsync_start = vdisplay + 4;
+	mode->vsync_end   = vdisplay + 4 + 5;
+	mode->vtotal      = vdisplay + 4 + 5 + 36;
+	mode->clock       = mode->htotal * mode->vtotal * 60 / 1000;
+	mode->type        = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED;
+	mode->vrefresh    = 60;
+	kms_mode_set_name(mode);
+	kms_connector_add_mode(connector, mode);
+	added++;
+
+	VKMS_DPRINTF(sc, "get_modes: published %ux%u (added=%d)\n",
+	    hdisplay, vdisplay, added);
+	return (added);
+}
+
+/*
+ * CRTC set_config: legacy modeset ioctl entry.  Phase C stubs it out
+ * so the framework's legacy-property fallback doesn't hit a NULL and
+ * userspace's SETCRTC returns success even before the real modeset
+ * lands.  Phase D fills in the SET_SCANOUT + RESOURCE_FLUSH sequence
+ * against the framebuffer the caller passed.
+ */
+static int
+virtio_kms_set_config(struct drm_mode_set *set)
+{
+	if (set == NULL || set->crtc == NULL)
+		return (EINVAL);
+	return (0);
+}
+
+static const struct drm_crtc_funcs virtio_kms_crtc_funcs = {
+	.set_config = virtio_kms_set_config,
+};
+static const struct drm_plane_funcs virtio_kms_plane_funcs = { 0 };
+static const struct drm_encoder_funcs virtio_kms_encoder_funcs = { 0 };
+static const struct drm_connector_funcs virtio_kms_connector_funcs = {
+	.get_modes = virtio_kms_get_modes,
+};
+
+/*
+ * Atomic check: sanity-only in Phase C.  The framework hands us a
+ * fully-populated drm_atomic_state and we walk it for obvious
+ * garbage.  Phase D adds framebuffer-side validation.
+ */
+static int
+virtio_kms_atomic_check(struct drm_device *dev __unused,
+    struct drm_atomic_state *state)
+{
+	uint32_t i;
+
+	if (state == NULL)
+		return (EINVAL);
+	for (i = 0; i < state->num_crtc; i++) {
+		const struct drm_crtc_state *cs = state->crtc_states[i];
+
+		if (cs == NULL || !cs->mode_changed || !cs->active)
+			continue;
+		if (cs->mode.hdisplay == 0 || cs->mode.vdisplay == 0 ||
+		    cs->mode.clock == 0)
+			return (EINVAL);
+	}
+	return (0);
+}
+
+/*
+ * Atomic commit: Phase C is a no-op wrapper that just returns success.
+ * Phase D walks the CRTC states and issues VIRTIO_GPU_CMD_SET_SCANOUT
+ * + RESOURCE_FLUSH for each mode_changed / active_changed CRTC,
+ * using the framebuffer routed to that CRTC's primary plane.
+ */
+static int
+virtio_kms_atomic_commit(struct drm_device *dev __unused,
+    struct drm_atomic_state *state __unused, bool nonblock __unused)
+{
+	return (0);
+}
+
+static const struct drm_mode_config_funcs virtio_kms_mode_config_funcs = {
+	.atomic_check  = virtio_kms_atomic_check,
+	.atomic_commit = virtio_kms_atomic_commit,
+};
+
+/*
+ * Primary-plane format list.  virtio-gpu's 2D command surface
+ * accepts BGRA / XRGB variants; XRGB8888 is the universal fit
+ * for Xorg-modesetting + Wayland weston.  Phase F extends this
+ * once the driver knows the negotiated feature set (e.g. VirGL
+ * enables 3D formats).
+ */
+static const uint32_t virtio_kms_primary_formats[] = {
+	DRM_FORMAT_XRGB8888,
+	DRM_FORMAT_ARGB8888,
+};
+
+static int
+virtio_kms_topology_init(struct virtio_kms_softc *sc)
+{
+	struct drm_mode_config *mc = &sc->drm_dev->mode_config;
+	uint32_t crtc_mask;
+	int error;
+
+	/*
+	 * Cap the mode-config canvas at 4Kx4K.  virtio-gpu can advertise
+	 * larger surfaces if the host is willing, but 4K is a sane
+	 * default that matches rk_kms and every commodity display userspace
+	 * currently tries.
+	 */
+	mc->max_width  = 4096;
+	mc->max_height = 4096;
+
+	error = kms_crtc_init(sc->drm_dev, &sc->crtc,
+	    &virtio_kms_crtc_funcs);
+	if (error != 0)
+		return (error);
+	crtc_mask = 1u << sc->crtc.index;
+
+	error = kms_plane_init(sc->drm_dev, &sc->primary,
+	    &virtio_kms_plane_funcs, DRM_PLANE_TYPE_PRIMARY, crtc_mask,
+	    virtio_kms_primary_formats,
+	    nitems(virtio_kms_primary_formats));
+	if (error != 0)
+		goto fail_crtc;
+	sc->crtc.primary_plane = &sc->primary;
+
+	error = kms_encoder_init(sc->drm_dev, &sc->encoder,
+	    &virtio_kms_encoder_funcs, DRM_MODE_ENCODER_VIRTUAL);
+	if (error != 0)
+		goto fail_plane;
+	sc->encoder.possible_crtcs = crtc_mask;
+
+	error = kms_connector_init(sc->drm_dev, &sc->connector,
+	    &virtio_kms_connector_funcs, DRM_MODE_CONNECTOR_VIRTUAL);
+	if (error != 0)
+		goto fail_encoder;
+	sc->connector.status = connector_status_connected;
+	kms_connector_attach_encoder(&sc->connector, &sc->encoder);
+
+	return (0);
+
+fail_encoder:
+	kms_encoder_cleanup(&sc->encoder);
+fail_plane:
+	kms_plane_cleanup(&sc->primary);
+fail_crtc:
+	kms_crtc_cleanup(&sc->crtc);
+	return (error);
+}
+
+static void
+virtio_kms_topology_teardown(struct virtio_kms_softc *sc)
+{
+	kms_connector_cleanup(&sc->connector);
+	kms_encoder_cleanup(&sc->encoder);
+	kms_plane_cleanup(&sc->primary);
+	kms_crtc_cleanup(&sc->crtc);
 }
 
 static device_method_t virtio_kms_methods[] = {
