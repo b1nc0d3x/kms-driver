@@ -85,8 +85,15 @@ struct virtio_kms_scanout {
 	uint32_t	y;
 	uint32_t	flags;		/* pmode.flags from resp */
 
-	/* EDID cache, populated lazily.  Length 0 means "not fetched". */
+	/*
+	 * EDID cache, populated lazily.  `edid_tried` is a one-shot
+	 * gate so a get_modes storm on a host that either refuses
+	 * GET_EDID or hands us zero-length blobs doesn't hammer the
+	 * ctrl queue on every GETCONNECTOR ioctl.  Cleared by hotplug
+	 * so a re-plugged monitor gets re-probed.  Review #22.
+	 */
 	uint32_t	edid_len;
+	bool		edid_tried;
 	uint8_t		edid[1024];
 };
 
@@ -147,6 +154,14 @@ struct virtio_kms_softc {
 	struct drm_plane	 primary[VIRTIO_KMS_MAX_SCANOUTS];
 	struct drm_encoder	 encoder[VIRTIO_KMS_MAX_SCANOUTS];
 	struct drm_connector	 connector[VIRTIO_KMS_MAX_SCANOUTS];
+	/*
+	 * Highest connector-topology index actually initialised.
+	 * Grown by hotplug when the host adds a scanout; never shrinks
+	 * (kms_connector_cleanup on an already-published connector is
+	 * a footgun for concurrent GETCONNECTOR ioctls, so we just mark
+	 * the slot disconnected instead).  Review #13.
+	 */
+	uint32_t		 topology_n;
 
 	/* Task for taskqueue-deferred hotplug event handling. */
 	struct task		 hotplug_task;
@@ -940,14 +955,15 @@ virtio_kms_get_modes(struct drm_connector *connector)
 	uint32_t hdisplay, vdisplay;
 
 	/*
-	 * Best-effort EDID fetch (Phase F).  On success we still publish
-	 * the display_info geometry; a proper EDID mode parser is a
-	 * future task -- for now the EDID is cached and available via
-	 * dev.virtio_kms.N.edid_len for userspace to fetch through
-	 * connector.edid_blob later.
+	 * Best-effort EDID fetch (Phase F).  edid_tried is a one-shot
+	 * gate so subsequent get_modes calls don't hit the wire again
+	 * on a host that refuses GET_EDID.  Hotplug clears it.
+	 * Review #22.
 	 */
-	if (s->edid_len == 0)
+	if (!s->edid_tried) {
+		s->edid_tried = true;
 		(void)virtio_kms_fetch_edid(sc, idx);
+	}
 
 	if (sc->num_scanouts == 0 || s->enabled == 0) {
 		hdisplay = 1024;
@@ -1189,7 +1205,15 @@ virtio_kms_topology_init(struct virtio_kms_softc *sc)
 	if (n > VIRTIO_KMS_MAX_SCANOUTS)
 		n = VIRTIO_KMS_MAX_SCANOUTS;
 
-	for (i = 0; i < n; i++) {
+	/*
+	 * Grow-only.  Called from attach with topology_n == 0 to publish
+	 * the initial pipes, and again from hotplug_task with an already
+	 * non-zero topology_n when the host adds a scanout.  Slots
+	 * [topology_n, n) get published; slots [0, topology_n) are
+	 * assumed already initialised and get their connector.status
+	 * refreshed elsewhere (hotplug_task loop).  Review #13.
+	 */
+	for (i = sc->topology_n; i < n; i++) {
 		uint32_t crtc_mask;
 
 		error = kms_crtc_init(sc->drm_dev, &sc->crtc[i],
@@ -1224,16 +1248,17 @@ virtio_kms_topology_init(struct virtio_kms_softc *sc)
 		kms_connector_attach_encoder(&sc->connector[i],
 		    &sc->encoder[i]);
 	}
+	sc->topology_n = n;
 	return (0);
 
 fail:
 	/*
 	 * Best-effort cleanup: run cleanup on every slot up to and
-	 * including the one that failed.  The kms API is documented
-	 * as tolerant of double-cleanup on zero'd memory, which
-	 * matches how rk_kms handles the same failure path.
+	 * including the one that failed IN THIS GROW-STEP; already-
+	 * published slots (i < topology_n at entry) stay live so
+	 * concurrent GETCONNECTOR ioctls don't crash.
 	 */
-	for (; i > 0; i--) {
+	for (; i > sc->topology_n; i--) {
 		kms_connector_cleanup(&sc->connector[i - 1]);
 		kms_encoder_cleanup(&sc->encoder[i - 1]);
 		kms_plane_cleanup(&sc->primary[i - 1]);
@@ -1245,20 +1270,15 @@ fail:
 static void
 virtio_kms_topology_teardown(struct virtio_kms_softc *sc)
 {
-	uint32_t n, i;
+	uint32_t i;
 
-	n = sc->num_scanouts;
-	if (n == 0)
-		n = 1;
-	if (n > VIRTIO_KMS_MAX_SCANOUTS)
-		n = VIRTIO_KMS_MAX_SCANOUTS;
-
-	for (i = n; i > 0; i--) {
+	for (i = sc->topology_n; i > 0; i--) {
 		kms_connector_cleanup(&sc->connector[i - 1]);
 		kms_encoder_cleanup(&sc->encoder[i - 1]);
 		kms_plane_cleanup(&sc->primary[i - 1]);
 		kms_crtc_cleanup(&sc->crtc[i - 1]);
 	}
+	sc->topology_n = 0;
 }
 
 /*
@@ -1310,16 +1330,23 @@ virtio_kms_hotplug_task(void *arg, int pending __unused)
 	 * mode_config.mutex first then sc->sx -- reversing that order
 	 * here would AB/BA deadlock a compositor commit against a
 	 * hotplug event.  Review #5.
+	 *
+	 * If num_scanouts grew past our current topology_n we
+	 * republish the additional pipes here so the hotplug loop's
+	 * connector[] walk stays within initialised territory.
+	 * Review #13.
 	 */
 	sx_xlock(&sc->sx);
 	(void)virtio_kms_fetch_display_info(sc);
 	n = sc->num_scanouts;
-	if (n == 0)
-		n = 1;
 	if (n > VIRTIO_KMS_MAX_SCANOUTS)
 		n = VIRTIO_KMS_MAX_SCANOUTS;
-	for (i = 0; i < n; i++)
+	if (n > sc->topology_n)
+		(void)virtio_kms_topology_init(sc);	/* grows to n */
+	for (i = 0; i < n; i++) {
 		sc->scanouts[i].edid_len = 0;
+		sc->scanouts[i].edid_tried = false;
+	}
 	sx_xunlock(&sc->sx);
 
 	/*
@@ -1328,7 +1355,7 @@ virtio_kms_hotplug_task(void *arg, int pending __unused)
 	 * entries with NULL ->dev and NULL mode-list heads, tripping a
 	 * NULL deref inside kms_connector_modes_clear.  Review #12.
 	 */
-	for (i = 0; i < n; i++) {
+	for (i = 0; i < sc->topology_n; i++) {
 		enum drm_connector_status status =
 		    (i < sc->num_scanouts && sc->scanouts[i].enabled != 0)
 		    ? connector_status_connected
