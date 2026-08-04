@@ -932,11 +932,33 @@ static void
 igen_read_pipe_mode(struct igen_softc *sc, int pipe,
     struct drm_display_mode *m)
 {
-	uint32_t htotal = igen_r32(sc, TRANS_HTOTAL(pipe));
-	uint32_t hsync  = igen_r32(sc, TRANS_HSYNC(pipe));
-	uint32_t vtotal = igen_r32(sc, TRANS_VTOTAL(pipe));
-	uint32_t vsync  = igen_r32(sc, TRANS_VSYNC(pipe));
-	uint32_t fctl   = igen_r32(sc, TRANS_DDI_FUNC_CTL(pipe));
+	uint32_t htotal, hsync, vtotal, vsync, fctl;
+
+	/*
+	 * On Apple HSW/BDW eDP handoff (subvendor 0x106b), TRANS_EDP is the
+	 * effective transcoder and PIPE_A's own timing registers stay at 0.
+	 * Read from TRANS_EDP's timing bank at 0x6f000 for pipe A queries so
+	 * atomic_commit's size-match check compares against the live panel
+	 * timing rather than the empty pipe A generator.  See
+	 * project_igen_apple_edp_handoff_2026_08_04.md for the ground-truth
+	 * Linux i915 register comparison.
+	 */
+	if (pipe == 0 && sc->gen == IGEN_GEN_HSW &&
+	    (sc->quirks & IGEN_QUIRK_APPLE_EDP_HANDOFF) != 0 &&
+	    (igen_r32(sc, 0x0007F008u) & (1u << 30)) != 0) {
+		/* TRANS_EDP is live -- read its timing bank at 0x6F000. */
+		htotal = igen_r32(sc, 0x0006F000u);
+		hsync  = igen_r32(sc, 0x0006F008u);
+		vtotal = igen_r32(sc, 0x0006F00cu);
+		vsync  = igen_r32(sc, 0x0006F014u);
+		fctl   = igen_r32(sc, 0x0006F400u);
+	} else {
+		htotal = igen_r32(sc, TRANS_HTOTAL(pipe));
+		hsync  = igen_r32(sc, TRANS_HSYNC(pipe));
+		vtotal = igen_r32(sc, TRANS_VTOTAL(pipe));
+		vsync  = igen_r32(sc, TRANS_VSYNC(pipe));
+		fctl   = igen_r32(sc, TRANS_DDI_FUNC_CTL(pipe));
+	}
 
 	memset(m, 0, sizeof(*m));
 	m->hdisplay    = (htotal & 0x1fff) + 1;
@@ -2340,10 +2362,25 @@ igen_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 			uint32_t pconf_live = igen_r32(sc, PIPE_CONF(0));
 			uint32_t ddi_b_live = igen_r32(sc, DDI_BUF_CTL_REG(1));
 			igen_read_pipe_mode(sc, 0, &probe);
-			bool needs_bringup = (probe.hdisplay < 32 ||
-			    probe.vdisplay < 32 ||
-			    (pconf_live & PIPE_CONF_STATE) == 0 ||
-			    (ddi_b_live & DDI_BUF_CTL_EN) == 0);
+			bool needs_bringup;
+			if ((sc->quirks & IGEN_QUIRK_APPLE_EDP_HANDOFF) != 0) {
+				/*
+				 * Apple HSW/BDW eDP handoff: PIPE_CONF stays 0
+				 * by design and DDI_A (not B) drives the panel.
+				 * The read_pipe_mode reads from TRANS_EDP so
+				 * probe.h/vdisplay reflect the live panel.  We
+				 * still "bring up" the plane once (DSPCNTR fix,
+				 * TRICKLE_FEED_DISABLE) but skip the DDI_B check
+				 * that doesn't apply here.
+				 */
+				needs_bringup = (probe.hdisplay < 32 ||
+				    probe.vdisplay < 32);
+			} else {
+				needs_bringup = (probe.hdisplay < 32 ||
+				    probe.vdisplay < 32 ||
+				    (pconf_live & PIPE_CONF_STATE) == 0 ||
+				    (ddi_b_live & DDI_BUF_CTL_EN) == 0);
+			}
 			if (needs_bringup)
 				device_printf(sc->dev,
 				    "atomic_commit: bring-up trigger"
@@ -2353,9 +2390,20 @@ igen_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 				    pconf_live, ddi_b_live);
 			if (needs_bringup) {
 				int perr;
-				if (sc->gen == IGEN_GEN_HSW)
+				if (sc->gen == IGEN_GEN_HSW) {
+					if ((sc->quirks &
+					    IGEN_QUIRK_APPLE_EDP_HANDOFF)
+					    == 0) {
+						device_printf(sc->dev,
+						    "atomic_commit: HSW cold"
+						    " modeset not implemented"
+						    " (no Apple handoff"
+						    " quirk); refusing\n");
+						error = ENOTSUP;
+						goto out;
+					}
 					perr = igen_hsw_panel_on(sc);
-				else if (sc->gen9_full_bringup != 0)
+				} else if (sc->gen9_full_bringup != 0)
 					perr = igen_gen9_full_bringup(sc,
 					    &cs->mode);
 				else
@@ -2578,12 +2626,29 @@ igen_attach(device_t dev)
 
 	sc->dev = dev;
 	sc->pci_id = pci_get_device(dev);
+	sc->pci_subvendor = pci_get_subvendor(dev);
+	sc->pci_subdevice = pci_get_subdevice(dev);
 	for (size_t i = 0; i < nitems(igen_ids); i++) {
 		if (igen_ids[i].id == sc->pci_id) {
 			sc->gen = igen_ids[i].gen;
 			break;
 		}
 	}
+
+	/*
+	 * Quirk detection: PCI subvendor 0x106b is Apple.  On the 2013-2015
+	 * Retina MacBook Pro (Iris Pro 5200 / device 0x0d26), EFI firmware
+	 * hands off with the transcoder + DDI + DP link fully programmed but
+	 * PIPE_A and its timing generator quiescent.  Only the Apple variant
+	 * of hsw_panel_on knows how to complete that handoff; non-Apple HSW
+	 * needs a full cold modeset (not yet implemented).  Gate strictly on
+	 * subvendor to keep non-Apple boards on the standard path.
+	 */
+	if (sc->pci_subvendor == 0x106b && sc->gen == IGEN_GEN_HSW)
+		sc->quirks |= IGEN_QUIRK_APPLE_EDP_HANDOFF;
+	if (sc->quirks != 0)
+		device_printf(dev, "quirks=0x%08x (subvendor 0x%04x)\n",
+		    sc->quirks, sc->pci_subvendor);
 
 	/*
 	 * BAR0 (PCIR_BAR(0) = 0x10) is GTTMMADR — register MMIO + the

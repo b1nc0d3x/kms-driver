@@ -90,10 +90,25 @@ struct igen_owned_fb {
 	struct igen_test_fb	*test_fb;
 };
 
+/*
+ * Platform quirks.  Populated at attach from PCI ids (subvendor 0x106b =
+ * Apple).  Keep these small + explicit so non-Apple Intel builds don't
+ * accidentally trip Apple-specific handoff shortcuts.
+ */
+#define	IGEN_QUIRK_APPLE_EDP_HANDOFF	0x00000001u
+	/* Apple EFI firmware leaves DDI+DP_TP+TRANS_EDP+link-train fully up
+	 * with PIPE_A and its timing generator OFF.  hsw_panel_on's Apple
+	 * variant reads TRANS_EDP_HTOTAL/VTOTAL, mirrors them to PIPE_A_HTOTAL/
+	 * VTOTAL (and HBLANK/HSYNC/VBLANK/VSYNC), then enables pipe A.  Does
+	 * NOT touch DDI/DP_TP/TRANS_EDP -- firmware owns them. */
+
 struct igen_softc {
 	device_t		 dev;
 	struct drm_device	*drm_dev;
 	uint16_t		 pci_id;
+	uint16_t		 pci_subvendor;
+	uint16_t		 pci_subdevice;
+	uint32_t		 quirks;	/* IGEN_QUIRK_* */
 
 	/*
 	 * Silicon generation, as the integer "gen number" with one

@@ -444,7 +444,6 @@ igen_hsw_panel_on(struct igen_softc *sc)
 	uint32_t m, n;
 	uint32_t link_khz = 270000;	/* HBR; firmware-left link rate */
 	uint32_t lanes = 4;		/* HBR×4; firmware-left */
-	int i;
 	size_t need_bytes;
 
 	if (sc->cached_edid_len < 128) {
@@ -511,32 +510,44 @@ igen_hsw_panel_on(struct igen_softc *sc)
 	igen_w32(sc, HSW_DSPTILEOFF(0), 0);
 	uint32_t dspcntr = igen_r32(sc, HSW_DSPCNTR(0));
 	/*
-	 * Clear format AND tiling bits — firmware-left state on macbsd
-	 * has TILED=1 (X-tile), set for the EFI framebuffer.  Our
-	 * scanout_fb is linear; leaving TILED on makes the pipe decode
-	 * our buffer as X-tiles, producing the classic 64-px vertical
-	 * black/white columns of mistinterpreted linear pixels.
+	 * DSPCNTR shape derived from a live-fire Linux i915 register
+	 * comparison on a Broadwell MBP (Ubuntu on 192.168.1.72, 2026-08-04):
+	 *
+	 *   Linux i915:  DSPACNTR = 0xe8000400  (bit 29 = TRICKLE_FEED_DISABLE)
+	 *   FreeBSD:     DSPACNTR = 0xd8000400  (bit 28 = TILED, no trickle
+	 *                                        feed disable, wrong)
+	 *
+	 * The firmware-left value has TILED=1 (X-tile) because the EFI FB is
+	 * X-tiled.  Our GTT-bound framebuffers are linear.  Clear TILED, set
+	 * TRICKLE_FEED_DISABLE (required on HSW/BDW eDP for framer sync).
 	 */
 	dspcntr &= ~((0xfu << DSPCNTR_FORMAT_SHIFT) | DSPCNTR_TILED);
 	dspcntr |= DSPCNTR_ENABLE | DSPCNTR_GAMMA_ENABLE |
-	    DSPCNTR_FORMAT_BGRX8888;
+	    DSPCNTR_FORMAT_BGRX8888 |
+	    (1u << 29);	/* TRICKLE_FEED_DISABLE */
 	igen_w32(sc, HSW_DSPCNTR(0), dspcntr);
 
-	/* PIPE_A ENABLE — the missing 1%. */
-	igen_w32(sc, PIPE_CONF(0), PIPE_CONF_ENABLE);
-	for (i = 0; i < 200; i++) {
-		if (igen_r32(sc, PIPE_CONF(0)) & PIPE_CONF_STATE)
-			break;
-		DELAY(1000);
-	}
+	/*
+	 * CRITICAL: on HSW/BDW eDP, do NOT enable PIPE_A_CONF.  Confirmed
+	 * against Linux i915 live-fire (Broadwell MBP): PIPEACONF stays 0
+	 * while the display renders 2560x1600, because TRANS_EDP is the
+	 * effective pipe for eDP output.  Enabling PIPE_A_CONF would clobber
+	 * a specific power-well state the display power domain machinery
+	 * relies on ("pf-pd" in intel_reg decoding = panel-fitter powered
+	 * down, expected).  The transcoder pulls plane data through the
+	 * PIPE_A data path without PIPE_A_CONF being enabled.
+	 *
+	 * So: program plane (SURF/STRIDE/CTL) + M/N + PIPE_SRCSZ, then
+	 * return.  No PIPE_CONF write, no STATE poll.
+	 */
 
 	device_printf(sc->dev,
-	    "hsw_panel_on: pipe A %s  PIPE_CONF=0x%08x  PLANE_SURF=0x%08x"
-	    "  STRIDE=0x%08x  M=0x%08x  N=0x%08x\n",
-	    (igen_r32(sc, PIPE_CONF(0)) & PIPE_CONF_STATE) ? "LIVE" : "STALL",
-	    igen_r32(sc, PIPE_CONF(0)),
-	    igen_r32(sc, HSW_DSPSURF(0)),
-	    igen_r32(sc, HSW_DSPSTRIDE(0)), m, n);
+	    "hsw_panel_on: apple-handoff shape (PIPE_A stays off; TRANS_EDP"
+	    " drives panel)  DSPACNTR=0x%08x DSPASTRIDE=0x%08x"
+	    " DSPASURF=0x%08x  M=0x%08x N=0x%08x\n",
+	    igen_r32(sc, HSW_DSPCNTR(0)),
+	    igen_r32(sc, HSW_DSPSTRIDE(0)),
+	    igen_r32(sc, HSW_DSPSURF(0)), m, n);
 	return (0);
 }
 
