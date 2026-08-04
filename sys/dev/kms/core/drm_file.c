@@ -27,6 +27,7 @@
 #include <kms/drm_framebuffer.h>
 #include <kms/drm_gem.h>
 #include <kms/drm_mode_config.h>
+#include <kms/drm_property.h>
 
 #include "kms_internal.h"
 
@@ -112,6 +113,13 @@ kms_file_dtor(void *data)
 	 * Under mc->mutex so the vblank handler sees a consistent view.
 	 */
 	mc = &dev->mode_config;
+	/*
+	 * M2 (2026-08-03 review): orphan any property blobs the closing
+	 * file created, so no other client can destroy them via
+	 * DESTROYPROPBLOB after we drop below.  Blobs stay reachable by
+	 * id; only the master can then destroy them.
+	 */
+	kms_property_blob_orphan_owner(dev, file);
 	sx_xlock(&mc->mutex);
 	TAILQ_FOREACH(obj, &mc->crtcs, link) {
 		crtc = __containerof(obj, struct drm_crtc, base);

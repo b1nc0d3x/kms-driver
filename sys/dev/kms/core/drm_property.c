@@ -243,9 +243,30 @@ kms_object_properties_cleanup(struct drm_mode_object *obj)
 
 /* --- blobs --- */
 
+void
+kms_property_blob_orphan_owner(struct drm_device *dev, struct drm_file *file)
+{
+	struct drm_mode_config *mc;
+	struct drm_mode_object *obj;
+	struct drm_property_blob *blob;
+
+	if (dev == NULL || file == NULL)
+		return;
+	mc = &dev->mode_config;
+	sx_xlock(&mc->mutex);
+	TAILQ_FOREACH(obj, &mc->objects, reg) {
+		if (obj->type != DRM_MODE_OBJECT_BLOB)
+			continue;
+		blob = __containerof(obj, struct drm_property_blob, base);
+		if (blob->owner == file)
+			blob->owner = NULL;
+	}
+	sx_xunlock(&mc->mutex);
+}
+
 struct drm_property_blob *
-kms_property_blob_create(struct drm_device *dev, const void *data,
-    size_t length)
+kms_property_blob_create(struct drm_device *dev, struct drm_file *owner,
+    const void *data, size_t length)
 {
 	struct drm_property_blob *blob;
 	int error;
@@ -257,6 +278,7 @@ kms_property_blob_create(struct drm_device *dev, const void *data,
 
 	blob = malloc(sizeof(*blob), M_KMS, M_WAITOK | M_ZERO);
 	blob->dev = dev;
+	blob->owner = owner;
 	blob->length = length;
 	blob->data = malloc(length, M_KMS, M_WAITOK);
 	if (data != NULL)

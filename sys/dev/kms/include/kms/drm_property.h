@@ -85,6 +85,13 @@ struct drm_property {
 struct drm_property_blob {
 	struct drm_mode_object		 base;
 	struct drm_device		*dev;
+	/*
+	 * Creator drm_file, or NULL for driver-created / connector-property
+	 * blobs (EDID, hdr metadata caps).  M2 (2026-08-03 review): only
+	 * `owner` or a DRM master may DESTROYPROPBLOB — otherwise any
+	 * client could destroy the compositor's mode blobs.
+	 */
+	struct drm_file			*owner;
 	size_t				 length;
 	uint8_t				*data;
 };
@@ -128,10 +135,23 @@ void	kms_object_properties_cleanup(struct drm_mode_object *obj);
 
 /* --- blob lifecycle --- */
 
+/*
+ * `owner` = calling drm_file for CREATEPROPBLOB (used by the M2 gate in
+ * DESTROYPROPBLOB), NULL for driver-created blobs (EDID, cap probes).
+ */
 struct drm_property_blob *kms_property_blob_create(struct drm_device *dev,
-	    const void *data, size_t length);
+	    struct drm_file *owner, const void *data, size_t length);
 struct drm_property_blob *kms_property_blob_find(struct drm_device *dev,
 	    uint32_t id);
 void	kms_property_blob_destroy(struct drm_property_blob *blob);
+/*
+ * On file close, walk every blob in the device and clear owner where it
+ * matches this file.  Orphaned blobs stay reachable via their id (in
+ * case a property still references them) but can no longer be
+ * destroyed by another client — only the master.  Called from
+ * kms_file_dtor.  M2 (2026-08-03 review).
+ */
+void	kms_property_blob_orphan_owner(struct drm_device *dev,
+	    struct drm_file *file);
 
 #endif /* _KMS_DRM_PROPERTY_H_ */

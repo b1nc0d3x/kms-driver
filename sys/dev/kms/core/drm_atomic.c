@@ -307,7 +307,7 @@ kms_ioctl_mode_createpropblob(struct drm_file *file,
 		free(buf, M_KMS);
 		return (error);
 	}
-	blob = kms_property_blob_create(file->dev, buf, r->length);
+	blob = kms_property_blob_create(file->dev, file, buf, r->length);
 	free(buf, M_KMS);
 	if (blob == NULL)
 		return (ENOMEM);
@@ -329,6 +329,21 @@ kms_ioctl_mode_destroypropblob(struct drm_file *file,
 	if (obj == NULL)
 		return (ENOENT);
 	blob = __containerof(obj, struct drm_property_blob, base);
+	/*
+	 * M2 (2026-08-03 review): only the creating client may destroy a
+	 * blob.  Driver-created blobs (owner==NULL — EDID, connector
+	 * caps) are not user-destroyable at all.  Master override lets a
+	 * compositor recover blobs from a hung client without a full
+	 * DRM_MASTER handoff.
+	 */
+	if (blob->owner == NULL) {
+		kms_mode_object_put(obj);
+		return (EACCES);
+	}
+	if (blob->owner != file && !file->is_master) {
+		kms_mode_object_put(obj);
+		return (EACCES);
+	}
 	kms_mode_object_put(obj);
 	kms_property_blob_destroy(blob);
 	return (0);

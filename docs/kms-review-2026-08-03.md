@@ -26,6 +26,18 @@ allowed-offset set.
 invisible to it, so the file can be freed in that window.  Needs a
 refcount on `drm_file`, or delivery under the lock.
 
+**Verified 2026-08-03: H2 is already addressed by the prior-review
+H4 fix.**  Every `kms_pending_vblank_event` takes `kms_file_get(file)`
+at WAIT_VBLANK queue time (`drm_events.c:329`) and drops it after
+delivery (`drm_events.c:236`).  `kms_file_dtor` scrubbing only
+pending entries is *sufficient* because entries moved to the ready
+list still carry their own file ref — the dtor's `kms_file_put`
+against the d_open ref just decrements to N-1 where N-1 > 0 as long
+as any pending or in-flight pe references file.  The flip-event path
+uses the same pattern (`drm_modeset.c` `kms_file_get` at arm-time,
+`kms_file_put` in vblank handler after send).  No code change needed;
+this note serves as the audit trail.
+
 ### H3 (new) — Modeset ioctls have no master/auth gate
 
 **Impact**: `is_master` is tracked, `SET_MASTER` is priv_checked —
@@ -50,6 +62,18 @@ unprivileged client.  Do the arithmetic in u64 and reject
 keep pointing at pages the kernel has freed and reused.  Combined
 with `submit_user_batch`, that's a GPU-visible UAF into arbitrary
 physical memory.
+
+**Status 2026-08-03: still open, defer to a dedicated pass.**  The
+lifecycle risk chain requires `dev.igen.<n>.i915_dispatch_enable` to
+be non-zero (default off) — reads on a scanout-only system that has
+never flipped that sysctl are unaffected.  Proper fix needs three
+pieces: (1) add `driver->file_free(file)` and `driver->gem_close
+(file, obj)` hooks to `struct drm_driver`; (2) igen tracks softpin
+bindings per-file in a small list attached to `drm_file->driver_priv`
+(new field); (3) file_free walks and calls `igen_gtt_unbind_range`
+(currently only exists inline in `igen_gtt_unbind_user_fb`; needs
+promotion to a general helper).  Estimated 1-2 days.  Until then:
+recommend keeping `i915_dispatch_enable = 0` on production boxes.
 
 ### H6 (new) — I915_GEM_CREATE has no size cap
 
