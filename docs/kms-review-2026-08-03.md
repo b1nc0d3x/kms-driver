@@ -12,19 +12,22 @@ DRM_MASTER gate) all closed.  New findings, ranked by severity.
 | H2 vblank UAF | **already addressed** by prior H4 refcount | drm_events.c:329 kms_file_get |
 | H3 modeset master gate (OBJ_SETPROPERTY) | **landed** | 25efd57 |
 | H4 igen GGTT u64 truncation | **landed** | 42acf1a |
-| H5 GGTT never unbound | **deferred** — 1-2 days, gated by i915_dispatch_enable=0 default | — |
+| H5 GGTT never unbound | **landed** — driver->file_free + per-file softpin tracker in igen | 5f999c3 |
 | H6 GEM_CREATE size cap | **landed** | 42acf1a |
 | M1 kqueue KNOTE_LOCKED | **landed** | 42acf1a |
-| M2 blob ownership + orphan | **landed** (per-file cap deferred with H5) | 9506a18 |
+| M2 blob ownership + orphan + per-file cap | **landed** — cap = KMS_MAX_BLOBS_PER_FILE (256) | 9506a18 + 5f999c3 |
 | M3 flip event ordering | **landed** | 42acf1a |
 | M4 render-node deny list expansion | **landed** | 25efd57 |
 | Low: input passthrough counter | **landed** | 97d7d7e |
 | Low: prime_fo_mmap NULL check | **landed** | 97d7d7e |
 | Low: drm_modeset.c:494 printf | **not reproduced** — older-revision artifact | — |
 
-Cross-builds: kms.ko (arm64) + igen.ko (amd64) clean at 97d7d7e.
-Runtime verification on armbsd still pending (needs reboot to load
-new kms.ko).
+Cross-builds: kms.ko (arm64) + igen.ko (amd64) clean at 5f999c3.
+Runtime verification on armbsd 2026-08-04: kms.ko `9bb3e972` +
+rk_kms.ko `7f47fb37` deployed, boot-to-XFCE clean (Xorg + xfce4
+session running, 1920x1080 DP modeset up, /dev/dri/card0 +
+renderD128 present).  No regressions vs pre-H5 baseline (79s
+boot-to-XFCE preserved).
 
 ## High
 
