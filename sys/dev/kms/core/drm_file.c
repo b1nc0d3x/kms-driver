@@ -155,10 +155,20 @@ kms_file_dtor(void *data)
 	 * detached from mc->pending lists (so IRQs won't reference this
 	 * file's driver state) but before kms_file_put releases the
 	 * storage (so the driver still has a valid `file`).
+	 *
+	 * 3rd-review L-3: snapshot dev->driver with atomic_load_ptr so a
+	 * concurrent kms_dev_unregister setting it to NULL under dev_lock
+	 * is observed atomically here.  Without the snapshot we'd race a
+	 * torn 8-byte load on some architectures and could deref garbage.
 	 */
-	if (dev->driver != NULL && dev->driver->file_free != NULL) {
-		dev->driver->file_free(file);
-		file->driver_priv = NULL;
+	{
+		const struct drm_driver *drv =
+		    (const struct drm_driver *)atomic_load_ptr(&dev->driver);
+
+		if (drv != NULL && drv->file_free != NULL) {
+			drv->file_free(file);
+			file->driver_priv = NULL;
+		}
 	}
 
 	/* Drop the d_open reference.  Frees storage if refs hits 0. */

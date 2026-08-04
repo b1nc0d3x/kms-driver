@@ -517,12 +517,15 @@ virtio_kms_detach(device_t dev)
 	uint32_t live_fbs;
 
 	/*
-	 * 2nd-review H1: refuse to detach while any framebuffer is still
-	 * tracked.  The drm_device may outlive kms_dev_unregister if a
-	 * compositor still has /dev/dri/cardN open, and a later RMFB (or
-	 * file dtor scrubbing mode_config) would fire our fb .destroy hook
-	 * against a softc newbus already freed.  Force the admin to shut
-	 * the compositor down before detach/kldunload.
+	 * 2nd-review H1 / 3rd-review L-2: refuse to detach while any
+	 * BOUND framebuffer is still tracked.  fb_map only tracks fbs
+	 * that atomic_bind_fb ever wired to a host resource -- ADDFB2'd-
+	 * but-never-committed fbs bypass this count.  Those are still
+	 * safe because virtio_kms_fb_destroy checks sc==NULL (the
+	 * framework NULL'd driver_priv in kms_dev_unregister) and just
+	 * frees the fb allocation without touching the driver.  So this
+	 * gate covers the primary crash path (fb with a live host resource
+	 * survives detach) and the sc==NULL guard covers the residual.
 	 */
 	sx_xlock(&sc->sx);
 	live_fbs = 0;

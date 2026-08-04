@@ -404,6 +404,15 @@ kms_dev_register_versioned2(const struct drm_driver *driver, void *driver_priv,
 static void
 kms_device_destroy(struct drm_device *dev)
 {
+	/*
+	 * 3rd-review L-4: refcount reaching zero implies every open file
+	 * has already run kms_file_dtor (which decrements open_count and
+	 * drops the file's dev ref).  Document the invariant so any future
+	 * caller that forgets to null-out ->cdev before releasing gets
+	 * caught here rather than at a much later stray-open access.
+	 */
+	KASSERT(dev->open_count == 0,
+	    ("kms_device_destroy: open_count=%u", dev->open_count));
 	kms_mode_config_cleanup(&dev->mode_config);
 	sx_destroy(&dev->gem_lock);
 	sx_destroy(&dev->dev_lock);

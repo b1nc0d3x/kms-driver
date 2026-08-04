@@ -107,7 +107,7 @@ struct drm_file {
 	 * GGTT bindings for teardown at file close).  Freed by the
 	 * driver's file_free hook.  NULL until the driver populates it.
 	 * ABI: keep at end of struct — new consumers set it, older
-	 * consumers ignore it, kms_dev_register_versioned catches size
+	 * consumers ignore it, kms_dev_register_versioned2 catches size
 	 * mismatch at load time.
 	 */
 	void				*driver_priv;

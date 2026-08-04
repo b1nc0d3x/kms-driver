@@ -77,13 +77,14 @@ struct drm_driver {
  * driver_priv is opaque, retrievable from drm_device->driver_priv by
  * the registering driver.
  *
- * DO NOT call kms_dev_register_versioned directly — use kms_dev_register
- * (the macro).  Passing the caller's sizeof(struct drm_device) lets kms
- * catch an ABI-mismatched consumer (rk_kms.ko compiled against an older
- * layout than the loaded kms.ko) and refuse the registration cleanly
- * instead of letting the driver deref shifted fields and panic — the
- * exact failure mode of the 2026-08-03 rk_kms_set_config crash after a
- * next_magic field was removed without a matched-set rebuild.
+ * DO NOT call kms_dev_register_versioned2 directly — use kms_dev_register
+ * (the macro).  Passing the caller's sizeof(struct drm_device) AND
+ * sizeof(struct drm_driver) lets kms catch an ABI-mismatched consumer
+ * (rk_kms.ko compiled against an older layout than the loaded kms.ko)
+ * and refuse the registration cleanly instead of letting the driver
+ * deref shifted fields and panic — the exact failure mode of the
+ * 2026-08-03 rk_kms_set_config crash after a next_magic field was
+ * removed without a matched-set rebuild.
  */
 int	kms_dev_register_versioned2(const struct drm_driver *driver,
 	    void *driver_priv, size_t caller_devsize, size_t caller_drvsize,

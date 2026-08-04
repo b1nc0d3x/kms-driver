@@ -40,3 +40,10 @@ addfb2_h3_test.debug
 # obj subtree if someone runs make in-tree without MAKEOBJDIRPREFIX
 obj/
 .depend
+sys/modules/virtio_kms/opt_acpi.h
+sys/modules/virtio_kms/opt_drm.h
+sys/modules/virtio_kms/opt_evdev.h
+sys/modules/virtio_kms/opt_kbd.h
+sys/modules/virtio_kms/virtio_bus_if.h
+sys/modules/virtio_kms/virtio_if.h
+sys/modules/virtio_kms/fb_if.h
