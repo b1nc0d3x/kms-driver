@@ -23,6 +23,7 @@
 
 #include <kms/drm_crtc.h>
 #include <kms/drm_device.h>
+#include <kms/drm_drv.h>
 #include <kms/drm_file.h>
 #include <kms/drm_framebuffer.h>
 #include <kms/drm_gem.h>
@@ -145,6 +146,20 @@ kms_file_dtor(void *data)
 		}
 	}
 	sx_xunlock(&mc->mutex);
+
+	/*
+	 * H5 (2026-08-03 review): give the driver a chance to release
+	 * per-file state stashed in file->driver_priv — most importantly
+	 * igen's softpin GGTT bindings that would otherwise outlive the
+	 * fd and keep PTEs pointing at freed pages.  Called after we
+	 * detached from mc->pending lists (so IRQs won't reference this
+	 * file's driver state) but before kms_file_put releases the
+	 * storage (so the driver still has a valid `file`).
+	 */
+	if (dev->driver != NULL && dev->driver->file_free != NULL) {
+		dev->driver->file_free(file);
+		file->driver_priv = NULL;
+	}
 
 	/* Drop the d_open reference.  Frees storage if refs hits 0. */
 	kms_file_put(file);

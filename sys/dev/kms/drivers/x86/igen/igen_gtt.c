@@ -56,6 +56,7 @@
 #include <kms/drm_device.h>
 #include <kms/drm_drv.h>
 #include <kms/drm_encoder.h>
+#include <kms/drm_file.h>
 #include <kms/drm_framebuffer.h>
 #include <kms/drm_gem.h>
 #include <kms/drm_mode_config.h>
@@ -384,6 +385,136 @@ igen_gtt_bind_gem_at(struct igen_softc *sc, struct drm_gem_object *obj,
 		}
 	}
 	return (0);
+}
+
+/*
+ * H5 (2026-08-03 review): per-file softpin binding tracker.
+ *
+ * Every successful igen_gtt_bind_gem_at from EXECBUFFER2 gets recorded
+ * into a small list attached to drm_file->driver_priv, so file close
+ * can walk the list and clear the PTEs before the underlying GEM pages
+ * are freed and reused by unrelated kernel allocations.  Without this,
+ * i915_dispatch_enable=1 lets the GPU keep reading/writing DRAM at any
+ * softpin address the client used, long after the client is gone.
+ *
+ * Storage: single tail-inserted TAILQ.  Entries are 24 B each, held
+ * under file_priv->lock; workload upper bound is ~1000 BOs per batch,
+ * ~24 KiB of tracker overhead per file.
+ */
+struct igen_softpin_binding {
+	TAILQ_ENTRY(igen_softpin_binding)	link;
+	uint32_t				first_idx;
+	uint32_t				npages;
+};
+
+struct igen_file_priv {
+	struct sx					lock;
+	TAILQ_HEAD(, igen_softpin_binding)		bindings;
+	uint32_t					count;
+};
+
+static struct igen_file_priv *
+igen_file_priv_get_or_alloc(struct drm_file *file)
+{
+	struct igen_file_priv *fp;
+
+	if (file == NULL)
+		return (NULL);
+	fp = file->driver_priv;
+	if (fp != NULL)
+		return (fp);
+	fp = malloc(sizeof(*fp), M_KMS, M_WAITOK | M_ZERO);
+	sx_init(&fp->lock, "igen_softpin");
+	TAILQ_INIT(&fp->bindings);
+	file->driver_priv = fp;
+	return (fp);
+}
+
+/*
+ * Clear a range of GGTT PTEs.  Idempotent; used both from
+ * igen_file_free (per-binding unwind at fd close) and from any future
+ * explicit unbind path.  Callers hold no lock; igen_gtt_write is safe
+ * to call from any context.
+ */
+void
+igen_gtt_unbind_range(struct igen_softc *sc, uint32_t first_idx,
+    uint32_t npages)
+{
+	uint32_t i;
+
+	for (i = 0; i < npages; i++)
+		igen_gtt_write(sc, first_idx + i, 0);
+}
+
+/*
+ * Record a successful softpin bind so the file_free callback can undo
+ * it.  Duplicates (same first_idx) simply get another entry — unbind
+ * writes 0 either way, so idempotent.  Returns 0 on success, or errno.
+ * Callers do not need to handle failure; a full-mem case here just
+ * means the eventual file_free won't unbind that PTE, leaving the
+ * pre-fix behaviour unchanged for one binding.
+ */
+int
+igen_softpin_track(struct drm_file *file, uint32_t first_idx,
+    uint32_t npages)
+{
+	struct igen_file_priv *fp;
+	struct igen_softpin_binding *b;
+
+	fp = igen_file_priv_get_or_alloc(file);
+	if (fp == NULL)
+		return (EINVAL);
+	b = malloc(sizeof(*b), M_KMS, M_NOWAIT | M_ZERO);
+	if (b == NULL)
+		return (ENOMEM);
+	b->first_idx = first_idx;
+	b->npages = npages;
+	sx_xlock(&fp->lock);
+	TAILQ_INSERT_TAIL(&fp->bindings, b, link);
+	fp->count++;
+	sx_xunlock(&fp->lock);
+	return (0);
+}
+
+/*
+ * Driver file_free callback, registered in igen_driver.file_free.
+ * kms_file_dtor calls this after detaching all mode_config pending
+ * events but before releasing the drm_file storage.  We walk the
+ * softpin binding list, clear each range of GGTT PTEs, and free the
+ * tracker itself so the drm_file goes back to a clean state.
+ *
+ * sc is retrieved from file->dev->driver_priv (igen sets it in
+ * kms_dev_register).
+ */
+void
+igen_file_free(struct drm_file *file)
+{
+	struct igen_file_priv *fp;
+	struct igen_softpin_binding *b;
+	struct igen_softc *sc;
+	uint32_t count = 0;
+
+	if (file == NULL || file->driver_priv == NULL)
+		return;
+	fp = file->driver_priv;
+	sc = (struct igen_softc *)file->dev->driver_priv;
+
+	sx_xlock(&fp->lock);
+	while ((b = TAILQ_FIRST(&fp->bindings)) != NULL) {
+		TAILQ_REMOVE(&fp->bindings, b, link);
+		if (sc != NULL)
+			igen_gtt_unbind_range(sc, b->first_idx, b->npages);
+		count++;
+		free(b, M_KMS);
+	}
+	sx_xunlock(&fp->lock);
+	sx_destroy(&fp->lock);
+	free(fp, M_KMS);
+	file->driver_priv = NULL;
+
+	if (sc != NULL && sc->sc_debug > 0 && count > 0)
+		device_printf(sc->dev,
+		    "igen_file_free: unbound %u softpin binding(s)\n", count);
 }
 
 void

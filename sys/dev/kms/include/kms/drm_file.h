@@ -100,6 +100,36 @@ struct drm_file {
 	struct sx			 syncobj_lock;
 	struct kms_syncobj_list		 syncobjs;
 	uint32_t			 next_syncobj_handle;
+
+	/*
+	 * H5 (2026-08-03 review): opaque per-driver, per-file state.
+	 * Drivers stash their own struct here (e.g. igen tracks softpin
+	 * GGTT bindings for teardown at file close).  Freed by the
+	 * driver's file_free hook.  NULL until the driver populates it.
+	 * ABI: keep at end of struct — new consumers set it, older
+	 * consumers ignore it, kms_dev_register_versioned catches size
+	 * mismatch at load time.
+	 */
+	void				*driver_priv;
+
+	/*
+	 * M2 (2026-08-03 review): per-file property-blob count.
+	 * Enforces KMS_MAX_BLOBS_PER_FILE cap in property blob create so
+	 * one client can't exhaust kernel malloc with 1 MiB blobs.
+	 * Incremented in kms_property_blob_create_owned, decremented in
+	 * blob free (unref path).
+	 */
+	uint32_t			 blob_count;
 };
+
+/*
+ * Per-file property blob cap.  Chosen high enough for a normal
+ * compositor (Xorg/Wayland ~10s of blobs) + generous headroom, low
+ * enough that a hostile client can't OOM the kernel with 1 MiB blobs.
+ * 256 blobs * 1 MiB max = 256 MiB per file worst case; a system with N
+ * fds needs 256*N MiB in the worst case, but blobs are typically <1 KiB
+ * (gamma tables, edid, mode blobs).
+ */
+#define	KMS_MAX_BLOBS_PER_FILE	256
 
 #endif /* _KMS_DRM_FILE_H_ */

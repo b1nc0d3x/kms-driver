@@ -1025,6 +1025,18 @@ igen_i915_gem_execbuffer2(struct drm_file *file,
 				error = berr;
 				goto out;
 			}
+			/*
+			 * H5: record the successful bind so igen_file_free
+			 * can clear the PTEs on fd close, before the GEM
+			 * pages get freed and reused by unrelated allocs.
+			 * Silently ignore ENOMEM — worst case is one leaked
+			 * binding that stays live until kldunload; strictly
+			 * better than the pre-fix behaviour (every binding
+			 * leaks by design).
+			 */
+			(void)igen_softpin_track(file,
+			    (uint32_t)(objs[i].offset / PAGE_SIZE),
+			    (uint32_t)gem_refs[i]->npages);
 		}
 	}
 
