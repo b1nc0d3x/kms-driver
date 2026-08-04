@@ -123,7 +123,12 @@ struct virtio_kms_softc {
 	struct virtqueue	*cursor_vq;	/* cursor updates */
 	struct sx		 ctrl_sx;	/* serialize ctrl_vq req/resp */
 	uint32_t		 features;	/* negotiated VIRTIO_GPU_F_* */
-	uint64_t		 next_fence;	/* fence_id counter */
+	/*
+	 * Every ctrl-queue command goes through virtio_kms_req_resp which
+	 * polls the used ring in-line -- we never observe a host fence,
+	 * so we don't set VIRTIO_GPU_FLAG_FENCE and don't burn a fence_id.
+	 * Review #24.
+	 */
 
 	/* Config snapshot + cached scanout topology. */
 	struct virtio_gpu_config gpucfg;
@@ -363,8 +368,6 @@ virtio_kms_fetch_display_info(struct virtio_kms_softc *sc)
 
 	bzero(&s, sizeof(s));
 	s.req.type = htole32(VIRTIO_GPU_CMD_GET_DISPLAY_INFO);
-	s.req.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
-	s.req.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
 
 	error = virtio_kms_req_resp(sc, &s.req, sizeof(s.req),
 	    &s.resp, sizeof(s.resp));
@@ -422,7 +425,6 @@ virtio_kms_attach(device_t dev)
 
 	sc = device_get_softc(dev);
 	sc->dev = dev;
-	sc->next_fence = 1;
 	sx_init(&sc->sx, "virtio_kms");
 	sx_init(&sc->ctrl_sx, "virtio_kms ctrl");
 	LIST_INIT(&sc->fb_map);
@@ -563,8 +565,8 @@ virtio_kms_detach(device_t dev)
  * virtio_kms_req_resp helper from Phase B.
  *
  * Response validation is uniform: any non-OK_NODATA return type
- * from the host is logged and turned into EIO.  Fence IDs are
- * allocated from sc->next_fence.
+ * from the host is logged and turned into EIO.  No fences are
+ * requested -- see the note above sc->features.  Review #24.
  */
 
 static int
@@ -593,8 +595,6 @@ virtio_kms_resource_create_2d(struct virtio_kms_softc *sc,
 
 	bzero(&s, sizeof(s));
 	s.req.hdr.type = htole32(VIRTIO_GPU_CMD_RESOURCE_CREATE_2D);
-	s.req.hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
-	s.req.hdr.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
 	s.req.resource_id = htole32(resource_id);
 	s.req.format = htole32(format);
 	s.req.width = htole32(width);
@@ -620,8 +620,6 @@ virtio_kms_resource_unref(struct virtio_kms_softc *sc, uint32_t resource_id)
 
 	bzero(&s, sizeof(s));
 	s.req.hdr.type = htole32(VIRTIO_GPU_CMD_RESOURCE_UNREF);
-	s.req.hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
-	s.req.hdr.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
 	s.req.resource_id = htole32(resource_id);
 
 	error = virtio_kms_req_resp(sc, &s.req, sizeof(s.req),
@@ -662,7 +660,6 @@ virtio_kms_attach_backing(struct virtio_kms_softc *sc, uint32_t resource_id,
 
 	bzero(&s, sizeof(s));
 	s.req.hdr.type = htole32(VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING);
-	s.req.hdr.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
 	s.req.resource_id = htole32(resource_id);
 	s.req.nr_entries = htole32(1);
 	s.mem[0].addr = htole64(VM_PAGE_TO_PHYS(gem->pages[0]));
@@ -687,8 +684,6 @@ virtio_kms_detach_backing(struct virtio_kms_softc *sc, uint32_t resource_id)
 
 	bzero(&s, sizeof(s));
 	s.req.hdr.type = htole32(VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING);
-	s.req.hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
-	s.req.hdr.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
 	s.req.resource_id = htole32(resource_id);
 
 	error = virtio_kms_req_resp(sc, &s.req, sizeof(s.req),
@@ -711,8 +706,6 @@ virtio_kms_set_scanout(struct virtio_kms_softc *sc, uint32_t scanout_id,
 
 	bzero(&s, sizeof(s));
 	s.req.hdr.type = htole32(VIRTIO_GPU_CMD_SET_SCANOUT);
-	s.req.hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
-	s.req.hdr.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
 	s.req.scanout_id = htole32(scanout_id);
 	s.req.resource_id = htole32(resource_id);
 	s.req.r.x = htole32(x);
@@ -740,8 +733,6 @@ virtio_kms_transfer_to_host_2d(struct virtio_kms_softc *sc,
 
 	bzero(&s, sizeof(s));
 	s.req.hdr.type = htole32(VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D);
-	s.req.hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
-	s.req.hdr.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
 	s.req.resource_id = htole32(resource_id);
 	s.req.offset = htole64(0);	/* whole surface for now */
 	s.req.r.x = htole32(x);
@@ -770,8 +761,6 @@ virtio_kms_resource_flush(struct virtio_kms_softc *sc, uint32_t resource_id,
 
 	bzero(&s, sizeof(s));
 	s.req.hdr.type = htole32(VIRTIO_GPU_CMD_RESOURCE_FLUSH);
-	s.req.hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
-	s.req.hdr.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
 	s.req.resource_id = htole32(resource_id);
 	s.req.r.x = htole32(x);
 	s.req.r.y = htole32(y);
@@ -1037,8 +1026,6 @@ virtio_kms_fetch_edid(struct virtio_kms_softc *sc, uint32_t scanout_id)
 
 	bzero(&s, sizeof(s));
 	s.req.hdr.type = htole32(VIRTIO_GPU_CMD_GET_EDID);
-	s.req.hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
-	s.req.hdr.fence_id = htole64(atomic_fetchadd_64(&sc->next_fence, 1));
 	s.req.scanout = htole32(scanout_id);
 
 	error = virtio_kms_req_resp(sc, &s.req, sizeof(s.req),
