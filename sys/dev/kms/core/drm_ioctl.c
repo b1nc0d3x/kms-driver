@@ -162,7 +162,18 @@ drm_ioctl_get_cap(struct drm_file *file __unused, struct drm_get_cap *c)
 		c->value = 24;
 		return (0);
 	case DRM_CAP_DUMB_PREFER_SHADOW:
-		c->value = 1;
+		/*
+		 * Say 0 so modesetting_drv writes XRender output directly into
+		 * the CRTC's dumb buffer instead of maintaining a private
+		 * shadow pixmap.  With shadow=1 modesetting draws to a shadow
+		 * pixmap in Xorg's own RAM and would need to blit shadow ->
+		 * dumb on damage.  On FreeBSD that blit path did not fire
+		 * (verified 2026-08-05 fbsdmac: even with ShadowFB=on Xorg's
+		 * writes never reached obj->pages[]).  With PREFER_SHADOW=0
+		 * Xorg treats the dumb-buffer mmap as the front pixmap and
+		 * XRender writes land directly on our GEM pages.
+		 */
+		c->value = 0;
 		return (0);
 	case DRM_CAP_TIMESTAMP_MONOTONIC:
 		c->value = 1;

@@ -212,17 +212,15 @@ retry_alloc:
 	    VM_MEMATTR_UNCACHEABLE
 #else
 	    /*
-	     * x86: switching to VM_MEMATTR_DEFAULT (WB) for the
-	     * fake-page refactor.  Under the pre-insert code path we
-	     * needed WC because our PHYS_TO_DMAP read of the same phys
-	     * page (WB) vs Xorg's WC PTE was undefined per Intel — with
-	     * fake pages, our real managed page is only ever accessed
-	     * via WB DMAP and via display DMA (which bypasses caches
-	     * entirely) so single-memattr is safe.  igen's per-scanout
-	     * pmap_invalidate_cache_pages call in bind_user_fb still
-	     * flushes CPU dirty lines to DRAM before display DMA.
+	     * x86: WRITE_COMBINING is the standard scanout memory
+	     * attribute (what Linux i915 uses for stolen + system scanout
+	     * pages) and matches what modesetting_drv's XRender fallback
+	     * expects — writes flush through the WC combining buffer on
+	     * SFENCE/read.  WB is also correct architecturally but modeset
+	     * driver's fbCompositeGeneral loop may issue MOVNTPS or
+	     * similar streaming stores that only make sense on WC pages.
 	     */
-	    VM_MEMATTR_DEFAULT
+	    VM_MEMATTR_WRITE_COMBINING
 #endif
 	    );
 	if (m == NULL) {
@@ -248,7 +246,7 @@ retry_alloc:
 #ifdef __aarch64__
 		pmap_page_set_memattr(m, VM_MEMATTR_UNCACHEABLE);
 #else
-		pmap_page_set_memattr(m, VM_MEMATTR_DEFAULT);
+		pmap_page_set_memattr(m, VM_MEMATTR_WRITE_COMBINING);
 #endif
 		obj->pages[i] = m;
 	}
@@ -292,7 +290,7 @@ retry_alloc:
 #ifdef __aarch64__
 		vm_object_set_memattr(obj->pager, VM_MEMATTR_UNCACHEABLE);
 #else
-		vm_object_set_memattr(obj->pager, VM_MEMATTR_DEFAULT);
+		vm_object_set_memattr(obj->pager, VM_MEMATTR_WRITE_COMBINING);
 #endif
 	}
 	if (obj->pager == NULL) {
