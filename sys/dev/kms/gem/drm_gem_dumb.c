@@ -64,6 +64,20 @@ kms_ioctl_mode_create_dumb(struct drm_file *file,
 		return (EINVAL);
 
 	/*
+	 * Scanout-safe bpp promotion: an incoming bpp=24 request means
+	 * "24-bit color" but the display engines we drive (Intel HSW,
+	 * Rockchip VOP, virtio-gpu) all scan out at 32 bpp with a padding
+	 * byte per pixel.  A packed 24-bit fb produces pitch=w*3 and the
+	 * display reads it as pitch=w*4 → progressive per-row shift.
+	 * Xorg's modesetting_drv on FreeBSD does exactly this on eDP
+	 * (bpp=24 into CREATE_DUMB); observed via drm_test2 (bpp=32,
+	 * clean) vs Xorg (bpp=24, corrupted) on MBP11,4 2026-08-04.
+	 * Promote to 32 so the pitch matches what the display fetches.
+	 */
+	if (args->bpp == 24)
+		args->bpp = 32;
+
+	/*
 	 * Overflow-checked geometry math (security rule 4).  Pitch is
 	 * (width * bpp/8) rounded to a 64-byte cache line; size is
 	 * pitch * height.  All in 64-bit space; reject if size exceeds
