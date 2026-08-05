@@ -654,12 +654,24 @@ igen_sysctl_fb_scan(SYSCTL_HANDLER_ARGS)
 		pa = VM_PAGE_TO_PHYS(obj->pages[0]);
 		p = (uint32_t *)PHYS_TO_DMAP(pa);
 
+		/*
+		 * pmap_is_modified: has anyone (kernel *or* userspace mmap)
+		 * written to this phys page since the last flush?  If Xorg's
+		 * XRender writes hit its own private RAM shadow instead of
+		 * this GEM object, we'll see modified=0 here even though
+		 * xwd -root reports rich content.  If mod=1 but pixels stay
+		 * zero, the write went somewhere else (aliased mapping?)
+		 * or WC combining is stuck.  See project_igen_apple_edp_
+		 * handoff_2026_08_04.md for the standing mystery.
+		 */
+		bool mod0 = pmap_is_modified(obj->pages[0]);
+		bool ref0 = pmap_is_referenced(obj->pages[0]);
 		device_printf(sc->dev,
 		    "fb_scan slot %u: fb=%u %ux%u pitch=%u npages=%u"
-		    " surf=0x%08x pa[0]=0x%llx\n",
+		    " surf=0x%08x pa[0]=0x%llx mod=%d ref=%d\n",
 		    s, fb->base.id, fb->width, fb->height, fb->pitches[0],
 		    (unsigned)obj->npages, sc->user_fb_slots[s].surf,
-		    (long long)pa);
+		    (long long)pa, mod0, ref0);
 		device_printf(sc->dev,
 		    "  page[0] dw[0..15]: %08x %08x %08x %08x %08x %08x %08x"
 		    " %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
@@ -694,9 +706,11 @@ igen_sysctl_fb_scan(SYSCTL_HANDLER_ARGS)
 				p = (uint32_t *)PHYS_TO_DMAP(pa);
 				device_printf(sc->dev,
 				    "  page[%u]: %08x %08x %08x %08x"
-				    " (pa=0x%llx)\n",
+				    " (pa=0x%llx mod=%d ref=%d)\n",
 				    pgi, p[0], p[1], p[2], p[3],
-				    (long long)pa);
+				    (long long)pa,
+				    pmap_is_modified(obj->pages[pgi]),
+				    pmap_is_referenced(obj->pages[pgi]));
 			}
 		}
 	}
