@@ -453,6 +453,87 @@ igen_sysctl_bit_scan(SYSCTL_HANDLER_ARGS)
 	return (0);
 }
 
+/*
+ * fb_scan: dump the first 32 dwords of every currently-bound user fb's
+ * page 0, plus count non-zero and white (0xffffffff) pixels in the
+ * first scanline.  For diagnosing "is Xorg actually writing to the fb"
+ * vs "is the plane reading the right memory".
+ */
+static int
+igen_sysctl_fb_scan(SYSCTL_HANDLER_ARGS)
+{
+	struct igen_softc *sc = arg1;
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+
+	if (error || req->newptr == NULL || trigger == 0)
+		return (error);
+
+	for (uint32_t s = 0; s < USER_FB_GTT_NSLOTS; s++) {
+		struct drm_framebuffer *fb = sc->user_fb_slots[s].fb;
+		struct drm_gem_object *obj;
+		uint32_t *p;
+		uint32_t nonzero, white, black, i, row_px;
+		vm_paddr_t pa;
+
+		if (fb == NULL)
+			continue;
+		obj = fb->gem_objs[0];
+		if (obj == NULL || obj->pages == NULL || obj->npages == 0)
+			continue;
+
+		pa = VM_PAGE_TO_PHYS(obj->pages[0]);
+		p = (uint32_t *)PHYS_TO_DMAP(pa);
+
+		device_printf(sc->dev,
+		    "fb_scan slot %u: fb=%u %ux%u pitch=%u npages=%u"
+		    " surf=0x%08x pa[0]=0x%llx\n",
+		    s, fb->base.id, fb->width, fb->height, fb->pitches[0],
+		    (unsigned)obj->npages, sc->user_fb_slots[s].surf,
+		    (long long)pa);
+		device_printf(sc->dev,
+		    "  page[0] dw[0..15]: %08x %08x %08x %08x %08x %08x %08x"
+		    " %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+		    p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
+		    p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
+
+		row_px = fb->pitches[0] / 4;
+		if (row_px > 1024) row_px = 1024;	/* cap dump */
+		nonzero = white = black = 0;
+		for (i = 0; i < row_px; i++) {
+			if (p[i] == 0) black++;
+			else if ((p[i] & 0x00ffffff) == 0x00ffffff) white++;
+			else nonzero++;
+		}
+		device_printf(sc->dev,
+		    "  row 0 first %u px: %u black, %u white, %u other\n",
+		    row_px, black, white, nonzero);
+
+		/* Also probe pages at 1/4, 1/2, 3/4 of the fb. */
+		{
+			uint32_t sample_pages[3] = {
+				(uint32_t)obj->npages / 4,
+				(uint32_t)obj->npages / 2,
+				(uint32_t)(3 * obj->npages) / 4
+			};
+
+			for (uint32_t k = 0; k < 3; k++) {
+				uint32_t pgi = sample_pages[k];
+				if (pgi >= obj->npages)
+					continue;
+				pa = VM_PAGE_TO_PHYS(obj->pages[pgi]);
+				p = (uint32_t *)PHYS_TO_DMAP(pa);
+				device_printf(sc->dev,
+				    "  page[%u]: %08x %08x %08x %08x"
+				    " (pa=0x%llx)\n",
+				    pgi, p[0], p[1], p[2], p[3],
+				    (long long)pa);
+			}
+		}
+	}
+	return (0);
+}
+
 /* igen_sysctl_edid_read_b lives in igen_gmbus.c. */
 static int	igen_sysctl_vbt_dump(SYSCTL_HANDLER_ARGS);
 /* igen_sysctl_hpd_dump lives in igen_hpd.c. */
@@ -561,6 +642,11 @@ igen_re_sysctls_init(struct igen_softc *sc)
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
 	    sc, 0, igen_sysctl_bit_scan, "I",
 	    "write 1 to scan bit_scan_addr and diff side-effects");
+	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "fb_scan",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, igen_sysctl_fb_scan, "I",
+	    "write 1 to dump user fb page contents (row 0 + samples)");
 	/* edid_read_b sysctl is owned by igen_gmbus.c. */
 	igen_gmbus_register_sysctls(sc);
 

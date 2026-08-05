@@ -491,8 +491,17 @@ igen_hsw_panel_on(struct igen_softc *sc)
 	    link_khz, lanes, &m, &n);
 	igen_w32(sc, HSW_PIPE_DATA_M(0), m);
 	igen_w32(sc, HSW_PIPE_DATA_N(0), n);
-	igen_w32(sc, HSW_PIPE_LINK_M(0), m & ~PIPE_DATA_M_TU_SIZE_DEFAULT);
-	igen_w32(sc, HSW_PIPE_LINK_N(0), n);
+	/*
+	 * PIPE_LINK_M/N are a DIFFERENT ratio from PIPE_DATA_M/N.  Our earlier
+	 * reuse of DATA_M/N for LINK was wrong -- Linux HSW live-fire values
+	 * on the same MBP hardware for 2880x1800 60Hz 8bpc are:
+	 *   PIPE_LINK_M = 0x000a01e5, PIPE_LINK_N = 0x00080000
+	 * Hardcode until we have a proper LINK_M/N formula.  These values
+	 * only apply to native panel timing; multi-monitor / mode-changing
+	 * work will need real computation.
+	 */
+	igen_w32(sc, HSW_PIPE_LINK_M(0), 0x000a01e5u);
+	igen_w32(sc, HSW_PIPE_LINK_N(0), 0x00080000u);
 
 	/* PLANE configuration.  Defer SURF/STRIDE until scanout_fb is
 	 * actually populated by the caller (currently a separate sysctl).
@@ -510,21 +519,38 @@ igen_hsw_panel_on(struct igen_softc *sc)
 	igen_w32(sc, HSW_DSPTILEOFF(0), 0);
 	uint32_t dspcntr = igen_r32(sc, HSW_DSPCNTR(0));
 	/*
-	 * DSPCNTR shape derived from a live-fire Linux i915 register
-	 * comparison on a Broadwell MBP (Ubuntu on 192.168.1.72, 2026-08-04):
+	 * DSPCNTR shape derived from live-fire Linux i915 register comparison
+	 * on THE EXACT SAME MBP hardware (Fedora Live on fbsdmac's MBP11,4,
+	 * 2026-08-04):
 	 *
-	 *   Linux i915:  DSPACNTR = 0xe8000400  (bit 29 = TRICKLE_FEED_DISABLE)
-	 *   FreeBSD:     DSPACNTR = 0xd8000400  (bit 28 = TILED, no trickle
-	 *                                        feed disable, wrong)
+	 *   Linux i915:  DSPACNTR = 0xe8000400  format field [29:26]=0xa
+	 *                                      (BGRX101010 = 10bpc packed)
+	 *                                      + bit 10 TILED (mutter uses
+	 *                                      X-tiled fb)
 	 *
-	 * The firmware-left value has TILED=1 (X-tile) because the EFI FB is
-	 * X-tiled.  Our GTT-bound framebuffers are linear.  Clear TILED, set
-	 * TRICKLE_FEED_DISABLE (required on HSW/BDW eDP for framer sync).
+	 * Format field decode: bits [29:26] = 4 bits.  0xa = BGRX 10-10-10-2,
+	 * 0x6 = BGRX 8-8-8-X.  We want 0x6 to match Xorg's 8bpc XRGB8888 dumb
+	 * buffer allocation.
+	 *
+	 * TRICKLE_FEED_DISABLE is at bit 14 on gen 7+ (my earlier bit-29
+	 * write was wrong -- bit 29 is the top of the format field, so
+	 * setting it turned BGRX (0x6) into RGBX (0xe) with byte-order
+	 * swap).  Fix by using bit 14 for TRICKLE_FEED_DISABLE and leaving
+	 * bit 29 as part of the format field.
+	 *
+	 * Firmware-left DSPCNTR has TILED=1 for the EFI X-tiled FB.  Xorg's
+	 * dumb fb is linear, so clear TILED (bit 10).  Linux mutter uses
+	 * X-tiled so IT keeps TILED=1 -- USERSPACE-dependent, not a display-
+	 * requirement.
+	 */
+	/*
+	 * Back to the safe working baseline (bars visible but modeset
+	 * succeeds so fb_scan can inspect Xorg's rendered content):
+	 * format 0x6 BGRX8888, no TILED, no TRICKLE_FEED_DISABLE.
 	 */
 	dspcntr &= ~((0xfu << DSPCNTR_FORMAT_SHIFT) | DSPCNTR_TILED);
 	dspcntr |= DSPCNTR_ENABLE | DSPCNTR_GAMMA_ENABLE |
-	    DSPCNTR_FORMAT_BGRX8888 |
-	    (1u << 29);	/* TRICKLE_FEED_DISABLE */
+	    DSPCNTR_FORMAT_BGRX8888;
 	igen_w32(sc, HSW_DSPCNTR(0), dspcntr);
 
 	/*
@@ -542,38 +568,49 @@ igen_hsw_panel_on(struct igen_softc *sc)
 	 */
 
 	/*
-	 * Auxiliary programming derived from Linux i915 BDW register dump
-	 * (Ubuntu at 192.168.1.72, 2026-08-04):
+	 * Auxiliary programming derived from Linux i915 HSW live-fire on
+	 * THIS EXACT MBP hardware (Fedora Live at 192.168.1.86, 2026-08-04).
+	 * BDW dump at .72 was informative but had gen-8-only differences;
+	 * these values are the ground truth for MBP11,4 Iris Pro 5200:
 	 *
-	 *   PIPE_MISC (0x70030) = 0x00400000  bit 22 = DITHER_ENABLE
-	 *   CHICKEN_PIPESL_A (0x420b0) = 0x00400001  HSW/BDW plane-fetch
-	 *      chicken bits (bit 22, bit 0 — clock gating + prefetch)
-	 *   WM_LINETIME_A (0x45270) = 0x00400051  IPS_LINETIME=0x40,
-	 *      LINETIME=0x51 (values for 2560x1600 60Hz; scale-appropriate
-	 *      for 2880x1800 too since watermarks are conservative)
+	 *   PIPEASRC (0x6001c) = 0x0b3f0707     (2880, 1800) — pipe source size
+	 *                                        register in PIPE block, not
+	 *                                        PLANE block SRCSZ we already
+	 *                                        program
+	 *   PIPE_MISC (0x70030) = 0x00000000    LEAVE ZERO on HSW (Linux does)
+	 *   WM_PIPE_A (0x45100) = 0x002d0006    primary 45 pipe 6
+	 *   WM_LINETIME_A (0x45270) = 0x00000048  line time 72
+	 *   WM_LP_1 (0x45108) = 0x82302d06      enabled lat 2 fbc 3 pri 45 cur 6
+	 *   WM_LP_2 (0x4510c) = 0x84516a0a      enabled lat 4 fbc 5 pri 362 cur 10
+	 *   WM_LP_3 (0x45110) = 0x8672d212      enabled lat 6 fbc 7 pri 722 cur 18
+	 *   HSW_PWR_WELL_CTL5 (0x45410) = 0x0004050f  actual HSW power well ctl
 	 *
-	 * Without these three, the plane fetches pixel data but the transcoder
-	 * doesn't lock timing correctly with the plane's fetch cadence, giving
-	 * the classic B&W vertical column artifact (misaligned burst reads
-	 * ending mid-row).  Ground truth: matches Linux i915 for HSW/BDW eDP
-	 * plane bring-up.
+	 * The Fedora HSW box (same MBP hardware) was displaying the exact
+	 * 2880x1800 mode we want, so hardcode-copying these values guarantees
+	 * we match hardware timing exactly.
 	 */
-#define	HSW_PIPE_MISC(p)		(0x00070030u + (p) * 0x1000u)
-#define	HSW_CHICKEN_PIPESL_A		0x000420b0u
+#define	HSW_PIPEASRC			0x0006001cu
+#define	HSW_WM_PIPE_A			0x00045100u
 #define	HSW_WM_LINETIME_A		0x00045270u
-	igen_w32(sc, HSW_PIPE_MISC(0), 0x00400000u);
-	igen_w32(sc, HSW_CHICKEN_PIPESL_A, 0x00400001u);
-	igen_w32(sc, HSW_WM_LINETIME_A, 0x00400051u);
+#define	HSW_WM_LP_1			0x00045108u
+#define	HSW_WM_LP_2			0x0004510cu
+#define	HSW_WM_LP_3			0x00045110u
+	igen_w32(sc, HSW_PIPEASRC,   0x0b3f0707u);
+	igen_w32(sc, HSW_WM_PIPE_A,  0x002d0006u);
+	igen_w32(sc, HSW_WM_LINETIME_A, 0x00000048u);
+	igen_w32(sc, HSW_WM_LP_1,    0x82302d06u);
+	igen_w32(sc, HSW_WM_LP_2,    0x84516a0au);
+	igen_w32(sc, HSW_WM_LP_3,    0x8672d212u);
 
 	device_printf(sc->dev,
 	    "hsw_panel_on: apple-handoff shape (PIPE_A stays off; TRANS_EDP"
 	    " drives panel)  DSPACNTR=0x%08x DSPASTRIDE=0x%08x"
-	    " DSPASURF=0x%08x  M=0x%08x N=0x%08x  PIPE_MISC=0x%08x"
+	    " DSPASURF=0x%08x  M=0x%08x N=0x%08x  PIPEASRC=0x%08x"
 	    " WM_LINETIME=0x%08x\n",
 	    igen_r32(sc, HSW_DSPCNTR(0)),
 	    igen_r32(sc, HSW_DSPSTRIDE(0)),
 	    igen_r32(sc, HSW_DSPSURF(0)), m, n,
-	    igen_r32(sc, HSW_PIPE_MISC(0)),
+	    igen_r32(sc, HSW_PIPEASRC),
 	    igen_r32(sc, HSW_WM_LINETIME_A));
 	return (0);
 }
