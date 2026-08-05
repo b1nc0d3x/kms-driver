@@ -190,9 +190,10 @@ retry_alloc:
 	     * stay in WB cache while the display DMA reads stale DRAM.
 	     * WC empties the write-combining buffer on read/mfence and
 	     * bypasses the WB path so display always sees fresh data.
-	     * Observed on Iris Pro 5200 HSW: Xorg fb contained an orange
-	     * xterm (verified via xwd) but the display showed solid black
-	     * with WB; WC lets the xterm reach the panel.
+	     * UC (VM_MEMATTR_UNCACHEABLE) tested but Xorg's mmap of a UC
+	     * buffer produces PTEs the CPU treats as strong-uncached, and
+	     * Xorg's XRender pipeline never lands writes to memory (xwd
+	     * shows solid black under UC).  WC is the sweet spot on HSW.
 	     */
 	    VM_MEMATTR_WRITE_COMBINING
 #endif
