@@ -68,16 +68,45 @@ struct drm_gem_handle {
 /* ----- pager callbacks ----- */
 
 /*
- * Pages are inserted at create time, so the fault path should never
- * fire — if it does, something is asking for an offset we never
- * populated and the right answer is to fail rather than allocate
- * silently.
+ * Return a fake (PG_FICTITIOUS) page pointing at the phys addr of the
+ * real managed page we allocated for this offset.  Mirrors linuxkpi's
+ * linux_cdev_pager_fault (see linux_compat.c:448).
+ *
+ * We used to pre-insert obj->pages[i] into the pager pctrie and return
+ * VM_PAGER_FAIL here, trusting the fault-fast path to find them.  That
+ * worked for drm_test2 / write_dumb (single-shot linear write) but the
+ * write-fault path from Xorg's mmap evicted our real managed page and
+ * inserted a fresh zeroed anonymous page — so Xorg's XRender writes
+ * landed on a shadow that never reached obj->pages[].  Fake pages sit
+ * outside the pager pctrie and just carry the paddr, so pmap_enter
+ * always targets obj->pages[i]'s DRAM directly.  Verified on fbsdmac
+ * MBP11,4 2026-08-05 via a canary experiment.
  */
 static int
-drm_gem_pager_fault(vm_object_t vm_obj __unused, vm_ooffset_t offset __unused,
-    int prot __unused, vm_page_t *mres __unused)
+drm_gem_pager_fault(vm_object_t vm_obj, vm_ooffset_t offset, int prot __unused,
+    vm_page_t *mres)
 {
-	return (VM_PAGER_FAIL);
+	struct drm_gem_object *obj = vm_obj->handle;
+	vm_pindex_t pidx = OFF_TO_IDX(offset);
+	vm_paddr_t paddr;
+	vm_page_t page;
+
+	if (obj == NULL || pidx >= obj->npages || obj->pages[pidx] == NULL)
+		return (VM_PAGER_FAIL);
+	paddr = VM_PAGE_TO_PHYS(obj->pages[pidx]);
+
+	if (((*mres)->flags & PG_FICTITIOUS) != 0) {
+		page = *mres;
+		vm_page_updatefake(page, paddr, vm_obj->memattr);
+	} else {
+		VM_OBJECT_WUNLOCK(vm_obj);
+		page = vm_page_getfake(paddr, vm_obj->memattr);
+		VM_OBJECT_WLOCK(vm_obj);
+		vm_page_replace(page, vm_obj, (*mres)->pindex, *mres);
+		*mres = page;
+	}
+	vm_page_valid(page);
+	return (VM_PAGER_OK);
 }
 
 static int
@@ -104,11 +133,14 @@ drm_gem_pager_dtor(void *handle)
 	struct drm_gem_object *obj = handle;
 	size_t i;
 
+	/*
+	 * Our real managed pages were never inserted into the pager's
+	 * pctrie (only fake pages carry the paddr into userspace PTEs),
+	 * so no page-off-the-pager step is needed.  Just unwire + free.
+	 */
 	for (i = 0; i < obj->npages; i++) {
 		if (obj->pages[i] == NULL)
 			continue;
-		obj->pages[i]->flags &= ~PG_FICTITIOUS;
-		obj->pages[i]->oflags |= VPO_UNMANAGED;
 		vm_page_unwire_noq(obj->pages[i]);
 		vm_page_free(obj->pages[i]);
 	}
@@ -128,7 +160,6 @@ struct drm_gem_object *
 kms_gem_object_create(struct drm_device *dev, size_t size)
 {
 	struct drm_gem_object *obj;
-	struct pctrie_iter pages_iter;
 	vm_page_t m;
 	size_t npages;
 	size_t i;
@@ -181,21 +212,17 @@ retry_alloc:
 	    VM_MEMATTR_UNCACHEABLE
 #else
 	    /*
-	     * x86: WRITE_COMBINING is the standard scanout memory attribute
-	     * (what Linux i915 uses for stolen + system scanout pages).
-	     * Xorg with modesetting_drv + ShadowFB off draws in-place into
-	     * the current front buffer WITHOUT triggering a page-flip, so
-	     * our per-scanout pmap_invalidate_cache_pages (in bind_user_fb)
-	     * only runs once — the first bind — and subsequent CPU writes
-	     * stay in WB cache while the display DMA reads stale DRAM.
-	     * WC empties the write-combining buffer on read/mfence and
-	     * bypasses the WB path so display always sees fresh data.
-	     * UC (VM_MEMATTR_UNCACHEABLE) tested but Xorg's mmap of a UC
-	     * buffer produces PTEs the CPU treats as strong-uncached, and
-	     * Xorg's XRender pipeline never lands writes to memory (xwd
-	     * shows solid black under UC).  WC is the sweet spot on HSW.
+	     * x86: switching to VM_MEMATTR_DEFAULT (WB) for the
+	     * fake-page refactor.  Under the pre-insert code path we
+	     * needed WC because our PHYS_TO_DMAP read of the same phys
+	     * page (WB) vs Xorg's WC PTE was undefined per Intel — with
+	     * fake pages, our real managed page is only ever accessed
+	     * via WB DMAP and via display DMA (which bypasses caches
+	     * entirely) so single-memattr is safe.  igen's per-scanout
+	     * pmap_invalidate_cache_pages call in bind_user_fb still
+	     * flushes CPU dirty lines to DRAM before display DMA.
 	     */
-	    VM_MEMATTR_WRITE_COMBINING
+	    VM_MEMATTR_DEFAULT
 #endif
 	    );
 	if (m == NULL) {
@@ -221,7 +248,7 @@ retry_alloc:
 #ifdef __aarch64__
 		pmap_page_set_memattr(m, VM_MEMATTR_UNCACHEABLE);
 #else
-		pmap_page_set_memattr(m, VM_MEMATTR_WRITE_COMBINING);
+		pmap_page_set_memattr(m, VM_MEMATTR_DEFAULT);
 #endif
 		obj->pages[i] = m;
 	}
@@ -265,7 +292,7 @@ retry_alloc:
 #ifdef __aarch64__
 		vm_object_set_memattr(obj->pager, VM_MEMATTR_UNCACHEABLE);
 #else
-		vm_object_set_memattr(obj->pager, VM_MEMATTR_WRITE_COMBINING);
+		vm_object_set_memattr(obj->pager, VM_MEMATTR_DEFAULT);
 #endif
 	}
 	if (obj->pager == NULL) {
@@ -278,44 +305,16 @@ retry_alloc:
 		return (NULL);
 	}
 
-	vm_page_iter_init(&pages_iter, obj->pager);
-	VM_OBJECT_WLOCK(obj->pager);
-	for (i = 0; i < npages; i++) {
-		obj->pages[i]->oflags &= ~VPO_UNMANAGED;
-		/*
-		 * Do NOT set PG_FICTITIOUS on these pages.  They are real
-		 * RAM pages returned by vm_page_alloc_noobj_contig; marking
-		 * them fictitious tells the VM they are device-memory
-		 * placeholders whose backing store lives elsewhere, which
-		 * confuses the write-fault path.  Real managed RAM should
-		 * behave like any other file-backed managed page.
-		 *
-		 * Note (2026-08-05): removing this flag alone is NOT the
-		 * whole fix for Xorg's XRender-writes-do-not-reach-dumb-
-		 * buffer-pages bug.  fb_scan of Xorg's active dumb buffer
-		 * still shows page[0] all-zero after a full XFCE session.
-		 * Direct DRM clients (drm_test2, /tmp/write_dumb) that do a
-		 * single contiguous linear write reach memory correctly.
-		 * The remaining discrepancy is somewhere in the interaction
-		 * between modesetting_drv's XRender pipeline and our
-		 * cdev_pager mmap path.  Leaving this cleanup in since it is
-		 * semantically correct and unblocks whatever is next.
-		 */
-		if (vm_page_iter_insert(obj->pages[i], obj->pager, i,
-		    &pages_iter) != 0) {
-			VM_OBJECT_WUNLOCK(obj->pager);
-			/*
-			 * vm_object_deallocate runs drm_gem_pager_dtor, which
-			 * already unwires + frees every page (including the
-			 * ones we did successfully insert), frees obj->pages,
-			 * and frees obj itself.  Any manual cleanup here is
-			 * a double-free.
-			 */
-			vm_object_deallocate(obj->pager);
-			return (NULL);
-		}
-	}
-	VM_OBJECT_WUNLOCK(obj->pager);
+	/*
+	 * Real managed pages stay off the pager pctrie.  Every fault goes
+	 * through drm_gem_pager_fault which returns a PG_FICTITIOUS page
+	 * carrying the phys addr of obj->pages[pindex].  This matches
+	 * linuxkpi's cdev pager idiom and avoids the write-fault eviction
+	 * that our pre-insert approach hit — Xorg's XRender writes now
+	 * land directly on our DRAM pages instead of on an anonymous
+	 * shadow the fault path silently allocated (see canary experiment
+	 * memory 2026-08-05).
+	 */
 
 	sx_xlock(&dev->gem_lock);
 	obj->mmap_offset = dev->mmap_offset_counter;
