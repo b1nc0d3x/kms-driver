@@ -543,8 +543,16 @@ igen_sysctl_blit_efi_fb(SYSCTL_HANDLER_ARGS)
 	 * pointer is the actual truly-live source, independent of the
 	 * PLANE_SURF register (which we clobber ourselves when the bypass
 	 * arms the EFI fb) and independent of the user_fb_slots cache
-	 * (which may hold older Xorg fbs that Xorg has since freed). */
+	 * (which may hold older Xorg fbs that Xorg has since freed).
+	 *
+	 * Snapshot the pointer AND bump refcount under scanout_lock so a
+	 * concurrent Xorg RMFB during the 20 MB aperture copy below
+	 * cannot free the object.  Drop the extra ref at the end. */
+	sx_xlock(&sc->scanout_lock);
 	src_fb = sc->last_scanout_fb;
+	if (src_fb != NULL)
+		kms_mode_object_get(&src_fb->base);
+	sx_xunlock(&sc->scanout_lock);
 	if (src_fb == NULL) {
 		device_printf(sc->dev,
 		    "blit_efi_fb: no fb has been program_scanout'd yet\n");
@@ -555,6 +563,7 @@ igen_sysctl_blit_efi_fb(SYSCTL_HANDLER_ARGS)
 		device_printf(sc->dev,
 		    "blit_efi_fb: source fb %u has no pages\n",
 		    src_fb->base.id);
+		kms_mode_object_put(&src_fb->base);
 		return (EINVAL);
 	}
 
@@ -596,6 +605,8 @@ igen_sysctl_blit_efi_fb(SYSCTL_HANDLER_ARGS)
 	    src_fb->base.id, src_fb->width, src_fb->height,
 	    src_fb->pitches[0], (unsigned)obj->npages,
 	    APPLE_EFI_FB_GTT_VA);
+	/* Drop the extra ref we took under scanout_lock at the top. */
+	kms_mode_object_put(&src_fb->base);
 	return (0);
 }
 
@@ -2233,12 +2244,27 @@ igen_program_scanout(struct igen_softc *sc, struct drm_framebuffer *fb)
 		stride = fb->pitches[0] / 64;
 	igen_w32(sc, PLANE_STRIDE(0), stride);
 	igen_w32(sc, PLANE_SURF(0), surf);
-	/* Track the fb we just armed so blit_efi_fb can find the
+	/*
+	 * Track the fb we just armed so blit_efi_fb can find the
 	 * currently-live source without trusting PLANE_SURF (which the
 	 * EFI-fb bypass path may have overwritten) or scanning slot
-	 * cache entries (which may point at older Xorg fbs). */
+	 * cache entries (which may point at older Xorg fbs).
+	 *
+	 * Hold a refcount on the tracked fb so a concurrent RMFB from
+	 * userspace (Xorg cycles fbs constantly) can't free the object
+	 * out from under blit_efi_fb.  Swap under scanout_lock so a
+	 * blit racing with a program_scanout gets a consistent (fb,
+	 * surf) pair — otherwise the two fields could split and blit
+	 * would read stale surf against a fresh fb.
+	 */
+	sx_xlock(&sc->scanout_lock);
+	if (sc->last_scanout_fb != NULL && sc->last_scanout_fb != fb)
+		kms_mode_object_put(&sc->last_scanout_fb->base);
+	if (fb != sc->last_scanout_fb)
+		kms_mode_object_get(&fb->base);
 	sc->last_scanout_fb = fb;
 	sc->last_scanout_surf = surf;
+	sx_xunlock(&sc->scanout_lock);
 	device_printf(sc->dev,
 	    "program_scanout: fb %u (%ux%u pitch=%u) -> PLANE_SURF=0x%08x"
 	    " STRIDE=0x%08x (gen=%d)\n",
@@ -3087,6 +3113,19 @@ igen_detach(device_t dev)
 	if (sc->drm_dev != NULL) {
 		igen_irq_teardown(sc);
 		igen_re_sysctls_fini(sc);
+		/*
+		 * Drop the refcount we hold on the last-armed scanout fb
+		 * (see program_scanout).  Must happen before kms_dev_unregister
+		 * runs the fb-teardown that also decrefs it, otherwise we
+		 * leak one ref that keeps the fb's GEM pages pinned past
+		 * this device's lifetime.
+		 */
+		sx_xlock(&sc->scanout_lock);
+		if (sc->last_scanout_fb != NULL) {
+			kms_mode_object_put(&sc->last_scanout_fb->base);
+			sc->last_scanout_fb = NULL;
+		}
+		sx_xunlock(&sc->scanout_lock);
 		kms_connector_cleanup(&sc->connector);
 		kms_encoder_cleanup(&sc->encoder);
 		kms_plane_cleanup(&sc->primary);
