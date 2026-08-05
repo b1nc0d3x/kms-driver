@@ -616,6 +616,40 @@ igen_hsw_panel_on(struct igen_softc *sc)
 	igen_w32(sc, 0x420b0u, 0x00400000u);
 	igen_w32(sc, 0x49028u, 0x00000002u);
 
+	/*
+	 * PWR_WELL_CTL2 (0x45404): PW2 controls the display pipe/plane
+	 * power domain on HSW.  i915kms writes 0xc0000000 (REQUEST + STATE)
+	 * and polls STATE to become 1 before any pipe-adjacent write via
+	 * intel_display_power_get(POWER_DOMAIN_PIPE_A).
+	 *
+	 * Without an explicit REQUEST, PW2 relies on residual firmware
+	 * state (STATE=1 leftover); if some other subsystem releases it,
+	 * our pipe writes silently fail.  Match i915kms's REQ+poll.
+	 */
+	{
+		uint32_t v = igen_r32(sc, 0x45404u);
+		if ((v & (1u << 31)) == 0) {
+			igen_w32(sc, 0x45404u, v | (1u << 31));
+			for (int i = 0; i < 20; i++) {
+				DELAY(500);
+				if ((igen_r32(sc, 0x45404u) & (1u << 30)) != 0)
+					break;
+			}
+		}
+	}
+
+	/*
+	 * TRANS_EDP_CONF (0x7f008): clear leftover bit 3.  i915kms shows
+	 * 0xc0000000; firmware leaves 0xc0000008.  Bit 3 is undocumented
+	 * on HSW; safest to normalize to i915kms value while preserving
+	 * ENABLE (31) + STATE (30) so the transcoder keeps running.
+	 */
+	{
+		uint32_t v = igen_r32(sc, 0x7f008u);
+		if ((v & (1u << 3)) != 0)
+			igen_w32(sc, 0x7f008u, v & ~(1u << 3));
+	}
+
 	device_printf(sc->dev,
 	    "hsw_panel_on: apple-handoff shape (PIPE_A stays off; TRANS_EDP"
 	    " drives panel)  DSPACNTR=0x%08x DSPASTRIDE=0x%08x"
