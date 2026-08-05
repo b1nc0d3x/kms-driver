@@ -544,13 +544,19 @@ igen_hsw_panel_on(struct igen_softc *sc)
 	 * requirement.
 	 */
 	/*
-	 * Back to the safe working baseline (bars visible but modeset
-	 * succeeds so fb_scan can inspect Xorg's rendered content):
-	 * format 0x6 BGRX8888, no TILED, no TRICKLE_FEED_DISABLE.
+	 * DSPACNTR = 0x98000400 verified via /dev/mem MMIO dump while
+	 * i915kms owned the display on THIS exact MBP11,4 (2026-08-04):
+	 *   bit 31 ENABLE = 1
+	 *   bit 30 GAMMA_ENABLE = 0   <-- i915kms does NOT enable gamma
+	 *   bits 29:26 format = 0x6 XRGB8888
+	 *   bit 10 TILED = 1          <-- i915kms uses X-tile fb
+	 *
+	 * Our Xorg dumb fb is linear, so TILED stays 0 for us.  The delta
+	 * from i915kms is TILED (userspace-fb-format-dependent) — everything
+	 * else must match.
 	 */
 	dspcntr &= ~((0xfu << DSPCNTR_FORMAT_SHIFT) | DSPCNTR_TILED);
-	dspcntr |= DSPCNTR_ENABLE | DSPCNTR_GAMMA_ENABLE |
-	    DSPCNTR_FORMAT_BGRX8888;
+	dspcntr |= DSPCNTR_ENABLE | DSPCNTR_FORMAT_BGRX8888;
 	igen_w32(sc, HSW_DSPCNTR(0), dspcntr);
 
 	/*
@@ -596,11 +602,24 @@ igen_hsw_panel_on(struct igen_softc *sc)
 #define	HSW_WM_LP_2			0x0004510cu
 #define	HSW_WM_LP_3			0x00045110u
 	igen_w32(sc, HSW_PIPEASRC,   0x0b3f0707u);
-	igen_w32(sc, HSW_WM_PIPE_A,  0x002d0006u);
+	/*
+	 * Watermarks from i915kms live MMIO on THIS MBP11,4 (2026-08-04).
+	 * Low nibbles (cursor watermarks) are 0 because we have no HW cursor
+	 * plane programmed; matching i915kms exactly avoids fetch-arb misfires.
+	 */
+	igen_w32(sc, HSW_WM_PIPE_A,  0x002d0000u);
 	igen_w32(sc, HSW_WM_LINETIME_A, 0x00000048u);
-	igen_w32(sc, HSW_WM_LP_1,    0x82302d06u);
-	igen_w32(sc, HSW_WM_LP_2,    0x84516a0au);
-	igen_w32(sc, HSW_WM_LP_3,    0x8672d212u);
+	igen_w32(sc, HSW_WM_LP_1,    0x82302d00u);
+	igen_w32(sc, HSW_WM_LP_2,    0x84516a00u);
+	igen_w32(sc, HSW_WM_LP_3,    0x8672d200u);
+	/*
+	 * CHICKEN_PIPESL_A = 0x00400000 per i915kms (was 0x00400001 previously
+	 * — bit 0 clear matches i915kms on same hardware).
+	 * CSC_MODE_A = 0x00000002 per i915kms (was un-programmed) — enables
+	 * the pipe color-space converter in bypass/legacy mode.
+	 */
+	igen_w32(sc, 0x420b0u, 0x00400000u);
+	igen_w32(sc, 0x49028u, 0x00000002u);
 
 	device_printf(sc->dev,
 	    "hsw_panel_on: apple-handoff shape (PIPE_A stays off; TRANS_EDP"
