@@ -653,17 +653,18 @@ igen_sysctl_fb_scan(SYSCTL_HANDLER_ARGS)
 
 		pa = VM_PAGE_TO_PHYS(obj->pages[0]);
 		p = (uint32_t *)PHYS_TO_DMAP(pa);
-
 		/*
-		 * pmap_is_modified: has anyone (kernel *or* userspace mmap)
-		 * written to this phys page since the last flush?  If Xorg's
-		 * XRender writes hit its own private RAM shadow instead of
-		 * this GEM object, we'll see modified=0 here even though
-		 * xwd -root reports rich content.  If mod=1 but pixels stay
-		 * zero, the write went somewhere else (aliased mapping?)
-		 * or WC combining is stuck.  See project_igen_apple_edp_
-		 * handoff_2026_08_04.md for the standing mystery.
+		 * CLFLUSH the WB DMAP view before reading.  Xorg's mmap of
+		 * this BO is WC (via fake pages); its WC writes drain to
+		 * DRAM on DIRTYFB SFENCE+CLFLUSH.  But OUR view via
+		 * PHYS_TO_DMAP is a separate WB PTE — a WB cache line loaded
+		 * during initial page-alloc zeroing stays in cache and gives
+		 * us stale zero even after Xorg's writes hit DRAM.
+		 * pmap_invalidate_cache_range CLFLUSHes across CPUs, forcing
+		 * next read to fault from DRAM.
 		 */
+		pmap_invalidate_cache_range((vm_offset_t)p,
+		    (vm_offset_t)p + PAGE_SIZE);
 		bool mod0 = pmap_is_modified(obj->pages[0]);
 		bool ref0 = pmap_is_referenced(obj->pages[0]);
 		device_printf(sc->dev,
@@ -704,6 +705,8 @@ igen_sysctl_fb_scan(SYSCTL_HANDLER_ARGS)
 					continue;
 				pa = VM_PAGE_TO_PHYS(obj->pages[pgi]);
 				p = (uint32_t *)PHYS_TO_DMAP(pa);
+				pmap_invalidate_cache_range((vm_offset_t)p,
+				    (vm_offset_t)p + PAGE_SIZE);
 				device_printf(sc->dev,
 				    "  page[%u]: %08x %08x %08x %08x"
 				    " (pa=0x%llx mod=%d ref=%d)\n",
