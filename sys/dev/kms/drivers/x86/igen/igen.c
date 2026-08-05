@@ -475,7 +475,9 @@ igen_sysctl_bit_scan(SYSCTL_HANDLER_ARGS)
 #define	APPLE_EFI_FB_SIZE	(APPLE_EFI_FB_STRIDE * APPLE_EFI_FB_HEIGHT)
 
 /* Look up the phys addr firmware pointed the fb at by reading GTT PTE.
- * Returns 0 on failure. */
+ * Returns 0 on failure.  Kept for debugging even though the current
+ * paint/blit paths use the aperture-write path instead. */
+static vm_paddr_t igen_apple_efi_fb_phys(struct igen_softc *sc) __unused;
 static vm_paddr_t
 igen_apple_efi_fb_phys(struct igen_softc *sc)
 {
@@ -527,11 +529,9 @@ igen_sysctl_blit_efi_fb(SYSCTL_HANDLER_ARGS)
 	struct igen_softc *sc = arg1;
 	int trigger = 0;
 	int error = sysctl_handle_int(oidp, &trigger, 0, req);
-	vm_paddr_t src_phys;
-	uint32_t src_surf, src_entry;
-	uint64_t src_pte;
-	uint32_t *src;
-	size_t i;
+	struct drm_framebuffer *src_fb;
+	struct drm_gem_object *obj;
+	size_t bytes_left, page_bytes, page_off, aperture_off, i;
 
 	if (error || req->newptr == NULL || trigger == 0)
 		return (error);
@@ -539,55 +539,63 @@ igen_sysctl_blit_efi_fb(SYSCTL_HANDLER_ARGS)
 		return (ENOTSUP);
 	if (sc->gmadr_res == NULL)
 		return (ENXIO);
-	/* Prefer the currently-armed PLANE_SURF, but if it already points
-	 * at the EFI fb (because we ran once already) fall back to the
-	 * most-recent Xorg-bound user_fb_slot.  This lets the sysctl be
-	 * triggered repeatedly to keep the EFI fb up to date with Xorg. */
-	src_surf = igen_r32(sc, PLANE_SURF(0));
-	if (src_surf == APPLE_EFI_FB_GTT_VA || src_surf == 0) {
-		src_surf = 0;
-		for (uint32_t i = 0; i < USER_FB_GTT_NSLOTS; i++) {
-			if (sc->user_fb_slots[i].fb != NULL)
-				src_surf = sc->user_fb_slots[i].surf;
-		}
-		if (src_surf == 0) {
-			device_printf(sc->dev,
-			    "blit_efi_fb: no Xorg fb bound; nothing to blit\n");
-			return (ENOENT);
-		}
+	/* Use the fb we most-recently armed via program_scanout.  That
+	 * pointer is the actual truly-live source, independent of the
+	 * PLANE_SURF register (which we clobber ourselves when the bypass
+	 * arms the EFI fb) and independent of the user_fb_slots cache
+	 * (which may hold older Xorg fbs that Xorg has since freed). */
+	src_fb = sc->last_scanout_fb;
+	if (src_fb == NULL) {
+		device_printf(sc->dev,
+		    "blit_efi_fb: no fb has been program_scanout'd yet\n");
+		return (ENOENT);
 	}
-	src_entry = src_surf / PAGE_SIZE;
-	src_pte = igen_gtt_read(sc, src_entry);
-	if ((src_pte & 0x1ULL) == 0)
+	obj = src_fb->gem_objs[0];
+	if (obj == NULL || obj->pages == NULL || obj->npages == 0) {
+		device_printf(sc->dev,
+		    "blit_efi_fb: source fb %u has no pages\n",
+		    src_fb->base.id);
 		return (EINVAL);
-	src_phys = (vm_paddr_t)(src_pte & ~0xfffULL);
+	}
 
-	/* Source is a contigmalloc dumb buffer in system RAM — CPU-safe
-	 * via PHYS_TO_DMAP.  Destination is stolen mem — only reachable
-	 * via BAR2 aperture (bus_write_4).  Read src, write via BAR2.
-	 * pmap_invalidate_cache_range() flushes any WC/WB inconsistency
-	 * on the source view.
-	 */
-	src = (uint32_t *)PHYS_TO_DMAP(src_phys);
-	/* Force any userspace WC combining-buffer writes to drain to
-	 * memory before we read.  sfence + wbinvd is the biggest hammer:
-	 * sfence serializes store-buffer, wbinvd flushes+invalidates all
-	 * CPU caches on all cores.  Expensive but correct.
+	/* Walk source fb pages one at a time.  Each page is
+	 * PAGE_SIZE bytes but the last one may be short if the fb size is
+	 * not a whole multiple of PAGE_SIZE.  For each page, PHYS_TO_DMAP
+	 * to get a kernel virt addr and copy 4-byte-at-a-time into the
+	 * BAR2 aperture at the EFI GTT VA + running offset.
+	 *
+	 * Force any pending userspace-facing WC combining-buffer writes
+	 * onto memory first.  sfence orders the CPU store-buffer; wbinvd
+	 * flushes+invalidates all CPU caches on all cores.  Big hammer
+	 * but this path is not a hot loop.
 	 */
 	__asm__ volatile ("sfence" ::: "memory");
 	wbinvd();
-	pmap_invalidate_cache_range((vm_offset_t)src,
-	    (vm_offset_t)src + APPLE_EFI_FB_SIZE);
-	for (i = 0; i < APPLE_EFI_FB_SIZE / 4; i++) {
-		bus_write_4(sc->gmadr_res, APPLE_EFI_FB_GTT_VA + i * 4,
-		    src[i]);
+
+	bytes_left = APPLE_EFI_FB_SIZE;
+	aperture_off = APPLE_EFI_FB_GTT_VA;
+	for (page_off = 0; page_off < obj->npages && bytes_left > 0;
+	    page_off++) {
+		vm_paddr_t pa = VM_PAGE_TO_PHYS(obj->pages[page_off]);
+		uint32_t *src_page = (uint32_t *)PHYS_TO_DMAP(pa);
+		pmap_invalidate_cache_range((vm_offset_t)src_page,
+		    (vm_offset_t)src_page + PAGE_SIZE);
+		page_bytes = bytes_left < PAGE_SIZE ? bytes_left : PAGE_SIZE;
+		for (i = 0; i < page_bytes / 4; i++) {
+			bus_write_4(sc->gmadr_res,
+			    aperture_off + i * 4, src_page[i]);
+		}
+		aperture_off += page_bytes;
+		bytes_left -= page_bytes;
 	}
 
 	igen_w32(sc, PLANE_SURF(0), APPLE_EFI_FB_GTT_VA);
 	device_printf(sc->dev,
-	    "blit_efi_fb: %u bytes from phys 0x%llx via BAR2 aperture,"
-	    " DSPASURF=0x%08x\n",
-	    APPLE_EFI_FB_SIZE, (long long)src_phys, APPLE_EFI_FB_GTT_VA);
+	    "blit_efi_fb: fb %u %ux%u pitch=%u npages=%u -> EFI fb"
+	    " via BAR2 aperture, DSPASURF=0x%08x\n",
+	    src_fb->base.id, src_fb->width, src_fb->height,
+	    src_fb->pitches[0], (unsigned)obj->npages,
+	    APPLE_EFI_FB_GTT_VA);
 	return (0);
 }
 
@@ -2225,6 +2233,12 @@ igen_program_scanout(struct igen_softc *sc, struct drm_framebuffer *fb)
 		stride = fb->pitches[0] / 64;
 	igen_w32(sc, PLANE_STRIDE(0), stride);
 	igen_w32(sc, PLANE_SURF(0), surf);
+	/* Track the fb we just armed so blit_efi_fb can find the
+	 * currently-live source without trusting PLANE_SURF (which the
+	 * EFI-fb bypass path may have overwritten) or scanning slot
+	 * cache entries (which may point at older Xorg fbs). */
+	sc->last_scanout_fb = fb;
+	sc->last_scanout_surf = surf;
 	device_printf(sc->dev,
 	    "program_scanout: fb %u (%ux%u pitch=%u) -> PLANE_SURF=0x%08x"
 	    " STRIDE=0x%08x (gen=%d)\n",

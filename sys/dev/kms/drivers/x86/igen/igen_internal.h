@@ -214,6 +214,13 @@ struct igen_softc {
 	uint32_t		 scanout_prev_surf;
 	bool			 scanout_held;
 
+	/* Last fb + surf we armed via program_scanout — the truly-live
+	 * source for blit_efi_fb, independent of PLANE_SURF (which the
+	 * EFI-fb bypass may have overwritten) or user_fb_slots (which
+	 * may hold older cached bindings). */
+	struct drm_framebuffer	*last_scanout_fb;
+	uint32_t		 last_scanout_surf;
+
 	/*
 	 * Serializes atomic_commit and cursor_move.  Both touch pipe A
 	 * MMIO registers (PLANE_SURF, CUR_POS_A, CUR_BASE_A, CUR_CTL_A)
