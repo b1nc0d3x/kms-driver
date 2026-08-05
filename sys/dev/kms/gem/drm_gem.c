@@ -260,7 +260,25 @@ retry_alloc:
 	VM_OBJECT_WLOCK(obj->pager);
 	for (i = 0; i < npages; i++) {
 		obj->pages[i]->oflags &= ~VPO_UNMANAGED;
-		obj->pages[i]->flags |= PG_FICTITIOUS;
+		/*
+		 * Do NOT set PG_FICTITIOUS on these pages.  They are real
+		 * RAM pages returned by vm_page_alloc_noobj_contig; marking
+		 * them fictitious tells the VM they are device-memory
+		 * placeholders whose backing store lives elsewhere, which
+		 * confuses the write-fault path.  Real managed RAM should
+		 * behave like any other file-backed managed page.
+		 *
+		 * Note (2026-08-05): removing this flag alone is NOT the
+		 * whole fix for Xorg's XRender-writes-do-not-reach-dumb-
+		 * buffer-pages bug.  fb_scan of Xorg's active dumb buffer
+		 * still shows page[0] all-zero after a full XFCE session.
+		 * Direct DRM clients (drm_test2, /tmp/write_dumb) that do a
+		 * single contiguous linear write reach memory correctly.
+		 * The remaining discrepancy is somewhere in the interaction
+		 * between modesetting_drv's XRender pipeline and our
+		 * cdev_pager mmap path.  Leaving this cleanup in since it is
+		 * semantically correct and unblocks whatever is next.
+		 */
 		if (vm_page_iter_insert(obj->pages[i], obj->pager, i,
 		    &pages_iter) != 0) {
 			VM_OBJECT_WUNLOCK(obj->pager);
