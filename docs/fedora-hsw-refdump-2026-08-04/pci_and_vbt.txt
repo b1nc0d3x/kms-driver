@@ -1,0 +1,25 @@
+X11 forwarding request failed on channel 0
+[sudo] password for admin: 00:02.0 VGA compatible controller [0300]: Intel Corporation Crystal Well Integrated Graphics Controller [8086:0d26] (rev 08) (prog-if 00 [VGA controller])
+	Subsystem: Apple Inc. Device [106b:0147]
+	Flags: bus master, fast devsel, latency 0, IRQ 67
+	Memory at a0000000 (64-bit, non-prefetchable) [size=4M]
+	Memory at 90000000 (64-bit, prefetchable) [size=256M]
+	I/O ports at 3000 [size=64]
+	Expansion ROM at 000c0000 [virtual] [disabled] [size=128K]
+	Capabilities: [90] MSI: Enable+ Count=1/1 Maskable- 64bit-
+	Capabilities: [d0] Power Management version 2
+	Capabilities: [a4] PCI Advanced Features
+	Kernel driver in use: i915
+	Kernel modules: i915
+
+---
+00000219
+0000003d
+00000000
+79a00001
+02
+0022a401
+00000000
+---
+0
+VBT-bytes

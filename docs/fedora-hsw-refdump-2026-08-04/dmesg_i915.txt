@@ -1,0 +1,18 @@
+X11 forwarding request failed on channel 0
+[sudo] password for admin: [    0.329697] ACPI: bus type drm_connector registered
+[    0.335501] simple-framebuffer simple-framebuffer.0: [drm] Registered 1 planes with drm panic
+[    0.335503] [drm] Initialized simpledrm 1.0.0 for simple-framebuffer.0 on minor 0
+[    0.339821] simple-framebuffer simple-framebuffer.0: [drm] fb0: simpledrmdrmfb frame buffer device
+[    3.368769] i915 0000:00:02.0: [drm] Found haswell (device ID 0d26) integrated display version 7.00 stepping N/A
+[    3.369079] i915 0000:00:02.0: [drm] Found 128MB of eDRAM
+[    3.389786] i915 0000:00:02.0: vgaarb: deactivate vga console
+[    3.390783] i915 0000:00:02.0: vgaarb: VGA decodes changed: olddecodes=io+mem,decodes=io+mem:owns=io+mem
+[    3.446714] i915 0000:00:02.0: [drm] Skipping intel_backlight registration
+[    3.447601] i915 0000:00:02.0: [drm] Registered 3 planes with drm panic
+[    3.447608] [drm] Initialized i915 1.6.0 for 0000:00:02.0 on minor 1
+[    3.464198] fbcon: i915drmfb (fb0) is primary device
+[    3.464270] i915 0000:00:02.0: [drm] fb0: i915drmfb frame buffer device
+[   19.768378] systemd[1]: modprobe@drm.service - Load Kernel Module drm was skipped because of an unmet condition check (ConditionKernelModuleLoaded=!drm).
+[   23.007707] snd_hda_intel 0000:00:03.0: bound 0000:00:02.0 (ops intel_audio_component_bind_ops [i915])
+[  808.994243] i915 0000:00:02.0: [drm] Invalid mmio detected during user access
+[ 1127.770463] i915 0000:00:02.0: [drm] Invalid mmio detected during user access

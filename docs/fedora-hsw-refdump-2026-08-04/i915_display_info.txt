@@ -1,0 +1,73 @@
+X11 forwarding request failed on channel 0
+[sudo] password for admin: CRTC info
+---------
+[CRTC:49:pipe A]:
+	uapi: enable=yes, active=yes, mode="2880x1800": 60 337750 2880 2928 2960 3040 1800 1803 1809 1852 0x48 0x9
+	hw: enable=yes, active=yes
+	adjusted_mode="2880x1800": 60 337750 2880 2928 2960 3040 1800 1803 1809 1852 0x48 0x9
+	pipe__mode="2880x1800": 60 337750 2880 2928 2960 3040 1800 1803 1809 1852 0x40 0x9
+	pipe src=2880x1800+0+0, dither=no, bpp=24
+	port_clock=270000, lane_count=4
+	No scalers available on this platform
+	[ENCODER:84:DDI A/PHY A]: connectors:
+		[CONNECTOR:85:eDP-1]
+	[PLANE:33:primary A]: type=PRI
+		uapi: [FB:86] XR30 little-endian (0x30335258),0x100000000000001,2880x1800, visible=visible, src=2880.000000x1800.000000+0.000000+0.000000, dst=2880x1800+0+0, rotation=0 (0x00000001)
+		hw: [FB:86] XR30 little-endian (0x30335258),0x100000000000001,2880x1800, visible=yes, src=2880.000000x1800.000000+0.000000+0.000000, dst=2880x1800+0+0, rotation=0 (0x00000001)
+	[PLANE:38:sprite A]: type=OVL
+		uapi: [FB:0] n/a,0x0,0x0,, visible=hidden, src=0.000000x0.000000+0.000000+0.000000, dst=0x0+0+0, rotation=0 (0x00000001)
+	[PLANE:44:cursor A]: type=CUR
+		uapi: [FB:124] AR24 little-endian (0x34325241),0x0,64x64, visible=visible, src=64.000000x64.000000+0.000000+0.000000, dst=64x64+852+1125, rotation=0 (0x00000001)
+		hw: [FB:124] AR24 little-endian (0x34325241),0x0,64x64, visible=yes, src=64.000000x64.000000+0.000000+0.000000, dst=64x64+852+1125, rotation=0 (0x00000001)
+	underrun reporting: cpu=yes pch=no
+[CRTC:66:pipe B]:
+	uapi: enable=no, active=no, mode="": 0 0 0 0 0 0 0 0 0 0 0x0 0x0
+	hw: enable=no, active=no
+	adjusted_mode="": 0 0 0 0 0 0 0 0 0 0 0x0 0x0
+	pipe__mode="": 0 0 0 0 0 0 0 0 0 0 0x0 0x0
+	pipe src=0x0+0+0, dither=no, bpp=0
+	port_clock=0, lane_count=0
+	No scalers available on this platform
+	[PLANE:50:primary B]: type=PRI
+		uapi: [FB:0] n/a,0x0,0x0,, visible=hidden, src=0.000000x0.000000+0.000000+0.000000, dst=0x0+0+0, rotation=0 (0x00000001)
+	[PLANE:55:sprite B]: type=OVL
+		uapi: [FB:0] n/a,0x0,0x0,, visible=hidden, src=0.000000x0.000000+0.000000+0.000000, dst=0x0+0+0, rotation=0 (0x00000001)
+	[PLANE:61:cursor B]: type=CUR
+		uapi: [FB:0] n/a,0x0,0x0,, visible=hidden, src=0.000000x0.000000+0.000000+0.000000, dst=0x0+0+0, rotation=0 (0x00000001)
+	underrun reporting: cpu=yes pch=yes
+[CRTC:83:pipe C]:
+	uapi: enable=no, active=no, mode="": 0 0 0 0 0 0 0 0 0 0 0x0 0x0
+	hw: enable=no, active=no
+	adjusted_mode="": 0 0 0 0 0 0 0 0 0 0 0x0 0x0
+	pipe__mode="": 0 0 0 0 0 0 0 0 0 0 0x0 0x0
+	pipe src=0x0+0+0, dither=no, bpp=0
+	port_clock=0, lane_count=0
+	No scalers available on this platform
+	[PLANE:67:primary C]: type=PRI
+		uapi: [FB:0] n/a,0x0,0x0,, visible=hidden, src=0.000000x0.000000+0.000000+0.000000, dst=0x0+0+0, rotation=0 (0x00000001)
+	[PLANE:72:sprite C]: type=OVL
+		uapi: [FB:0] n/a,0x0,0x0,, visible=hidden, src=0.000000x0.000000+0.000000+0.000000, dst=0x0+0+0, rotation=0 (0x00000001)
+	[PLANE:78:cursor C]: type=CUR
+		uapi: [FB:0] n/a,0x0,0x0,, visible=hidden, src=0.000000x0.000000+0.000000+0.000000, dst=0x0+0+0, rotation=0 (0x00000001)
+	underrun reporting: cpu=yes pch=yes
+
+Connector info
+--------------
+[CONNECTOR:85:eDP-1]: status: connected
+	physical dimensions: 330x210mm
+	subpixel order: Unknown
+	CEA rev: 0
+	DPCD rev: 11
+	audio support: no
+	DP branch device present: no
+	HDCP version: No Connector Support
+	max bpc: 8
+	fixed modes:
+		"2880x1800": 60 337750 2880 2928 2960 3040 1800 1803 1809 1852 0x48 0x9
+	modes:
+		"2880x1800": 60 337750 2880 2928 2960 3040 1800 1803 1809 1852 0x48 0x9
+[CONNECTOR:93:DP-1]: status: disconnected
+[CONNECTOR:101:HDMI-A-1]: status: disconnected
+[CONNECTOR:107:DP-2]: status: disconnected
+[CONNECTOR:113:HDMI-A-2]: status: disconnected
+[CONNECTOR:117:HDMI-A-3]: status: disconnected

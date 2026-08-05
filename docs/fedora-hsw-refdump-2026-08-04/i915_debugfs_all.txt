@@ -1,0 +1,756 @@
+X11 forwarding request failed on channel 0
+[sudo] password for admin: ===== /sys/kernel/debug/dri/1/i915_capabilities =====
+graphics version: 7
+media version: 7
+graphics stepping: **
+media stepping: **
+gt: 3
+memory-regions: 0x21
+page-sizes: 0x1000
+platform: HASWELL
+ppgtt-size: 31
+ppgtt-type: 1
+dma_mask_size: 40
+is_mobile: no
+require_force_probe: no
+is_dgfx: no
+has_64bit_reloc: no
+has_64k_pages: no
+gpu_reset_clobbers_display: no
+has_reset_engine: yes
+has_3d_pipeline: yes
+has_flat_ccs: no
+has_global_mocs: no
+has_gmd_id: no
+has_gt_uc: no
+has_heci_pxp: no
+has_heci_gscfi: no
+has_guc_deprivilege: no
+has_guc_tlb_invalidation: no
+has_l3_ccs_read: no
+has_l3_dpf: yes
+has_llc: yes
+has_logical_ring_contexts: no
+has_logical_ring_elsq: no
+has_media_ratio_mode: no
+has_mslice_steering: no
+has_oa_bpc_reporting: no
+has_oa_slice_contrib_limits: no
+has_oam: no
+has_one_eu_per_fuse_bit: no
+has_pxp: no
+has_rc6: yes
+has_rc6p: no
+has_rps: yes
+has_runtime_pm: yes
+has_snoop: no
+has_coherent_ggtt: yes
+tuning_thread_rr_after_dep: no
+unfenced_needs_alignment: no
+hws_needs_physical: no
+has_pooled_eu: no
+iommu: disabled
+available engines: 40403
+slice total: 2, mask=0003
+subslice total: 4
+slice0: 2 subslices, mask=00000003
+slice1: 2 subslices, mask=00000003
+EU total: 40
+EU per subslice: 10
+has slice power gating: no
+has subslice power gating: no
+has EU power gating: no
+Has logical contexts? yes
+scheduler: 0x0
+i915.modeset=-1
+i915.enable_guc=0
+i915.guc_log_level=-1
+i915.guc_firmware_path=(null)
+i915.huc_firmware_path=(null)
+i915.gsc_firmware_path=(null)
+i915.memtest=no
+i915.mmio_debug=0
+i915.reset=3
+i915.inject_probe_failure=0
+i915.force_probe=
+i915.request_timeout_ms=20000
+i915.lmem_size=0
+i915.lmem_bar_size=0
+i915.enable_hangcheck=yes
+i915.error_capture=yes
+i915.enable_gvt=no
+i915.enable_debug_only_api=no
+===== /sys/kernel/debug/dri/1/i915_cdclk_info =====
+Current CD clock frequency: 540000 kHz
+Max CD clock frequency: 540000 kHz
+Max pixel clock frequency: 540000 kHz
+===== /sys/kernel/debug/dri/1/i915_cur_wm_latency =====
+WM0 20 (2.0 usec)
+WM1 4 (2.0 usec)
+WM2 36 (18.0 usec)
+WM3 70 (35.0 usec)
+WM4 160 (80.0 usec)
+===== /sys/kernel/debug/dri/1/i915_ddb_info =====
+head: error reading '/sys/kernel/debug/dri/1/i915_ddb_info': No such device
+===== /sys/kernel/debug/dri/1/i915_display_info =====
+CRTC info
+---------
+[CRTC:49:pipe A]:
+	uapi: enable=yes, active=yes, mode="2880x1800": 60 337750 2880 2928 2960 3040 1800 1803 1809 1852 0x48 0x9
+	hw: enable=yes, active=yes
+	adjusted_mode="2880x1800": 60 337750 2880 2928 2960 3040 1800 1803 1809 1852 0x48 0x9
+	pipe__mode="2880x1800": 60 337750 2880 2928 2960 3040 1800 1803 1809 1852 0x40 0x9
+	pipe src=2880x1800+0+0, dither=no, bpp=24
+	port_clock=270000, lane_count=4
+	No scalers available on this platform
+	[ENCODER:84:DDI A/PHY A]: connectors:
+		[CONNECTOR:85:eDP-1]
+	[PLANE:33:primary A]: type=PRI
+		uapi: [FB:86] XR30 little-endian (0x30335258),0x100000000000001,2880x1800, visible=visible, src=2880.000000x1800.000000+0.000000+0.000000, dst=2880x1800+0+0, rotation=0 (0x00000001)
+		hw: [FB:86] XR30 little-endian (0x30335258),0x100000000000001,2880x1800, visible=yes, src=2880.000000x1800.000000+0.000000+0.000000, dst=2880x1800+0+0, rotation=0 (0x00000001)
+	[PLANE:38:sprite A]: type=OVL
+		uapi: [FB:0] n/a,0x0,0x0,, visible=hidden, src=0.000000x0.000000+0.000000+0.000000, dst=0x0+0+0, rotation=0 (0x00000001)
+	[PLANE:44:cursor A]: type=CUR
+		uapi: [FB:124] AR24 little-endian (0x34325241),0x0,64x64, visible=visible, src=64.000000x64.000000+0.000000+0.000000, dst=64x64+852+1125, rotation=0 (0x00000001)
+		hw: [FB:124] AR24 little-endian (0x34325241),0x0,64x64, visible=yes, src=64.000000x64.000000+0.000000+0.000000, dst=64x64+852+1125, rotation=0 (0x00000001)
+	underrun reporting: cpu=yes pch=no
+[CRTC:66:pipe B]:
+	uapi: enable=no, active=no, mode="": 0 0 0 0 0 0 0 0 0 0 0x0 0x0
+	hw: enable=no, active=no
+	adjusted_mode="": 0 0 0 0 0 0 0 0 0 0 0x0 0x0
+	pipe__mode="": 0 0 0 0 0 0 0 0 0 0 0x0 0x0
+	pipe src=0x0+0+0, dither=no, bpp=0
+	port_clock=0, lane_count=0
+	No scalers available on this platform
+	[PLANE:50:primary B]: type=PRI
+		uapi: [FB:0] n/a,0x0,0x0,, visible=hidden, src=0.000000x0.000000+0.000000+0.000000, dst=0x0+0+0, rotation=0 (0x00000001)
+	[PLANE:55:sprite B]: type=OVL
+		uapi: [FB:0] n/a,0x0,0x0,, visible=hidden, src=0.000000x0.000000+0.000000+0.000000, dst=0x0+0+0, rotation=0 (0x00000001)
+	[PLANE:61:cursor B]: type=CUR
+		uapi: [FB:0] n/a,0x0,0x0,, visible=hidden, src=0.000000x0.000000+0.000000+0.000000, dst=0x0+0+0, rotation=0 (0x00000001)
+	underrun reporting: cpu=yes pch=yes
+[CRTC:83:pipe C]:
+	uapi: enable=no, active=no, mode="": 0 0 0 0 0 0 0 0 0 0 0x0 0x0
+	hw: enable=no, active=no
+	adjusted_mode="": 0 0 0 0 0 0 0 0 0 0 0x0 0x0
+	pipe__mode="": 0 0 0 0 0 0 0 0 0 0 0x0 0x0
+	pipe src=0x0+0+0, dither=no, bpp=0
+	port_clock=0, lane_count=0
+	No scalers available on this platform
+	[PLANE:67:primary C]: type=PRI
+		uapi: [FB:0] n/a,0x0,0x0,, visible=hidden, src=0.000000x0.000000+0.000000+0.000000, dst=0x0+0+0, rotation=0 (0x00000001)
+	[PLANE:72:sprite C]: type=OVL
+		uapi: [FB:0] n/a,0x0,0x0,, visible=hidden, src=0.000000x0.000000+0.000000+0.000000, dst=0x0+0+0, rotation=0 (0x00000001)
+	[PLANE:78:cursor C]: type=CUR
+		uapi: [FB:0] n/a,0x0,0x0,, visible=hidden, src=0.000000x0.000000+0.000000+0.000000, dst=0x0+0+0, rotation=0 (0x00000001)
+	underrun reporting: cpu=yes pch=yes
+
+Connector info
+--------------
+[CONNECTOR:85:eDP-1]: status: connected
+	physical dimensions: 330x210mm
+	subpixel order: Unknown
+	CEA rev: 0
+	DPCD rev: 11
+	audio support: no
+	DP branch device present: no
+	HDCP version: No Connector Support
+	max bpc: 8
+	fixed modes:
+		"2880x1800": 60 337750 2880 2928 2960 3040 1800 1803 1809 1852 0x48 0x9
+	modes:
+		"2880x1800": 60 337750 2880 2928 2960 3040 1800 1803 1809 1852 0x48 0x9
+[CONNECTOR:93:DP-1]: status: disconnected
+[CONNECTOR:101:HDMI-A-1]: status: disconnected
+[CONNECTOR:107:DP-2]: status: disconnected
+[CONNECTOR:113:HDMI-A-2]: status: disconnected
+[CONNECTOR:117:HDMI-A-3]: status: disconnected
+===== /sys/kernel/debug/dri/1/i915_dmc_info =====
+head: error reading '/sys/kernel/debug/dri/1/i915_dmc_info': No such device
+===== /sys/kernel/debug/dri/1/i915_dp_mst_info =====
+MST Source Port [ENCODER:92:DDI B/PHY B]
+
+*** Atomic state info ***
+payload_mask: 0, max_payloads: 3, start_slot: 1, pbn_div: 0
+
+| idx | port | vcpi | slots | pbn | dsc | status |     sink name     |
+
+*** DPCD Info ***
+MST Source Port [ENCODER:106:DDI C/PHY C]
+
+*** Atomic state info ***
+payload_mask: 0, max_payloads: 3, start_slot: 1, pbn_div: 0
+
+| idx | port | vcpi | slots | pbn | dsc | status |     sink name     |
+
+*** DPCD Info ***
+===== /sys/kernel/debug/dri/1/i915_dp_test_active =====
+00===== /sys/kernel/debug/dri/1/i915_dp_test_data =====
+00===== /sys/kernel/debug/dri/1/i915_dp_test_type =====
+00===== /sys/kernel/debug/dri/1/i915_edp_psr_debug =====
+head: error reading '/sys/kernel/debug/dri/1/i915_edp_psr_debug': No such device
+===== /sys/kernel/debug/dri/1/i915_edp_psr_status =====
+head: error reading '/sys/kernel/debug/dri/1/i915_edp_psr_status': No such device
+===== /sys/kernel/debug/dri/1/i915_engine_info =====
+GT awake? no [0], 65068ms
+CS timestamp frequency: 12500000 Hz, 80 ns
+rcs0
+	Awake? 0
+	Barriers?: no
+	Latency: 78us
+	Forcewake: 0 domains, 0 active
+	Reset count: 0 (global 0)
+	Properties:
+		heartbeat_interval_ms: 2500 [default 2500]
+		max_busywait_duration_ns: 8000 [default 8000]
+		preempt_timeout_ms: 640 [default 640]
+		stop_timeout_ms: 100 [default 100]
+		timeslice_duration_ms: 1 [default 1]
+	Requests:
+	On hold?: 0
+	MMIO base:  0x00002000
+	CCID: 0x7ffa3109
+	RING_START: 0x7fffa000
+	RING_HEAD:  0x00001fa0
+	RING_TAIL:  0x00001fa0
+	RING_CTL:   0x00003001
+	RING_MODE:  0x00004200 [idle]
+	RING_IMR:   0xffffffdf
+	RING_ESR:   0x00000000
+	RING_EMR:   0xffffffff
+	RING_EIR:   0x00000000
+	ACTHD:  0x00000000_20201fa0
+	BBADDR: 0x00000000_01f7cad4
+	DMA_FADDR: 0x00000000_7fffbfa0
+	IPEIR: 0x00000000
+	IPEHR: 0x780c0000
+	PP_DIR_BASE: 0x7fda0000
+	PP_DIR_BASE_READ: 0x00000000
+	PP_DIR_DCLV: 0xffffffff
+HWSP:
+[0000] 00000001 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+[0020] 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+*
+[0100] 00002aa6 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+[0120] 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+*
+Idle? yes
+IRQ: disabled
+bcs0
+	Awake? 0
+	Barriers?: no
+	Latency: 49us
+	Forcewake: 0 domains, 0 active
+	Reset count: 0 (global 0)
+	Properties:
+		heartbeat_interval_ms: 2500 [default 2500]
+		max_busywait_duration_ns: 8000 [default 8000]
+		preempt_timeout_ms: 640 [default 640]
+		stop_timeout_ms: 100 [default 100]
+		timeslice_duration_ms: 1 [default 1]
+	Requests:
+	On hold?: 0
+	MMIO base:  0x00022000
+	RING_START: 0x7fd9c000
+	RING_HEAD:  0x00000630
+	RING_TAIL:  0x00000630
+	RING_CTL:   0x00003001
+	RING_MODE:  0x00000200 [idle]
+	RING_IMR:   0xffffffff
+	RING_ESR:   0x00000000
+	RING_EMR:   0xffffffff
+	RING_EIR:   0x00000000
+	ACTHD:  0x00000000_00000630
+	BBADDR: 0x00000000_00000000
+	DMA_FADDR: 0x00000000_7fd9c630
+	IPEIR: 0x00000000
+	IPEHR: 0x00000000
+	PP_DIR_BASE: 0x7fda0000
+	PP_DIR_BASE_READ: 0x00000000
+	PP_DIR_DCLV: 0xffffffff
+HWSP:
+[0000] 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+*
+[0100] 00000003 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+[0120] 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+*
+Idle? yes
+IRQ: disabled
+vcs0
+	Awake? 0
+	Barriers?: no
+	Latency: 42us
+	Forcewake: 0 domains, 0 active
+	Reset count: 0 (global 0)
+	Properties:
+		heartbeat_interval_ms: 2500 [default 2500]
+		max_busywait_duration_ns: 8000 [default 8000]
+		preempt_timeout_ms: 640 [default 640]
+		stop_timeout_ms: 100 [default 100]
+		timeslice_duration_ms: 1 [default 1]
+	Requests:
+	On hold?: 0
+	MMIO base:  0x00012000
+	RING_START: 0x7fd98000
+===== /sys/kernel/debug/dri/1/i915_error_state =====
+===== /sys/kernel/debug/dri/1/i915_fbc_false_color =====
+0
+===== /sys/kernel/debug/dri/1/i915_fbc_status =====
+FBC disabled: disabled per module param or by default
+  [PLANE:33:primary A]: disabled per module param or by default
+===== /sys/kernel/debug/dri/1/i915_fifo_underrun_reset =====
+head: error reading '/sys/kernel/debug/dri/1/i915_fifo_underrun_reset': Invalid argument
+===== /sys/kernel/debug/dri/1/i915_forcewake_user =====
+head: error reading '/sys/kernel/debug/dri/1/i915_forcewake_user': Invalid argument
+===== /sys/kernel/debug/dri/1/i915_frequency_info =====
+Video Turbo Mode: yes
+HW control enabled: yes
+SW control enabled: no
+PM IER=0x00000400 IMR=0xffffffff, MASK=0x0000007a
+PM ISR=0x00000000 IIR=0x00000000
+pm_intrmsk_mbz: 0x00000004
+GT_PERF_STATUS: 0x00000400
+Render p-state ratio: 4
+Render p-state VID: 0
+Render p-state limit: 255
+RPSTAT1: 0x00048200
+RPMODECTL: 0x00000d92
+RPINCLIMIT: 0x00001cfe
+RPDECLIMIT: 0x00005302
+RPNSWREQ: 200MHz
+CAGF: 200MHz
+RP CUR UP EI: 3067 (3925760ns)
+RP CUR UP: 31 (39680ns)
+RP PREV UP: 0 (0ns)
+Up threshold: 95%
+RP UP EI: 7813 (10000640ns)
+RP UP THRESHOLD: 7422 (9500160ns)
+RP CUR DOWN EI: 9302 (11906560ns)
+RP CUR DOWN: 259 (331520ns)
+RP PREV DOWN: 0 (0ns)
+Down threshold: 85%
+RP DOWN EI: 25000 (32000000ns)
+RP DOWN THRESHOLD: 21250 (27200000ns)
+Lowest (RPN) frequency: 200MHz
+Nominal (RP1) frequency: 200MHz
+Max non-overclocked (RP0) frequency: 1200MHz
+Max overclocked frequency: 1200MHz
+Current freq: 200 MHz
+Actual freq: 200 MHz
+Idle freq: 200 MHz
+Min freq: 200 MHz
+Boost freq: 1200 MHz
+Max freq: 1200 MHz
+efficient (RPe) frequency: 200 MHz
+===== /sys/kernel/debug/dri/1/i915_frontbuffer_tracking =====
+FB tracking busy bits: 0x00000000
+FB tracking flip bits: 0x00000000
+===== /sys/kernel/debug/dri/1/i915_gem_drop_caches =====
+0x000003ff
+===== /sys/kernel/debug/dri/1/i915_gem_framebuffer =====
+fbcon size: 2880 x 1800, depth 24, 32 bpp, modifier 0x100000000000001, refcount 1, obj 00000000cd0b9c5d: X      20700KiB 41 00  WT (ggtt offset: 00000000, size: 01437000, pages: 4K, normal , fence: 0) (pinned x 1) (stolen: 00000000) (fb)
+user size: 2880 x 1800, depth 30, 32 bpp, modifier 0x100000000000001, refcount 3, obj 0000000095c59089: X      24576KiB 3e 00  WT dirty (ggtt offset: 06500000, size: 01814000, pages: 4K, normal) (pinned x 1) (fb)
+user size: 64 x 64, depth 32, 32 bpp, modifier 0x0, refcount 3, obj 00000000e2af50f2:           16KiB 01 00  WT dirty (ggtt offset: 0144c000, size: 00004000, pages: , normal) (pinned x 1) (fb)
+===== /sys/kernel/debug/dri/1/i915_gem_objects =====
+360 shrinkable [0 free] objects, 412012544 bytes
+system: total:0x00000003def98000 bytes
+stolen-system: total:0x0000000006000000 bytes
+===== /sys/kernel/debug/dri/1/i915_gpu_info =====
+Kernel: 6.17.1-300.fc43.x86_64 x86_64
+Time: 1785879036 s 525177 us
+Boottime: 1114 s 357994 us
+Uptime: 1110 s 930841 us
+Capture: 4295781524 jiffies; 1 ms ago
+Reset count: 0
+Suspend count: 0
+Platform: HASWELL
+Subplatform: 0x0
+PCI ID: 0x0d26
+PCI Revision: 0x08
+PCI Subsystem: 106b:0147
+IOMMU enabled?: 0
+RPM wakelock: yes
+PM suspended: no
+GT awake: no
+CS timestamp frequency: 12500000 Hz, 80 ns
+EIR: 0x00000000
+PGTBL_ER: 0x00000000
+GTIER[0]: 0x00401821
+  fence[0] = 143605b00000001
+  fence[1] = 00000000
+  fence[2] = 00000000
+  fence[3] = 00000000
+  fence[4] = 00000000
+  fence[5] = 00000000
+  fence[6] = 00000000
+  fence[7] = 00000000
+  fence[8] = 00000000
+  fence[9] = 00000000
+  fence[10] = 00000000
+  fence[11] = 00000000
+  fence[12] = 00000000
+  fence[13] = 00000000
+  fence[14] = 00000000
+  fence[15] = 00000000
+  fence[16] = 00000000
+  fence[17] = 00000000
+  fence[18] = 00000000
+  fence[19] = 00000000
+  fence[20] = 00000000
+  fence[21] = 00000000
+  fence[22] = 00000000
+  fence[23] = 00000000
+  fence[24] = 00000000
+  fence[25] = 00000000
+  fence[26] = 00000000
+  fence[27] = 00000000
+  fence[28] = 00000000
+  fence[29] = 00000000
+  fence[30] = 00000000
+  fence[31] = 00000000
+FORCEWAKE: 0x00000001
+ERROR: 0x00000000
+DONE_REG: 0xffffffff
+ERR_INT: 0x00000000
+available engines: 40403
+slice total: 2, mask=0003
+subslice total: 4
+slice0: 2 subslices, mask=00000003
+slice1: 2 subslices, mask=00000003
+EU total: 40
+EU per subslice: 10
+has slice power gating: no
+has subslice power gating: no
+has EU power gating: no
+slice0: 2 subslice(s) (0x00000003):
+	subslice0: 10 EUs (0x3ff)
+	subslice1: 10 EUs (0x3ff)
+slice1: 2 subslice(s) (0x00000003):
+	subslice0: 10 EUs (0x3ff)
+	subslice1: 10 EUs (0x3ff)
+graphics version: 7
+media version: 7
+graphics stepping: **
+media stepping: **
+gt: 3
+memory-regions: 0x21
+page-sizes: 0x1000
+platform: HASWELL
+ppgtt-size: 31
+ppgtt-type: 1
+dma_mask_size: 40
+is_mobile: no
+require_force_probe: no
+is_dgfx: no
+has_64bit_reloc: no
+has_64k_pages: no
+gpu_reset_clobbers_display: no
+has_reset_engine: yes
+has_3d_pipeline: yes
+has_flat_ccs: no
+has_global_mocs: no
+has_gmd_id: no
+has_gt_uc: no
+has_heci_pxp: no
+has_heci_gscfi: no
+has_guc_deprivilege: no
+has_guc_tlb_invalidation: no
+has_l3_ccs_read: no
+===== /sys/kernel/debug/dri/1/i915_hpd_short_storm_ctl =====
+Enabled: no
+===== /sys/kernel/debug/dri/1/i915_hpd_storm_ctl =====
+Threshold: 50
+Detected: no
+===== /sys/kernel/debug/dri/1/i915_ignore_long_hpd =====
+N
+===== /sys/kernel/debug/dri/1/i915_lpsp_status =====
+LPSP: enabled
+===== /sys/kernel/debug/dri/1/i915_opregion =====
+IntelGraphicsMem                                      1215                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       ˇ  Ä  Äd  Ä Ää3îLûf®≤ôº≤∆Ã–Â⁄ˇ‰                                                                                                            >                                                                                                 $VBT HASWELL        d 0 ç^ 0                   BIOS_DATA_BLOCK Ω  ]˛Í  d1215Intel(R) HSW Mobile/Desktop PCI Accelerated SVGA BIOS
+Build Number: 1215 PC 14.34  12/13/2012  10:16:59
+DECOMPILATION OR DISASSEMBLY PROHIBITED
+        Copyright (C) 2000-2011 Intel Corp. All Rights Reserved.
+
+  ¿      ˝2 	H@( A@! D@ E@ d I ) L@ $  ,      ! ∆x            
+       @        ÷` î	                  @ ÷` ¶	                     “` ∏	                                                                                                                                                          02468:<@BDFHJLPRTVXZ\ÄÅÇÉÑ ¸Æ            0 I
+ r( ü ©8 M» Î	  
+ !
+ 4
+ _ £ µ « Ÿ Ó
+ ¯
+ 
+ 
+ 
+ #
+ -
+ 7
+                                                                 u ¸ˇÄ      Ä     Ä       é) Äú     ú     	     
+                                                  ˇˇ ˛ˇŒ ˇˇ= ¸ˇ@   D     H     L   P     T    X     ˇˇ	`   2 2   2 2   2 2   2 2   2 2   2 2   2 2   2 2   2 2   2 2   2 2   2 2   2 2   2 2   2 2   2 2 
+À 
+        ˇˇ        ˇˇ        ˇˇ        ˇˇ        ˇˇ        ˇˇ        ˇˇ        ˇˇ        ˇˇ        ˇˇ        ˇˇ        ˇˇ        ˇˇ        ˇˇ        ˇˇ        ˇˇ        ˇˇ        ˇˇ        ˇˇ        ˇˇ  « !Ä              p             Ä              r             Ä                               Ä                               Ä                               Ä                                J  <Ñ     U  ˇü x 
+	 Z j- ã 	
+                                                                                          	                                                                  û       <                        <                        <                        <                        <                        <                  K              0Ñ  LFP_PanelNameLFP_PanelNameLFP_PanelNameLFP_PanelNameH d @A &0à6      0* òQ 0@0p      ®/x‡Q&@Xò      H?@0b∞2@@¿      ( 6     6     6ê    6     (  ˙ ˙  ê        » @ @ @ @ ,@ @ @ @ ,   –
+ –Ùà–
+ –Ùà–
+ –Ùà–
+ –Ùà–
+ –Ùà–
+ –Ùà–
+ –Ùà–
+ –Ùà–
+ –Ùà–
+ –Ùà–
+ –Ùà–
+ –Ùà–
+ –Ùà–
+ –Ùà–
+ –Ùà–
+ –Ùà      1                    ˇˇ                                                                    6 ÷	Äê ‡`"      ÷	Äê ‡`"      ÷	Äê ‡`"      4  	           @A D !$`                \   	      @ D H A             ! A H    @   H D ` $ (   @     @   	 (                                   (  s                 ™™™™)î  BT
+^ Ññ
+† ∆ÿ
+‚ 
+$ J\
+f åû
+® Œ‡
+Í "
+, Rd
+n î¶
+∞ ÷Ë
+Ú *
+4 Zl
+v úÆ
+∏ ﬁ
+˙  2
+<*Ä‡Ä    r –Xr –Ùr ' ˇˇ÷	Äê ‡`"      6      XÄ    r –Xr –Ùr ' ˇˇ†  1X (Ä      6       Ä    r –Xr –Ùr ' ˇˇd @A &0à6      6       Ä <  r –Xr –Ùr ' ˇˇ0* òQ 0@0p      6     xÄ <  r –Xr –Ùr ' ˇˇ0*x Q@p      6ê    xÄ <  r –Xr –Ùr ' ˇˇ®/x‡Q&@Xò      6ê    @∞Ä <  r –Xr –Ùr ' ˇˇH?@0b∞2@@¿      6     V Ä    r –Xr –Ùr ' ˇˇf!V™Q 0Fê      6ê    êÄ <  r –Xr –Ùr ' ˇˇ|.ê†`@0 6      6ê	    Ä∞Ä <  r –Xr –Ùr ' ˇˇ(<Ä†p∞#@0 *      6ê
+    †ÑÄ    r –Xr –Ùr ' ˇˇö)†–QÑ"0Pô      6     @ÑÄ    r –Xr –Ùr ' ˇˇ0*@»`Ñd0Q      6       Ä    r –Xr –Ùr ' ˇˇd @A &0à6      6       Ä    r –Xr –Ùr ' ˇˇÍ †P 00C      6ê    Ä8Ä    r –Xr –Ùr ' ˇˇ:Äq8-@X-6      6       Ä <  r –Xr –Ùr ' ˇˇ)@ `Ä `      6     LFP_PanelNameLFP_PanelNameLFP_PanelNameLFP_PanelNameLFP_PanelNameLFP_PanelNameLFP_PanelNameLFP_PanelNameLFP_PanelNameLFP_PanelNameLFP_PanelNameLFP_PanelNameLFP_PanelNameLFP_PanelNameLFP_PanelNameLFP_PanelName                  +q J' X™J»  X™J»  X™J»  X™J»  X™J»  X™J»  X™J»  X™J»  X™J»  X™J»  X™J»  X™J»  X™J»  X™J»  X™J»  X™ˇˇˇˇˇˇˇˇˇˇˇˇˇˇˇˇ, âF   I 
+ U P d ,ñ Ë.∞  àààààààààà àààààààààà àààààààààà àààààààààà àààààààààà àààààààààà àààààààààà àààààààààà àààààààààà àààààààààà àààààààààà àààààààààà àààààààààà àààààààààà àààààààààà àààààààààà                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   ===== /sys/kernel/debug/dri/1/i915_params =====
+head: error reading '/sys/kernel/debug/dri/1/i915_params': Is a directory
+===== /sys/kernel/debug/dri/1/i915_perf_noa_delay =====
+500000
+===== /sys/kernel/debug/dri/1/i915_power_domain_info =====
+Runtime power status: enabled
+Power well/domain         Use count
+always-on                 7
+  DISPLAY_CORE            1
+  PIPE_A                  1
+  PIPE_B                  0
+  PIPE_C                  0
+  PIPE_D                  0
+  PIPE_PANEL_FITTER_A     0
+  PIPE_PANEL_FITTER_B     0
+  PIPE_PANEL_FITTER_C     0
+  PIPE_PANEL_FITTER_D     0
+  TRANSCODER_A            0
+  TRANSCODER_B            0
+  TRANSCODER_C            0
+  TRANSCODER_D            0
+  TRANSCODER_EDP          1
+  TRANSCODER_DSI_A        0
+  TRANSCODER_DSI_C        0
+  TRANSCODER_VDSC_PW2     0
+  PORT_DDI_LANES_A        1
+  PORT_DDI_LANES_B        0
+  PORT_DDI_LANES_C        0
+  PORT_DDI_LANES_D        0
+  PORT_DDI_LANES_E        0
+  PORT_DDI_LANES_F        0
+  PORT_DDI_LANES_TC1      0
+  PORT_DDI_LANES_TC2      0
+  PORT_DDI_LANES_TC3      0
+  PORT_DDI_LANES_TC4      0
+  PORT_DDI_LANES_TC5      0
+  PORT_DDI_LANES_TC6      0
+  PORT_DDI_IO_A           1
+  PORT_DDI_IO_B           0
+  PORT_DDI_IO_C           0
+  PORT_DDI_IO_D           0
+  PORT_DDI_IO_E           0
+  PORT_DDI_IO_F           0
+  PORT_DDI_IO_TC1         0
+  PORT_DDI_IO_TC2         0
+  PORT_DDI_IO_TC3         0
+  PORT_DDI_IO_TC4         0
+  PORT_DDI_IO_TC5         0
+  PORT_DDI_IO_TC6         0
+  PORT_DSI                0
+  PORT_CRT                0
+  PORT_OTHER              0
+  VGA                     0
+  AUDIO_MMIO              0
+  AUDIO_PLAYBACK          0
+  AUX_IO_A                0
+  AUX_IO_B                0
+  AUX_IO_C                0
+  AUX_IO_D                0
+  AUX_IO_E                0
+  AUX_IO_F                0
+  AUX_A                   1
+  AUX_B                   0
+  AUX_C                   0
+  AUX_D                   0
+  AUX_E                   0
+  AUX_F                   0
+  AUX_USBC1               0
+  AUX_USBC2               0
+  AUX_USBC3               0
+  AUX_USBC4               0
+  AUX_USBC5               0
+  AUX_USBC6               0
+  AUX_TBT1                0
+  AUX_TBT2                0
+  AUX_TBT3                0
+  AUX_TBT4                0
+  AUX_TBT5                0
+  AUX_TBT6                0
+  GMBUS                   0
+  GT_IRQ                  1
+  DC_OFF                  0
+  TC_COLD_OFF             0
+  INIT                    0
+display                   0
+  PIPE_B                  0
+  PIPE_C                  0
+  PIPE_PANEL_FITTER_A     0
+  PIPE_PANEL_FITTER_B     0
+  PIPE_PANEL_FITTER_C     0
+  TRANSCODER_A            0
+  TRANSCODER_B            0
+  TRANSCODER_C            0
+  PORT_DDI_LANES_B        0
+  PORT_DDI_LANES_C        0
+  PORT_DDI_LANES_D        0
+  PORT_CRT                0
+  VGA                     0
+  AUDIO_MMIO              0
+  AUDIO_PLAYBACK          0
+  INIT                    0
+===== /sys/kernel/debug/dri/1/i915_pri_wm_latency =====
+WM0 20 (2.0 usec)
+WM1 4 (2.0 usec)
+WM2 36 (18.0 usec)
+WM3 70 (35.0 usec)
+WM4 160 (80.0 usec)
+===== /sys/kernel/debug/dri/1/i915_rps_boost_info =====
+RPS enabled? yes
+RPS active? no
+GPU busy? no
+Boosts outstanding? 0
+Interactive? 4
+Frequency requested 200, actual 200
+  min hard:200, soft:200; max soft:1200, hard:1200
+  idle:200, efficient:200, boost:1200
+Wait boosts: 27
+===== /sys/kernel/debug/dri/1/i915_runtime_pm_status =====
+GPU idle: yes
+IRQs disabled: no
+Usage count: 7
+PCI device power state: D0 [0]
+===== /sys/kernel/debug/dri/1/i915_shared_dplls_info =====
+PLL refclks: non-SSC: 135000 kHz, SSC: 135000 kHz
+DPLL0: WRPLL 1, id: 0
+ pipe_mask: 0x0, active: 0x0, on: no
+ tracked hardware state:
+dpll_hw_state: wrpll: 0x202418 spll: 0x0
+DPLL1: WRPLL 2, id: 1
+ pipe_mask: 0x0, active: 0x0, on: no
+ tracked hardware state:
+dpll_hw_state: wrpll: 0x202418 spll: 0x0
+DPLL2: SPLL, id: 2
+ pipe_mask: 0x0, active: 0x0, on: no
+ tracked hardware state:
+dpll_hw_state: wrpll: 0x0 spll: 0x0
+DPLL3: LCPLL 810, id: 3
+ pipe_mask: 0x0, active: 0x0, on: no
+ tracked hardware state:
+dpll_hw_state: wrpll: 0x0 spll: 0x0
+DPLL4: LCPLL 1350, id: 4
+ pipe_mask: 0x1, active: 0x1, on: yes
+ tracked hardware state:
+dpll_hw_state: wrpll: 0x0 spll: 0x0
+DPLL5: LCPLL 2700, id: 5
+ pipe_mask: 0x0, active: 0x0, on: no
+ tracked hardware state:
+dpll_hw_state: wrpll: 0x0 spll: 0x0
+===== /sys/kernel/debug/dri/1/i915_spr_wm_latency =====
+WM0 20 (2.0 usec)
+WM1 4 (2.0 usec)
+WM2 36 (18.0 usec)
+WM3 70 (35.0 usec)
+WM4 160 (80.0 usec)
+===== /sys/kernel/debug/dri/1/i915_sr_status =====
+self-refresh: enabled
+===== /sys/kernel/debug/dri/1/i915_sseu_status =====
+head: error reading '/sys/kernel/debug/dri/1/i915_sseu_status': No such device
+===== /sys/kernel/debug/dri/1/i915_swizzle_info =====
+bit6 swizzle for X-tiling = bit9/bit10
+bit6 swizzle for Y-tiling = bit9
+MAD_DIMM_C0 = 0x00620020
+MAD_DIMM_C1 = 0x00620020
+MAD_DIMM_C2 = 0x00600000
+TILECTL = 0x00000001
+ARB_MODE = 0x00000020
+DISP_ARB_CTL = 0x16663056
+===== /sys/kernel/debug/dri/1/i915_vbt =====
+$VBT HASWELL        d 0 ç^ 0                   BIOS_DATA_BLOCK Ω  ]˛Í  d1215Intel(R) HSW Mobile/Desktop PCI Accelerated SVGA BIOS
+Build Number: 1215 PC 14.34  12/13/2012  10:16:59
+DECOMPILATION OR DISASSEMBLY PROHIBITED
+        Copyright (C) 2000-2011 Intel Corp. All Rights Reserved.
+
+  ¿      ˝2 	H@( A@! D@ E@ d I ) L@ $  ,      ! ∆x            
+       @        ÷` î	                  @ ÷` ¶	                     “` ∏	                                                                                                                                                          02468:<@BDFHJLPRTVXZ\ÄÅÇÉÑ ¸Æ            0 I
+ r( ü ©8 M» Î	  
+ !
+ 4
+ _ £ µ « Ÿ Ó
+ ¯
+ 
+ 
+ 
+ #
+ -
+ 7
+                                                                 u ¸ˇÄ      Ä     Ä       é) Äú     ú     	     
+                                                  ˇˇ ˛ˇŒ ˇˇ= ¸ˇ@   D     H     L   P     T    X     ˇˇ	`   2 2   2 2   2 2   2 2   2 2   2 2   2 2   2 2   2 2   2 2   2 2   2 2   2 2   2 2   2 2   2 2 
+À 
+        ˇˇ        ˇˇ        ˇˇ        ˇˇ        ˇˇ        ˇˇ        ˇˇ        ˇˇ        ˇˇ        ˇˇ        ˇˇ        ˇˇ        ˇˇ        ˇˇ        ˇˇ        ˇˇ        ˇˇ        ˇˇ        ˇˇ        ˇˇ  « !Ä              p             Ä              r             Ä                               Ä                               Ä                               Ä                                J  <Ñ     U  ˇü x 
+	 Z j- ã 	
+                                                                                          	                                                                  û       <                        <                        <                        <                        <                        <                  K              0Ñ  LFP_PanelNameLFP_PanelNameLFP_PanelNameLFP_PanelNameH d @A &0à6      0* òQ 0@0p      ®/x‡Q&@Xò      H?@0b∞2@@¿      ( 6     6     6ê    6     (  ˙ ˙  ê        » @ @ @ @ ,@ @ @ @ ,   –
+ –Ùà–
+ –Ùà–
+ –Ùà–
+ –Ùà–
+ –Ùà–
+ –Ùà–
+ –Ùà–
+ –Ùà–
+ –Ùà–
+ –Ùà–
+ –Ùà–
+ –Ùà–
+ –Ùà–
+ –Ùà–
+ –Ùà–
+ –Ùà      1                    ˇˇ                                                                    6 ÷	Äê ‡`"      ÷	Äê ‡`"      ÷	Äê ‡`"      4  	           @A D !$`                \   	      @ D H A             ! A H    @   H D ` $ (   @     @   	 (                                   (  s                 ™™™™)î  BT
+^ Ññ
+† ∆ÿ
+‚ 
+$ J\
+f åû
+® Œ‡
+Í "
+, Rd
+n î¶
+∞ ÷Ë
+Ú *
+4 Zl
+v úÆ
+∏ ﬁ
+˙  2
+<*Ä‡Ä    r –Xr –Ùr ' ˇˇ÷	Äê ‡`"      6      XÄ    r –Xr –Ùr ' ˇˇ†  1X (Ä      6       Ä    r –Xr –Ùr ' ˇˇd @A &0à6      6       Ä <  r –Xr –Ùr ' ˇˇ0* òQ 0@0p      6     xÄ <  r –Xr –Ùr ' ˇˇ0*x Q@p      6ê    xÄ <  r –Xr –Ùr ' ˇˇ®/x‡Q&@Xò      6ê    @∞Ä <  r –Xr –Ùr ' ˇˇH?@0b∞2@@¿      6     V Ä    r –Xr –Ùr ' ˇˇf!V™Q 0Fê      6ê    êÄ <  r –Xr –Ùr ' ˇˇ|.ê†`@0 6      6ê	    Ä∞Ä <  r –Xr –Ùr ' ˇˇ(<Ä†p∞#@0 *      6ê
+    †ÑÄ    r –Xr –Ùr ' ˇˇö)†–QÑ"0Pô      6     @ÑÄ    r –Xr –Ùr ' ˇˇ0*@»`Ñd0Q      6       Ä    r –Xr –Ùr ' ˇˇd @A &0à6      6       Ä    r –Xr –Ùr ' ˇˇÍ †P 00C      6ê    Ä8Ä    r –Xr –Ùr ' ˇˇ:Äq8-@X-6      6       Ä <  r –Xr –Ùr ' ˇˇ)@ `Ä `      6     LFP_PanelNameLFP_PanelNameLFP_PanelNameLFP_PanelNameLFP_PanelNameLFP_PanelNameLFP_PanelNameLFP_PanelNameLFP_PanelNameLFP_PanelNameLFP_PanelNameLFP_PanelNameLFP_PanelNameLFP_PanelNameLFP_PanelNameLFP_PanelName                  +q J' X™J»  X™J»  X™J»  X™J»  X™J»  X™J»  X™J»  X™J»  X™J»  X™J»  X™J»  X™J»  X™J»  X™J»  X™J»  X™ˇˇˇˇˇˇˇˇˇˇˇˇˇˇˇˇ, âF   I 
+ U P d ,ñ Ë.∞  àààààààààà àààààààààà àààààààààà àààààààààà àààààààààà àààààààààà àààààààààà àààààààààà àààààààààà àààààààààà àààààààààà àààààààààà àààààààààà àààààààààà àààààààààà àààààààààà                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   ===== /sys/kernel/debug/dri/1/i915_wa_registers =====
+rcs0: Workarounds applied: 1
+0x20C0: 0x00800080, mask: 0x00000000
+
+===== /sys/kernel/debug/dri/1/i915_wedged =====
+0
