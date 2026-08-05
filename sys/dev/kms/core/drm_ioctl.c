@@ -734,7 +734,81 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 			}
 		}
 #else
-		(void)fb; (void)gem; (void)i;
+		/*
+		 * x86 DIRTYFB flush.  GEM pages carry
+		 * VM_MEMATTR_WRITE_COMBINING; Xorg's XRender writes sit in
+		 * per-CPU WC combining buffers until SFENCE or an uncached
+		 * read.  Without draining them here, display DMA reads
+		 * stale DRAM even though pmap sees the PTE as dirty.
+		 *
+		 * SFENCE serialises the WC buffer on THIS CPU; CLFLUSH via
+		 * pmap_invalidate_cache_range crosses all CPUs via IPI and
+		 * forcibly evicts the WC line for the addressed range.
+		 * Together they guarantee that when the ioctl returns,
+		 * DRAM reflects every user-space write in the fb.
+		 *
+		 * This is what let Xorg light up on real i915: modesetting_
+		 * drv issues DIRTYFB on damage and expects the kernel to
+		 * make the writes visible.  Our aarch64 branch above does
+		 * the equivalent with dcache_wb_range.  x86 was a no-op
+		 * before 2026-08-05 — see project_igen_xorg_xrender_2026_08_05.
+		 */
+		gem = (fb->gem_objs[0] != NULL &&
+		    fb->gem_objs[0]->pages != NULL &&
+		    fb->gem_objs[0]->npages > 0) ? fb->gem_objs[0] : NULL;
+		__asm__ volatile("sfence" ::: "memory");
+		if (gem != NULL) {
+			if (dc->num_clips > 0 && dc->num_clips <= 64 &&
+			    dc->clips_ptr != 0 && fb->pitches[0] > 0) {
+				struct drm_clip_rect clips[64];
+				uint32_t nclips = dc->num_clips;
+				uint32_t pitch = fb->pitches[0];
+				uint32_t plane_off = fb->offsets[0];
+				int err;
+
+				err = copyin((void *)(uintptr_t)dc->clips_ptr,
+				    clips, nclips * sizeof(clips[0]));
+				if (err != 0) {
+					kms_mode_object_put(obj);
+					return (err);
+				}
+				for (i = 0; i < nclips; i++) {
+					uint32_t y1 = clips[i].y1;
+					uint32_t y2 = clips[i].y2;
+					uint32_t off_lo, off_hi, p_lo, p_hi, p;
+
+					if (y2 <= y1 || y1 >= fb->height)
+						continue;
+					if (y2 > fb->height)
+						y2 = fb->height;
+					off_lo = plane_off + y1 * pitch;
+					off_hi = plane_off + y2 * pitch;
+					p_lo = off_lo / PAGE_SIZE;
+					p_hi = (off_hi + PAGE_SIZE - 1) /
+					    PAGE_SIZE;
+					if (p_hi > gem->npages)
+						p_hi = gem->npages;
+					for (p = p_lo; p < p_hi; p++) {
+						vm_paddr_t ppa =
+						    VM_PAGE_TO_PHYS(gem->pages[p]);
+						void *va = (void *)
+						    PHYS_TO_DMAP(ppa);
+						pmap_invalidate_cache_range(
+						    (vm_offset_t)va,
+						    (vm_offset_t)va + PAGE_SIZE);
+					}
+				}
+			} else {
+				for (i = 0; i < gem->npages; i++) {
+					vm_paddr_t ppa =
+					    VM_PAGE_TO_PHYS(gem->pages[i]);
+					void *va = (void *)PHYS_TO_DMAP(ppa);
+					pmap_invalidate_cache_range(
+					    (vm_offset_t)va,
+					    (vm_offset_t)va + PAGE_SIZE);
+				}
+			}
+		}
 #endif
 		kms_mode_object_put(obj);
 		return (0);
