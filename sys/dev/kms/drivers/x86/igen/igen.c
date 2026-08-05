@@ -512,8 +512,16 @@ igen_sysctl_paint_efi_fb(SYSCTL_HANDLER_ARGS)
 	 * memory triggers HW machine check on Iris Pro 5200.
 	 */
 	off = APPLE_EFI_FB_GTT_VA;
+	/*
+	 * ~5.18M bus_write_4 calls at ~2560*1600*4 bytes.  On slower cores
+	 * that's tens of milliseconds under a sysctl call — long enough to
+	 * starve preemption if we hold the CPU straight through.  Yield
+	 * every 64 KiB (16k writes) so scheduler ticks get to run.
+	 */
 	for (i = 0; i < APPLE_EFI_FB_SIZE; i += 4) {
 		bus_write_4(sc->gmadr_res, off + i, color);
+		if ((i & 0xffff) == 0xfffc)
+			maybe_yield();
 	}
 	igen_w32(sc, PLANE_SURF(0), APPLE_EFI_FB_GTT_VA);
 	device_printf(sc->dev,
@@ -596,6 +604,10 @@ igen_sysctl_blit_efi_fb(SYSCTL_HANDLER_ARGS)
 		}
 		aperture_off += page_bytes;
 		bytes_left -= page_bytes;
+		/* Same rationale as paint_efi_fb: don't hog the CPU for the
+		 * whole ~5.18M aperture writes.  Yield every page (1024
+		 * writes) so the scheduler gets a chance. */
+		maybe_yield();
 	}
 
 	igen_w32(sc, PLANE_SURF(0), APPLE_EFI_FB_GTT_VA);

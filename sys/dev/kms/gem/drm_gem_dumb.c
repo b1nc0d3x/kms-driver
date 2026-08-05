@@ -39,6 +39,7 @@ kms_ioctl_mode_create_dumb(struct drm_file *file,
 	struct drm_gem_object *obj;
 	uint64_t size, pitch;
 	uint32_t handle;
+	uint32_t scanout_bpp;
 	int error;
 
 	if (file == NULL || args == NULL)
@@ -72,10 +73,12 @@ kms_ioctl_mode_create_dumb(struct drm_file *file,
 	 * Xorg's modesetting_drv on FreeBSD does exactly this on eDP
 	 * (bpp=24 into CREATE_DUMB); observed via drm_test2 (bpp=32,
 	 * clean) vs Xorg (bpp=24, corrupted) on MBP11,4 2026-08-04.
-	 * Promote to 32 so the pitch matches what the display fetches.
+	 * Compute pitch/size at 32 bpp so the buffer matches what HW
+	 * fetches, but leave args->bpp visible to userspace as the value
+	 * it asked for — Xorg's shadowfb sizing math relies on getting
+	 * back the bpp it requested.
 	 */
-	if (args->bpp == 24)
-		args->bpp = 32;
+	scanout_bpp = (args->bpp == 24) ? 32 : args->bpp;
 
 	/*
 	 * Overflow-checked geometry math (security rule 4).  Pitch is
@@ -83,7 +86,7 @@ kms_ioctl_mode_create_dumb(struct drm_file *file,
 	 * pitch * height.  All in 64-bit space; reject if size exceeds
 	 * the per-BO cap or overflows the user's __u64 return.
 	 */
-	pitch = (uint64_t)args->width * (args->bpp / 8);
+	pitch = (uint64_t)args->width * (scanout_bpp / 8);
 	if (pitch > UINT32_MAX || pitch == 0)
 		return (EINVAL);
 	pitch = (pitch + 63ULL) & ~63ULL;

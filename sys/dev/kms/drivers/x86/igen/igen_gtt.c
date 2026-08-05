@@ -93,13 +93,20 @@ MALLOC_DECLARE(M_KMS);
 #define	GTT_PTE_WRITEABLE	(1u << 1)	/* gen8+ only */
 
 /*
- * GTT_ENTRIES: bound to guard against write-anywhere via
- * caller-supplied entry_idx (H7 backstop).  Sized to a safe conservative
- * upper limit; HSW GGTT is up to 512 KiB entries (2 GiB), SKL+ is up to
- * 1 Mi entries (4 GiB).  Uses 1 Mi as the max and lets the per-gen
- * PTE_SIZE + BAR0 bounds catch anything beyond gen-specific max.
+ * Per-gen GGTT entry cap for the H7 backstop.  HSW GGTT is 2 GiB / 4 KiB
+ * = 512 Ki entries; SKL+ is 4 GiB / 4 KiB = 1 Mi entries.  The single 1
+ * Mi bound previously used let HSW writes land past the real GGTT into
+ * neighbouring MMIO at BAR0+0x400000..BAR0+0x600000 — real chip damage
+ * potential.  Gen-select for the exact cap and reject anything above.
  */
-#define	GTT_ENTRIES		0x00100000
+#define	HSW_GTT_ENTRIES		0x00080000	/* 512 Ki entries = 2 GiB */
+#define	SKL_GTT_ENTRIES		0x00100000	/* 1 Mi entries = 4 GiB */
+
+static inline uint32_t
+igen_gtt_entries(struct igen_softc *sc)
+{
+	return (sc->gen == IGEN_GEN_HSW ? HSW_GTT_ENTRIES : SKL_GTT_ENTRIES);
+}
 
 /*
  * Primary-plane registers needed for the page-flip path.  PLANE_SURF is
@@ -134,9 +141,9 @@ igen_gtt_read(struct igen_softc *sc, uint32_t entry_idx)
 {
 	uint32_t off, lo, hi;
 
-	if (entry_idx >= GTT_ENTRIES) {
+	if (entry_idx >= igen_gtt_entries(sc)) {
 		printf("igen: gtt_read entry_idx=0x%x out of range (max 0x%x)\n",
-		    entry_idx, GTT_ENTRIES - 1);
+		    entry_idx, igen_gtt_entries(sc) - 1);
 		return (0);
 	}
 	off = igen_gtt_base(sc) + entry_idx * igen_gtt_pte_size(sc);
@@ -154,10 +161,10 @@ igen_gtt_write(struct igen_softc *sc, uint32_t entry_idx,
 {
 	uint32_t off;
 
-	if (entry_idx >= GTT_ENTRIES) {
+	if (entry_idx >= igen_gtt_entries(sc)) {
 		printf("igen: gtt_write entry_idx=0x%x out of range (max 0x%x)"
 		    " — REFUSED (H7 backstop)\n",
-		    entry_idx, GTT_ENTRIES - 1);
+		    entry_idx, igen_gtt_entries(sc) - 1);
 		return;
 	}
 	off = igen_gtt_base(sc) + entry_idx * igen_gtt_pte_size(sc);
@@ -352,11 +359,12 @@ igen_gtt_bind_gem_at(struct igen_softc *sc, struct drm_gem_object *obj,
 	uint64_t first_page = ggtt_byte_addr / PAGE_SIZE;
 	uint64_t last_page = first_page + (uint64_t)obj->npages;
 	if (last_page < first_page ||	/* u64 wrap */
-	    last_page > (uint64_t)GTT_ENTRIES) {
+	    last_page > (uint64_t)igen_gtt_entries(sc)) {
 		device_printf(sc->dev,
 		    "gtt_bind_gem_at: softpin=0x%jx npages=%zu"
 		    " past GGTT ceiling (0x%x pages)\n",
-		    (uintmax_t)ggtt_byte_addr, obj->npages, GTT_ENTRIES);
+		    (uintmax_t)ggtt_byte_addr, obj->npages,
+		    igen_gtt_entries(sc));
 		return (EINVAL);
 	}
 

@@ -227,6 +227,28 @@ retry_alloc:
 	}
 
 	/*
+	 * One-shot boot log naming the memattr we requested.  If the
+	 * platform's PAT config falls back WC->UC (older hypervisors) or
+	 * WC->WB (broken PAT), scanout misbehaviour vs Xorg's XRender is
+	 * hard to distinguish from a genuine driver bug — this line makes
+	 * the intent grep-able from dmesg so an operator seeing black
+	 * panels can rule PAT out in one step.
+	 */
+	{
+		static bool memattr_logged = false;
+		if (!memattr_logged) {
+			memattr_logged = true;
+#ifdef __aarch64__
+			printf("kms/gem: scanout pages tagged "
+			    "VM_MEMATTR_UNCACHEABLE\n");
+#else
+			printf("kms/gem: scanout pages tagged "
+			    "VM_MEMATTR_WRITE_COMBINING (needs PAT slot)\n");
+#endif
+		}
+	}
+
+	/*
 	 * Pre-insert pages into the cdev_pager keyed on the GEM object
 	 * pointer.  cdev_pager_allocate is idempotent on (handle, ops),
 	 * so the userspace mmap path that calls it again with the same

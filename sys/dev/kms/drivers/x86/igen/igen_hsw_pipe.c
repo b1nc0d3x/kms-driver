@@ -489,14 +489,20 @@ igen_hsw_panel_on(struct igen_softc *sc)
 	 * them to match i915kms (leftover state persists across module
 	 * reloads).
 	 *
+	 * Gate on the Apple quirk: non-Apple HSW panels use PIPE_A as the
+	 * effective transcoder and need real M/N values there.  Zeroing
+	 * unconditionally would blank the panel on a non-Apple HSW eDP.
+	 *
 	 * TRANS_EDP_DP_LINK_M/N are left as firmware programmed them
 	 * (0x000a01e5 / 0x00080000 for the native 2880x1800 60 Hz mode);
 	 * see project_igen_apple_edp_handoff_2026_08_04.md.
 	 */
-	igen_w32(sc, HSW_PIPE_DATA_M(0), 0);
-	igen_w32(sc, HSW_PIPE_DATA_N(0), 0);
-	igen_w32(sc, HSW_PIPE_LINK_M(0), 0);
-	igen_w32(sc, HSW_PIPE_LINK_N(0), 0);
+	if ((sc->quirks & IGEN_QUIRK_APPLE_EDP_HANDOFF) != 0) {
+		igen_w32(sc, HSW_PIPE_DATA_M(0), 0);
+		igen_w32(sc, HSW_PIPE_DATA_N(0), 0);
+		igen_w32(sc, HSW_PIPE_LINK_M(0), 0);
+		igen_w32(sc, HSW_PIPE_LINK_N(0), 0);
+	}
 
 	/* PLANE configuration.  Defer SURF/STRIDE until scanout_fb is
 	 * actually populated by the caller (currently a separate sysctl).
