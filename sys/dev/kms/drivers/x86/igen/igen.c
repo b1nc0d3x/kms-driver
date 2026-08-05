@@ -454,6 +454,126 @@ igen_sysctl_bit_scan(SYSCTL_HANDLER_ARGS)
 }
 
 /*
+ * Apple HSW EFI-fb blit: firmware programmed PLANE_SURF = 0x05100000
+ * (GTT VA) which the GTT PTE resolves to phys 0x7EB01000 on MBP11,4.
+ * The display is scanning THAT physical page forever.  Rather than
+ * fight Xorg's dumb-buffer + PageFlip stack, memcpy pixels straight
+ * into the firmware-scanned phys page from kernel space via
+ * PHYS_TO_DMAP() and point DSPASURF back at the firmware VA.
+ *
+ * Two modes:
+ *   paint_efi_fb=<u32>:    fill EFI fb with solid color.
+ *   blit_efi_fb=1:         copy currently-armed PLANE_SURF fb → EFI fb.
+ *
+ * Both modes then restore DSPASURF=0x05100000 so the panel is guaranteed
+ * to be reading the phys page we just wrote.
+ */
+#define	APPLE_EFI_FB_GTT_VA	0x05100000u
+#define	APPLE_EFI_FB_STRIDE	11520u	/* 2880 × 4bpp */
+#define	APPLE_EFI_FB_WIDTH	2880u
+#define	APPLE_EFI_FB_HEIGHT	1800u
+#define	APPLE_EFI_FB_SIZE	(APPLE_EFI_FB_STRIDE * APPLE_EFI_FB_HEIGHT)
+
+/* Look up the phys addr firmware pointed the fb at by reading GTT PTE.
+ * Returns 0 on failure. */
+static vm_paddr_t
+igen_apple_efi_fb_phys(struct igen_softc *sc)
+{
+	uint32_t entry;
+	uint64_t pte;
+
+	entry = APPLE_EFI_FB_GTT_VA / PAGE_SIZE;
+	pte = igen_gtt_read(sc, entry);
+	if ((pte & 0x1ULL) == 0)		/* VALID bit */
+		return (0);
+	return ((vm_paddr_t)(pte & ~0xfffULL));
+}
+
+static int
+igen_sysctl_paint_efi_fb(SYSCTL_HANDLER_ARGS)
+{
+	struct igen_softc *sc = arg1;
+	unsigned int color = 0;
+	int error = sysctl_handle_int(oidp, &color, 0, req);
+	size_t i;
+	uint32_t off;
+
+	if (error || req->newptr == NULL)
+		return (error);
+	if ((sc->quirks & IGEN_QUIRK_APPLE_EDP_HANDOFF) == 0)
+		return (ENOTSUP);
+	if (sc->gmadr_res == NULL)
+		return (ENXIO);
+	/* Write through GTT aperture (BAR2) at the firmware-programmed
+	 * GTT VA.  Chipset does the address translation to the stolen-mem
+	 * phys page — CPU-safe, no MCE.  Direct PHYS_TO_DMAP on stolen
+	 * memory triggers HW machine check on Iris Pro 5200.
+	 */
+	off = APPLE_EFI_FB_GTT_VA;
+	for (i = 0; i < APPLE_EFI_FB_SIZE; i += 4) {
+		bus_write_4(sc->gmadr_res, off + i, color);
+	}
+	igen_w32(sc, PLANE_SURF(0), APPLE_EFI_FB_GTT_VA);
+	device_printf(sc->dev,
+	    "paint_efi_fb: 0x%08x written via BAR2 at GTT VA 0x%x,"
+	    " DSPASURF=0x%08x\n",
+	    color, APPLE_EFI_FB_GTT_VA, APPLE_EFI_FB_GTT_VA);
+	return (0);
+}
+
+static int
+igen_sysctl_blit_efi_fb(SYSCTL_HANDLER_ARGS)
+{
+	struct igen_softc *sc = arg1;
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+	vm_paddr_t src_phys;
+	uint32_t src_surf, src_entry;
+	uint64_t src_pte;
+	uint32_t *src;
+	size_t i;
+
+	if (error || req->newptr == NULL || trigger == 0)
+		return (error);
+	if ((sc->quirks & IGEN_QUIRK_APPLE_EDP_HANDOFF) == 0)
+		return (ENOTSUP);
+	if (sc->gmadr_res == NULL)
+		return (ENXIO);
+	src_surf = igen_r32(sc, PLANE_SURF(0));
+	if (src_surf == APPLE_EFI_FB_GTT_VA) {
+		device_printf(sc->dev,
+		    "blit_efi_fb: source == dest; nothing to do\n");
+		return (0);
+	}
+	src_entry = src_surf / PAGE_SIZE;
+	src_pte = igen_gtt_read(sc, src_entry);
+	if ((src_pte & 0x1ULL) == 0)
+		return (EINVAL);
+	src_phys = (vm_paddr_t)(src_pte & ~0xfffULL);
+
+	/* Source is a contigmalloc dumb buffer in system RAM — CPU-safe
+	 * via PHYS_TO_DMAP.  Destination is stolen mem — only reachable
+	 * via BAR2 aperture (bus_write_4).  Read src, write via BAR2.
+	 * pmap_invalidate_cache_range() flushes any WC/WB inconsistency
+	 * on the source view.
+	 */
+	src = (uint32_t *)PHYS_TO_DMAP(src_phys);
+	pmap_invalidate_cache_range((vm_offset_t)src,
+	    (vm_offset_t)src + APPLE_EFI_FB_SIZE);
+	for (i = 0; i < APPLE_EFI_FB_SIZE / 4; i++) {
+		bus_write_4(sc->gmadr_res, APPLE_EFI_FB_GTT_VA + i * 4,
+		    src[i]);
+	}
+
+	igen_w32(sc, PLANE_SURF(0), APPLE_EFI_FB_GTT_VA);
+	device_printf(sc->dev,
+	    "blit_efi_fb: %u bytes from phys 0x%llx via BAR2 aperture,"
+	    " DSPASURF=0x%08x\n",
+	    APPLE_EFI_FB_SIZE, (long long)src_phys, APPLE_EFI_FB_GTT_VA);
+	return (0);
+}
+
+/*
  * fb_scan: dump the first 32 dwords of every currently-bound user fb's
  * page 0, plus count non-zero and white (0xffffffff) pixels in the
  * first scanline.  For diagnosing "is Xorg actually writing to the fb"
@@ -538,6 +658,8 @@ igen_sysctl_fb_scan(SYSCTL_HANDLER_ARGS)
 static int	igen_sysctl_vbt_dump(SYSCTL_HANDLER_ARGS);
 /* igen_sysctl_hpd_dump lives in igen_hpd.c. */
 static int	igen_sysctl_cap_dump(SYSCTL_HANDLER_ARGS);
+static int	igen_sysctl_paint_efi_fb(SYSCTL_HANDLER_ARGS);
+static int	igen_sysctl_blit_efi_fb(SYSCTL_HANDLER_ARGS);
 /* DPLL/WRPLL/pw1 sysctl handlers live in igen_dpll.c. */
 static int	igen_sysctl_current_mode(SYSCTL_HANDLER_ARGS);
 /* GTT / scanout playground sysctl handlers live in igen_gtt.c. */
@@ -647,6 +769,18 @@ igen_re_sysctls_init(struct igen_softc *sc)
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
 	    sc, 0, igen_sysctl_fb_scan, "I",
 	    "write 1 to dump user fb page contents (row 0 + samples)");
+	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "paint_efi_fb",
+	    CTLTYPE_UINT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, igen_sysctl_paint_efi_fb, "IU",
+	    "Apple HSW: fill firmware EFI fb with a solid ARGB color and"
+	    " restore DSPASURF=0x05100000");
+	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "blit_efi_fb",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, igen_sysctl_blit_efi_fb, "I",
+	    "Apple HSW: copy currently-armed PLANE_SURF fb into firmware"
+	    " EFI fb and restore DSPASURF=0x05100000 (write 1)");
 	/* edid_read_b sysctl is owned by igen_gmbus.c. */
 	igen_gmbus_register_sysctls(sc);
 
