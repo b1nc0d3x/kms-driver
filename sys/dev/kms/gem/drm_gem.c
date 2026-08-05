@@ -180,7 +180,21 @@ retry_alloc:
 	     */
 	    VM_MEMATTR_UNCACHEABLE
 #else
-	    VM_MEMATTR_DEFAULT
+	    /*
+	     * x86: WRITE_COMBINING is the standard scanout memory attribute
+	     * (what Linux i915 uses for stolen + system scanout pages).
+	     * Xorg with modesetting_drv + ShadowFB off draws in-place into
+	     * the current front buffer WITHOUT triggering a page-flip, so
+	     * our per-scanout pmap_invalidate_cache_pages (in bind_user_fb)
+	     * only runs once — the first bind — and subsequent CPU writes
+	     * stay in WB cache while the display DMA reads stale DRAM.
+	     * WC empties the write-combining buffer on read/mfence and
+	     * bypasses the WB path so display always sees fresh data.
+	     * Observed on Iris Pro 5200 HSW: Xorg fb contained an orange
+	     * xterm (verified via xwd) but the display showed solid black
+	     * with WB; WC lets the xterm reach the panel.
+	     */
+	    VM_MEMATTR_WRITE_COMBINING
 #endif
 	    );
 	if (m == NULL) {
@@ -195,14 +209,18 @@ retry_alloc:
 	}
 	for (i = 0; i < npages; i++, m++) {
 		m->valid = VM_PAGE_BITS_ALL;
-#ifdef __aarch64__
 		/*
 		 * Per-page memattr backs the PTE created by pmap_enter when
-		 * userspace mmaps this BO.  Explicit set ensures Xorg's mmap
-		 * gets an UNCACHEABLE mapping so its writes reach DRAM in
-		 * time for the VOP scan-out.
+		 * userspace mmaps this BO.  Both arm64 (UNCACHEABLE) and
+		 * x86 (WRITE_COMBINING) need the explicit set to ensure
+		 * Xorg's mmap uses the same memattr as vm_page_alloc chose
+		 * for the physical pages — see vm_page_alloc_noobj_contig
+		 * call above for rationale.
 		 */
+#ifdef __aarch64__
 		pmap_page_set_memattr(m, VM_MEMATTR_UNCACHEABLE);
+#else
+		pmap_page_set_memattr(m, VM_MEMATTR_WRITE_COMBINING);
 #endif
 		obj->pages[i] = m;
 	}
@@ -215,15 +233,18 @@ retry_alloc:
 	 */
 	obj->pager = cdev_pager_allocate(obj, OBJT_MGTDEVICE,
 	    &drm_gem_pager_ops, size, 0, 0, NULL);
-#ifdef __aarch64__
 	/*
 	 * Set the pager's PTE-time memattr so any fault path that goes
-	 * through it still produces UNCACHEABLE PTEs.  Belt-and-braces
-	 * with the per-page memattr above.
+	 * through it still produces the correct memattr PTE.  Belt-and-
+	 * braces with the per-page memattr above.
 	 */
-	if (obj->pager != NULL)
+	if (obj->pager != NULL) {
+#ifdef __aarch64__
 		vm_object_set_memattr(obj->pager, VM_MEMATTR_UNCACHEABLE);
+#else
+		vm_object_set_memattr(obj->pager, VM_MEMATTR_WRITE_COMBINING);
 #endif
+	}
 	if (obj->pager == NULL) {
 		for (i = 0; i < npages; i++) {
 			vm_page_unwire_noq(obj->pages[i]);
