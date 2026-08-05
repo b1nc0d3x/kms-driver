@@ -69,28 +69,35 @@ MALLOC_DECLARE(M_KMS);
 /* ------------------------------- GTT -------------------------------------- */
 
 /*
- * Graphics Translation Table — lives at BAR0 + 0x800000 on gen9.  Each
- * PTE is 8 bytes (64-bit), gen8+ layout:
- *   bit 0:        VALID/PRESENT
- *   bit 1:        WRITEABLE
- *   bits[3:2]:    PAT_INDEX
- *   bit 11:       LLC_CACHEABLE
- *   bits[63:12]:  physical page frame number (PFN)
+ * Graphics Translation Table lives at different offsets and uses different
+ * PTE widths across gens:
  *
- * 8 MiB / 8 B per entry = 1 Mi entries × 4 KiB page = 4 GiB GTT-addressable.
+ *   Gen 7.5 (HSW): 4 MiB BAR0.  GTT at upper 2 MiB (offset 0x00200000).
+ *                  4-byte PTEs.  Gen 6/7 encoding:
+ *                    bit 0:      VALID
+ *                    bits[2:1]:  cache type (00=UC, 10=LLC, 11=LLC/eLLC)
+ *                    bits[31:12]: PFN
+ *                  No explicit WRITEABLE bit (all GTT is writeable).
+ *
+ *   Gen 8+ (BDW/SKL): 8+ MiB BAR0.  GTT at upper half (offset 0x00800000).
+ *                     8-byte PTEs.  Gen 8+ encoding:
+ *                       bit 0:        VALID
+ *                       bit 1:        WRITEABLE
+ *                       bits[3:2]:    PAT_INDEX
+ *                       bit 11:       LLC_CACHEABLE
+ *                       bits[63:12]:  PFN
  */
-#define	GTT_BASE		0x00800000
-#define	GTT_PTE_SIZE		8
+#define	HSW_GTT_BASE		0x00200000	/* HSW GTT offset in BAR0 */
+#define	SKL_GTT_BASE		0x00800000	/* SKL+ GTT offset in BAR0 */
 #define	GTT_PTE_VALID		(1u << 0)
-#define	GTT_PTE_WRITEABLE	(1u << 1)
+#define	GTT_PTE_WRITEABLE	(1u << 1)	/* gen8+ only */
+
 /*
- * GTT window is 8 MiB (BAR0 + 0x800000 .. + 0xfffff8).  At 8 bytes per
- * PTE that's exactly 0x100000 entries.  H7: without this bound a
- * caller-supplied entry_idx (traceable back to a userspace-controlled
- * framebuffer geometry via bind_user_fb) can push the write past the
- * GTT window into whatever MMIO region follows — a stealthy write-
- * anywhere primitive.  Enforce the bound at the leaf writer/reader
- * so no future caller has to remember to pre-validate.
+ * GTT_ENTRIES: bound to guard against write-anywhere via
+ * caller-supplied entry_idx (H7 backstop).  Sized to a safe conservative
+ * upper limit; HSW GGTT is up to 512 KiB entries (2 GiB), SKL+ is up to
+ * 1 Mi entries (4 GiB).  Uses 1 Mi as the max and lets the per-gen
+ * PTE_SIZE + BAR0 bounds catch anything beyond gen-specific max.
  */
 #define	GTT_ENTRIES		0x00100000
 
@@ -105,6 +112,23 @@ MALLOC_DECLARE(M_KMS);
 #define	PLANE_SURFLIVE(p)	(0x701ac + (p) * 0x1000)
 #define	PIPE_FRMCOUNT(p)	(0x70040 + (p) * 0x1000)
 
+/*
+ * Gen-aware GTT accessors.  HSW uses 4-byte PTEs at BAR0+0x200000; SKL+
+ * uses 8-byte PTEs at BAR0+0x800000.  Callers pass logical entry_idx;
+ * this layer handles the wire format.
+ */
+static inline uint32_t
+igen_gtt_base(struct igen_softc *sc)
+{
+	return (sc->gen == IGEN_GEN_HSW ? HSW_GTT_BASE : SKL_GTT_BASE);
+}
+
+static inline uint32_t
+igen_gtt_pte_size(struct igen_softc *sc)
+{
+	return (sc->gen == IGEN_GEN_HSW ? 4u : 8u);
+}
+
 uint64_t
 igen_gtt_read(struct igen_softc *sc, uint32_t entry_idx)
 {
@@ -115,7 +139,10 @@ igen_gtt_read(struct igen_softc *sc, uint32_t entry_idx)
 		    entry_idx, GTT_ENTRIES - 1);
 		return (0);
 	}
-	off = GTT_BASE + entry_idx * GTT_PTE_SIZE;
+	off = igen_gtt_base(sc) + entry_idx * igen_gtt_pte_size(sc);
+	if (sc->gen == IGEN_GEN_HSW) {
+		return ((uint64_t)igen_r32(sc, off));
+	}
 	lo = igen_r32(sc, off);
 	hi = igen_r32(sc, off + 4);
 	return ((uint64_t)hi << 32) | lo;
@@ -128,20 +155,23 @@ igen_gtt_write(struct igen_softc *sc, uint32_t entry_idx,
 	uint32_t off;
 
 	if (entry_idx >= GTT_ENTRIES) {
-		/*
-		 * H7 backstop.  Callers that walk fb->gem_objs[0] page arrays
-		 * (bind_user_fb, bind_cursor) should already keep first_idx +
-		 * npages under GTT_ENTRIES, but a hostile framebuffer with
-		 * bogus geometry could otherwise pass a huge npages and turn
-		 * this into an MMIO write-anywhere.  Log + refuse instead of
-		 * corrupting adjacent MMIO regions.
-		 */
 		printf("igen: gtt_write entry_idx=0x%x out of range (max 0x%x)"
 		    " — REFUSED (H7 backstop)\n",
 		    entry_idx, GTT_ENTRIES - 1);
 		return;
 	}
-	off = GTT_BASE + entry_idx * GTT_PTE_SIZE;
+	off = igen_gtt_base(sc) + entry_idx * igen_gtt_pte_size(sc);
+	if (sc->gen == IGEN_GEN_HSW) {
+		/* Gen 7 PTE is 32-bit: PFN[31:12] | cache[2:1] | VALID[0].
+		 * pte from caller may have the gen8 WRITEABLE bit (1<<1);
+		 * for HSW that bit is bits[2:1] cache — clearing it selects
+		 * uncached, which is fine (LLC-shared iGPU still sees CPU
+		 * writes through LLC).  Strip cache-select to 0 for now. */
+		uint32_t pfn_valid =
+		    (uint32_t)(pte & 0xfffff000ULL) | GTT_PTE_VALID;
+		igen_w32(sc, off, pfn_valid);
+		return;
+	}
 	igen_w32(sc, off, (uint32_t)pte);
 	igen_w32(sc, off + 4, (uint32_t)(pte >> 32));
 }
@@ -210,8 +240,9 @@ igen_gtt_bind_user_fb(struct igen_softc *sc,
 		    (sc->user_fb_next_slot + 1) % USER_FB_GTT_NSLOTS;
 	}
 
-	uint32_t first_idx = USER_FB_GTT_FIRST +
-	    slot * USER_FB_GTT_SLOT_PAGES;
+	uint32_t base = (sc->gen == IGEN_GEN_HSW) ?
+	    HSW_USER_FB_GTT_FIRST : SKL_USER_FB_GTT_FIRST;
+	uint32_t first_idx = base + slot * USER_FB_GTT_SLOT_PAGES;
 	for (size_t i = 0; i < obj->npages; i++) {
 		vm_paddr_t pa = VM_PAGE_TO_PHYS(obj->pages[i]);
 		uint64_t pte = (pa & ~0xfffULL) | GTT_PTE_VALID |

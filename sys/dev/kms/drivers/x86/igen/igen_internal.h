@@ -65,10 +65,19 @@ struct igen_test_fb {
  * 32 MiB / slot covers the high end of what modesetting hands us in
  * practice: 2880×1800 XR24 (Retina-class) is ~20 MiB, 3840×2160 XR24
  * (4K) is ~32 MiB on the nose.  At 8 slots that's a 256 MiB GTT
- * footprint, well inside the 2 GiB HSW aperture.  Bumping NSLOTS or
- * SLOT_PAGES further only costs GTT address space, not memory.
+ * footprint, well inside the aperture.
+ *
+ * Slot base differs by gen:
+ *   HSW: GGTT is 2 GiB (512 K entries max = 0x80000).  Firmware fb
+ *        typically at ~0x5100 and aperture window at 0..0xffff, so
+ *        place USER_FB at 0x20000 (128 MiB into GGTT) — well past
+ *        both, 8 slots × 32 MiB = 256 MiB fits within GGTT.
+ *   SKL+: GGTT is 4 GiB (1 M entries).  Slot base 0xa0000 stays.
+ * Selected at runtime via igen_user_fb_gtt_first(sc).
  */
-#define	USER_FB_GTT_FIRST	0xa0000
+#define	HSW_USER_FB_GTT_FIRST	0x20000
+#define	SKL_USER_FB_GTT_FIRST	0xa0000
+#define	USER_FB_GTT_FIRST	SKL_USER_FB_GTT_FIRST /* compat default */
 #define	USER_FB_GTT_SLOT_PAGES	8192
 #define	USER_FB_GTT_NSLOTS	8
 
