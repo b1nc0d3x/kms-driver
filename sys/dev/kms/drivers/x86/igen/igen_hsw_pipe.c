@@ -441,9 +441,6 @@ igen_hsw_panel_on(struct igen_softc *sc)
 {
 	uint8_t edid_dtd[18];
 	struct igen_dtd t;
-	uint32_t m, n;
-	uint32_t link_khz = 270000;	/* HBR; firmware-left link rate */
-	uint32_t lanes = 4;		/* HBR×4; firmware-left */
 	size_t need_bytes;
 
 	if (sc->cached_edid_len < 128) {
@@ -482,26 +479,24 @@ igen_hsw_panel_on(struct igen_softc *sc)
 	    ((t.hactive - 1) << 16) | (t.vactive - 1));
 
 	/*
-	 * M/N stuffer for the DP encoder.  Pixel rate / link rate ratio
-	 * tells the encoder how often to insert null symbols.  Firmware
-	 * may have programmed these for a non-native EFI mode, so
-	 * recompute for the panel-preferred mode.
+	 * Apple HSW eDP path uses TRANS_EDP as the effective transcoder.
+	 * The DP framer reads M/N from TRANS_EDP_DP_LINK_M/N (0x6f040/44),
+	 * NOT from PIPE_A's DATA/LINK M/N.  i915kms MMIO ground truth
+	 * (2026-08-04, MBP11,4) shows PIPE_A_{DATA,LINK}_{M,N} all zero
+	 * while the panel is lit.  Prior boots wrote garbage M/N into
+	 * PIPE_A which fed the pipe->trans handoff wrong ratios — the
+	 * column-bar corruption we chased for 6 boots.  Explicitly zero
+	 * them to match i915kms (leftover state persists across module
+	 * reloads).
+	 *
+	 * TRANS_EDP_DP_LINK_M/N are left as firmware programmed them
+	 * (0x000a01e5 / 0x00080000 for the native 2880x1800 60 Hz mode);
+	 * see project_igen_apple_edp_handoff_2026_08_04.md.
 	 */
-	igen_hsw_dp_mn(t.pixclk_khz, 3 /* bytes/pixel @ 24bpp */,
-	    link_khz, lanes, &m, &n);
-	igen_w32(sc, HSW_PIPE_DATA_M(0), m);
-	igen_w32(sc, HSW_PIPE_DATA_N(0), n);
-	/*
-	 * PIPE_LINK_M/N are a DIFFERENT ratio from PIPE_DATA_M/N.  Our earlier
-	 * reuse of DATA_M/N for LINK was wrong -- Linux HSW live-fire values
-	 * on the same MBP hardware for 2880x1800 60Hz 8bpc are:
-	 *   PIPE_LINK_M = 0x000a01e5, PIPE_LINK_N = 0x00080000
-	 * Hardcode until we have a proper LINK_M/N formula.  These values
-	 * only apply to native panel timing; multi-monitor / mode-changing
-	 * work will need real computation.
-	 */
-	igen_w32(sc, HSW_PIPE_LINK_M(0), 0x000a01e5u);
-	igen_w32(sc, HSW_PIPE_LINK_N(0), 0x00080000u);
+	igen_w32(sc, HSW_PIPE_DATA_M(0), 0);
+	igen_w32(sc, HSW_PIPE_DATA_N(0), 0);
+	igen_w32(sc, HSW_PIPE_LINK_M(0), 0);
+	igen_w32(sc, HSW_PIPE_LINK_N(0), 0);
 
 	/* PLANE configuration.  Defer SURF/STRIDE until scanout_fb is
 	 * actually populated by the caller (currently a separate sysctl).
@@ -624,11 +619,12 @@ igen_hsw_panel_on(struct igen_softc *sc)
 	device_printf(sc->dev,
 	    "hsw_panel_on: apple-handoff shape (PIPE_A stays off; TRANS_EDP"
 	    " drives panel)  DSPACNTR=0x%08x DSPASTRIDE=0x%08x"
-	    " DSPASURF=0x%08x  M=0x%08x N=0x%08x  PIPEASRC=0x%08x"
-	    " WM_LINETIME=0x%08x\n",
+	    " DSPASURF=0x%08x  TRANS_EDP_LINK_M=0x%08x N=0x%08x"
+	    "  PIPEASRC=0x%08x WM_LINETIME=0x%08x\n",
 	    igen_r32(sc, HSW_DSPCNTR(0)),
 	    igen_r32(sc, HSW_DSPSTRIDE(0)),
-	    igen_r32(sc, HSW_DSPSURF(0)), m, n,
+	    igen_r32(sc, HSW_DSPSURF(0)),
+	    igen_r32(sc, 0x6f040u), igen_r32(sc, 0x6f044u),
 	    igen_r32(sc, HSW_PIPEASRC),
 	    igen_r32(sc, HSW_WM_LINETIME_A));
 	return (0);
