@@ -539,11 +539,22 @@ igen_sysctl_blit_efi_fb(SYSCTL_HANDLER_ARGS)
 		return (ENOTSUP);
 	if (sc->gmadr_res == NULL)
 		return (ENXIO);
+	/* Prefer the currently-armed PLANE_SURF, but if it already points
+	 * at the EFI fb (because we ran once already) fall back to the
+	 * most-recent Xorg-bound user_fb_slot.  This lets the sysctl be
+	 * triggered repeatedly to keep the EFI fb up to date with Xorg. */
 	src_surf = igen_r32(sc, PLANE_SURF(0));
-	if (src_surf == APPLE_EFI_FB_GTT_VA) {
-		device_printf(sc->dev,
-		    "blit_efi_fb: source == dest; nothing to do\n");
-		return (0);
+	if (src_surf == APPLE_EFI_FB_GTT_VA || src_surf == 0) {
+		src_surf = 0;
+		for (uint32_t i = 0; i < USER_FB_GTT_NSLOTS; i++) {
+			if (sc->user_fb_slots[i].fb != NULL)
+				src_surf = sc->user_fb_slots[i].surf;
+		}
+		if (src_surf == 0) {
+			device_printf(sc->dev,
+			    "blit_efi_fb: no Xorg fb bound; nothing to blit\n");
+			return (ENOENT);
+		}
 	}
 	src_entry = src_surf / PAGE_SIZE;
 	src_pte = igen_gtt_read(sc, src_entry);
@@ -558,6 +569,13 @@ igen_sysctl_blit_efi_fb(SYSCTL_HANDLER_ARGS)
 	 * on the source view.
 	 */
 	src = (uint32_t *)PHYS_TO_DMAP(src_phys);
+	/* Force any userspace WC combining-buffer writes to drain to
+	 * memory before we read.  sfence + wbinvd is the biggest hammer:
+	 * sfence serializes store-buffer, wbinvd flushes+invalidates all
+	 * CPU caches on all cores.  Expensive but correct.
+	 */
+	__asm__ volatile ("sfence" ::: "memory");
+	wbinvd();
 	pmap_invalidate_cache_range((vm_offset_t)src,
 	    (vm_offset_t)src + APPLE_EFI_FB_SIZE);
 	for (i = 0; i < APPLE_EFI_FB_SIZE / 4; i++) {
