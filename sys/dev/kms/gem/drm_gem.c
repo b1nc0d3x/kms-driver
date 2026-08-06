@@ -18,7 +18,6 @@
 #include <sys/malloc.h>
 #include <sys/queue.h>
 #include <sys/refcount.h>
-#include <sys/pctrie.h>
 #include <sys/rwlock.h>
 #include <sys/sx.h>
 #include <sys/sysctl.h>
@@ -69,26 +68,45 @@ struct drm_gem_handle {
 /* ----- pager callbacks ----- */
 
 /*
- * Fault handler is a no-op: every obj->pages[i] is pre-inserted into
- * the pager's pctrie at object-create time (see kms_gem_object_create
- * below), so the VM fast path finds the real managed page without ever
- * calling in here.  Mirrors tegra_gem_pager_fault (arm/nvidia/drm2/
- * tegra_bo.c:324) — proven to route user CPU writes at Xorg's mmap
- * directly to obj->pages[]'s DRAM.
+ * Return a fake (PG_FICTITIOUS) page pointing at the phys addr of the
+ * real managed page we allocated for this offset.  Mirrors linuxkpi's
+ * linux_cdev_pager_fault (see linux_compat.c:448).
  *
- * Prior implementations tried the linuxkpi vm_page_getfake pattern
- * (linux_cdev_pager_fault, linux_compat.c:453).  It works for one-shot
- * linear writes (write_dumb) but on fbsdmac 2026-08-06 Xorg's mmap
- * writes landed at a DIFFERENT phys addr than obj->pages[i] — xwd
- * -root showed content, kernel fb_scan via PHYS_TO_DMAP saw all zeros.
- * Tegra's pre-insert-real-pages-marked-PG_FICTITIOUS pattern doesn't
- * have that alias.
+ * We used to pre-insert obj->pages[i] into the pager pctrie and return
+ * VM_PAGER_FAIL here, trusting the fault-fast path to find them.  That
+ * worked for drm_test2 / write_dumb (single-shot linear write) but the
+ * write-fault path from Xorg's mmap evicted our real managed page and
+ * inserted a fresh zeroed anonymous page — so Xorg's XRender writes
+ * landed on a shadow that never reached obj->pages[].  Fake pages sit
+ * outside the pager pctrie and just carry the paddr, so pmap_enter
+ * always targets obj->pages[i]'s DRAM directly.  Verified on fbsdmac
+ * MBP11,4 2026-08-05 via a canary experiment.
  */
 static int
-drm_gem_pager_fault(vm_object_t vm_obj __unused, vm_ooffset_t offset __unused,
-    int prot __unused, vm_page_t *mres __unused)
+drm_gem_pager_fault(vm_object_t vm_obj, vm_ooffset_t offset, int prot __unused,
+    vm_page_t *mres)
 {
-	return (VM_PAGER_FAIL);
+	struct drm_gem_object *obj = vm_obj->handle;
+	vm_pindex_t pidx = OFF_TO_IDX(offset);
+	vm_paddr_t paddr;
+	vm_page_t page;
+
+	if (obj == NULL || pidx >= obj->npages || obj->pages[pidx] == NULL)
+		return (VM_PAGER_FAIL);
+	paddr = VM_PAGE_TO_PHYS(obj->pages[pidx]);
+
+	if (((*mres)->flags & PG_FICTITIOUS) != 0) {
+		page = *mres;
+		vm_page_updatefake(page, paddr, vm_obj->memattr);
+	} else {
+		VM_OBJECT_WUNLOCK(vm_obj);
+		page = vm_page_getfake(paddr, vm_obj->memattr);
+		VM_OBJECT_WLOCK(vm_obj);
+		vm_page_replace(page, vm_obj, (*mres)->pindex, *mres);
+		*mres = page;
+	}
+	vm_page_valid(page);
+	return (VM_PAGER_OK);
 }
 
 static int
@@ -113,41 +131,18 @@ static void
 drm_gem_pager_dtor(void *handle)
 {
 	struct drm_gem_object *obj = handle;
-	struct pctrie_iter pctrie_pages;
-	vm_page_t m;
 	size_t i;
 
 	/*
-	 * Each obj->pages[i] was inserted into obj->pager's pctrie via
-	 * vm_page_iter_insert at create time.  Mirror tegra_bo_destruct
-	 * (arm/nvidia/drm2/tegra_bo.c) to unhook them properly before
-	 * vm_page_free: iterate the pctrie, busy each page,
-	 * cdev_mgtdev_pager_free_page to detach, clear PG_FICTITIOUS +
-	 * restore VPO_UNMANAGED so vm_page_free walks the normal path.
+	 * Our real managed pages were never inserted into the pager's
+	 * pctrie (only fake pages carry the paddr into userspace PTEs),
+	 * so no page-off-the-pager step is needed.  Just unwire + free.
 	 */
-	if (obj->pager != NULL) {
-		vm_page_iter_init(&pctrie_pages, obj->pager);
-		VM_OBJECT_WLOCK(obj->pager);
-		for (i = 0; i < obj->npages; i++) {
-			m = vm_radix_iter_lookup(&pctrie_pages, i);
-			if (m == NULL)
-				continue;
-			vm_page_busy_acquire(m, 0);
-			cdev_mgtdev_pager_free_page(&pctrie_pages, m);
-			m->flags &= ~PG_FICTITIOUS;
-			m->oflags |= VPO_UNMANAGED;
-			vm_page_unwire_noq(m);
-			vm_page_free(m);
-		}
-		VM_OBJECT_WUNLOCK(obj->pager);
-	} else {
-		for (i = 0; i < obj->npages; i++) {
-			m = obj->pages[i];
-			if (m == NULL)
-				continue;
-			vm_page_unwire_noq(m);
-			vm_page_free(m);
-		}
+	for (i = 0; i < obj->npages; i++) {
+		if (obj->pages[i] == NULL)
+			continue;
+		vm_page_unwire_noq(obj->pages[i]);
+		vm_page_free(obj->pages[i]);
 	}
 	free(obj->pages, M_KMS);
 	free(obj, M_KMS);
@@ -320,48 +315,15 @@ retry_alloc:
 	}
 
 	/*
-	 * Pre-insert every real managed page into the pager's pctrie via
-	 * vm_page_iter_insert.  Tegra idiom (arm/nvidia/drm2/tegra_bo.c
-	 * :tegra_bo_init_pager).  VM's fault fast path finds the page in
-	 * the pctrie and calls pmap_enter directly with the real vm_page,
-	 * so user mmap PTEs land on obj->pages[i]'s DRAM.  Clearing
-	 * VPO_UNMANAGED + setting PG_FICTITIOUS is the required pmap
-	 * contract for cdev_pager pre-insertion of contig-allocated
-	 * pages: pmap treats them as managed for tracking but skips the
-	 * PHYS_TO_VM_PAGE round-trip.
+	 * Real managed pages stay off the pager pctrie.  Every fault goes
+	 * through drm_gem_pager_fault which returns a PG_FICTITIOUS page
+	 * carrying the phys addr of obj->pages[pindex].  This matches
+	 * linuxkpi's cdev pager idiom and avoids the write-fault eviction
+	 * that our pre-insert approach hit — Xorg's XRender writes now
+	 * land directly on our DRAM pages instead of on an anonymous
+	 * shadow the fault path silently allocated (see canary experiment
+	 * memory 2026-08-05).
 	 */
-	{
-		struct pctrie_iter pctrie_pages;
-
-		vm_page_iter_init(&pctrie_pages, obj->pager);
-		VM_OBJECT_WLOCK(obj->pager);
-		for (i = 0; i < npages; i++) {
-			vm_page_t p = obj->pages[i];
-
-			p->oflags &= ~VPO_UNMANAGED;
-			p->flags |= PG_FICTITIOUS;
-			if (vm_page_iter_insert(p, obj->pager, i,
-			    &pctrie_pages) != 0) {
-				VM_OBJECT_WUNLOCK(obj->pager);
-				printf("kms/gem: vm_page_iter_insert failed "
-				    "at pindex %zu\n", i);
-				vm_object_deallocate(obj->pager);
-				obj->pager = NULL;
-				for (size_t j = 0; j < npages; j++) {
-					obj->pages[j]->flags &=
-					    ~PG_FICTITIOUS;
-					obj->pages[j]->oflags |=
-					    VPO_UNMANAGED;
-					vm_page_unwire_noq(obj->pages[j]);
-					vm_page_free(obj->pages[j]);
-				}
-				free(obj->pages, M_KMS);
-				free(obj, M_KMS);
-				return (NULL);
-			}
-		}
-		VM_OBJECT_WUNLOCK(obj->pager);
-	}
 
 	sx_xlock(&dev->gem_lock);
 	obj->mmap_offset = dev->mmap_offset_counter;
