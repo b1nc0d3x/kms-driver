@@ -706,14 +706,23 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 			for (i = 0; i < nclips; i++) {
 				uint32_t y1 = clips[i].y1;
 				uint32_t y2 = clips[i].y2;
-				uint32_t off_lo, off_hi, p_lo, p_hi, p;
+				uint64_t off_lo, off_hi;
+				uint64_t p_lo, p_hi, p;
 
 				if (y2 <= y1 || y1 >= fb->height)
 					continue;
 				if (y2 > fb->height)
 					y2 = fb->height;
-				off_lo = plane_off + y1 * pitch;
-				off_hi = plane_off + y2 * pitch;
+				/*
+				 * Promote to u64 so an oversized fb (accepted
+				 * by ADDFB2 with a pitch*height that overflows
+				 * u32) doesn't wrap and cause p_hi to compute
+				 * against the wrong region.
+				 */
+				off_lo = (uint64_t)plane_off +
+				    (uint64_t)y1 * pitch;
+				off_hi = (uint64_t)plane_off +
+				    (uint64_t)y2 * pitch;
 				p_lo = off_lo / PAGE_SIZE;
 				p_hi = (off_hi + PAGE_SIZE - 1) / PAGE_SIZE;
 				if (p_hi > gem->npages)
@@ -775,14 +784,18 @@ kms_ioctl(struct cdev *cdev __unused, u_long cmd, caddr_t data,
 				for (i = 0; i < nclips; i++) {
 					uint32_t y1 = clips[i].y1;
 					uint32_t y2 = clips[i].y2;
-					uint32_t off_lo, off_hi, p_lo, p_hi, p;
+					uint64_t off_lo, off_hi;
+					uint64_t p_lo, p_hi, p;
 
 					if (y2 <= y1 || y1 >= fb->height)
 						continue;
 					if (y2 > fb->height)
 						y2 = fb->height;
-					off_lo = plane_off + y1 * pitch;
-					off_hi = plane_off + y2 * pitch;
+					/* u64 promotion — see aarch64 comment above. */
+					off_lo = (uint64_t)plane_off +
+					    (uint64_t)y1 * pitch;
+					off_hi = (uint64_t)plane_off +
+					    (uint64_t)y2 * pitch;
 					p_lo = off_lo / PAGE_SIZE;
 					p_hi = (off_hi + PAGE_SIZE - 1) /
 					    PAGE_SIZE;

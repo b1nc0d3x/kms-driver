@@ -567,11 +567,12 @@ igen_hsw_panel_on(struct igen_softc *sc)
 	 * our GTT range at 0x20000000 never appear on the panel.
 	 *
 	 * Setting bit 9 makes PLANE_SURF writes take effect immediately.
-	 * Verified 2026-08-06 fbsdmac: program_scanout SURFLIVE-retry
-	 * printed "!= armed" on every SETCRTC; async-address bit lets the
-	 * arm land without waiting for a vblank that never comes.
+	 * Gated on the Apple quirk — a non-Apple HSW eDP path with a
+	 * running PIPE_A gets its normal vblank-latched semantics, matching
+	 * upstream i915 behavior for tear-free page flips.
 	 */
-	dspcntr |= (1u << 9);
+	if ((sc->quirks & IGEN_QUIRK_APPLE_EDP_HANDOFF) != 0)
+		dspcntr |= (1u << 9);
 	igen_w32(sc, HSW_DSPCNTR(0), dspcntr);
 
 	/*

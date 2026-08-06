@@ -761,7 +761,14 @@ igen_sysctl_fill_scanout(SYSCTL_HANDLER_ARGS)
 		if ((i & 0x3f) == 0x3f)
 			maybe_yield();
 	}
-	pmap_invalidate_cache_pages(obj->pages, obj->npages);
+	/*
+	 * pmap_invalidate_cache_pages takes an `int count` on amd64.
+	 * Cap at 0x7fffffff to avoid a size_t → int narrowing surprise.
+	 * A 256 MiB dumb-buf is 65536 pages so the cap is architectural
+	 * belt-and-braces, not a real-world limit.
+	 */
+	pmap_invalidate_cache_pages(obj->pages,
+	    (int)MIN(obj->npages, (size_t)0x7fffffff));
 	__asm__ volatile ("sfence" ::: "memory");
 	device_printf(sc->dev,
 	    "fill_scanout: painted %zu pages of fb %u with 0x%08x\n",
