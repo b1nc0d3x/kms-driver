@@ -212,18 +212,15 @@ retry_alloc:
 	    VM_MEMATTR_UNCACHEABLE
 #else
 	    /*
-	     * x86: UNCACHEABLE eliminates the write-combining buffer's
-	     * mid-scanline drain that painted horizontal striations
-	     * across the panel with WC memattr (fbsdmac 2026-08-06 WC
-	     * capture showed dense multi-color stripes; UC capture cut
-	     * them to a single narrow band around one bad page range).
-	     * WC would be faster for CPU-side workloads but scanout
-	     * cares only about deterministic RAM state per row, and UC
-	     * gives us that.  Kernel DMAP for these pages is also UC
-	     * (see pmap_page_set_memattr below) so fb_scan reads and
-	     * user mmap writes stay coherent.
+	     * x86: WRITE_COMBINING is the standard scanout memory
+	     * attribute (what Linux i915 uses for stolen + system scanout
+	     * pages) and matches what modesetting_drv's XRender fallback
+	     * expects — writes flush through the WC combining buffer on
+	     * SFENCE/read.  WB is also correct architecturally but modeset
+	     * driver's fbCompositeGeneral loop may issue MOVNTPS or
+	     * similar streaming stores that only make sense on WC pages.
 	     */
-	    VM_MEMATTR_UNCACHEABLE
+	    VM_MEMATTR_WRITE_COMBINING
 #endif
 	    );
 	if (m == NULL) {
@@ -249,7 +246,7 @@ retry_alloc:
 #ifdef __aarch64__
 		pmap_page_set_memattr(m, VM_MEMATTR_UNCACHEABLE);
 #else
-		pmap_page_set_memattr(m, VM_MEMATTR_UNCACHEABLE);
+		pmap_page_set_memattr(m, VM_MEMATTR_WRITE_COMBINING);
 #endif
 		obj->pages[i] = m;
 		/*
@@ -283,7 +280,7 @@ retry_alloc:
 			    "VM_MEMATTR_UNCACHEABLE\n");
 #else
 			printf("kms/gem: scanout pages tagged "
-			    "VM_MEMATTR_UNCACHEABLE\n");
+			    "VM_MEMATTR_WRITE_COMBINING (needs PAT slot)\n");
 #endif
 		}
 	}
@@ -304,7 +301,7 @@ retry_alloc:
 #ifdef __aarch64__
 		vm_object_set_memattr(obj->pager, VM_MEMATTR_UNCACHEABLE);
 #else
-		vm_object_set_memattr(obj->pager, VM_MEMATTR_UNCACHEABLE);
+		vm_object_set_memattr(obj->pager, VM_MEMATTR_WRITE_COMBINING);
 #endif
 	}
 	if (obj->pager == NULL) {
