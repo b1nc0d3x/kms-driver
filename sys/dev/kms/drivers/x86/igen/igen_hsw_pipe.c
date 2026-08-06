@@ -558,6 +558,20 @@ igen_hsw_panel_on(struct igen_softc *sc)
 	 */
 	dspcntr &= ~((0xfu << DSPCNTR_FORMAT_SHIFT) | DSPCNTR_TILED);
 	dspcntr |= DSPCNTR_ENABLE | DSPCNTR_FORMAT_BGRX8888;
+	/*
+	 * DSPCNTR bit 9 = ASYNC_ADDRESS_UPDATE_ENABLE.  Normally PLANE_SURF
+	 * writes latch on PIPE_A vblank, but we intentionally keep PIPE_A
+	 * off on Apple eDP handoff (TRANS_EDP drives).  Without PIPE_A
+	 * vblank there is no latch source; PLANE_SURFLIVE stays stuck at
+	 * the firmware-programmed EFI FB (0x00000000) and Xorg's writes to
+	 * our GTT range at 0x20000000 never appear on the panel.
+	 *
+	 * Setting bit 9 makes PLANE_SURF writes take effect immediately.
+	 * Verified 2026-08-06 fbsdmac: program_scanout SURFLIVE-retry
+	 * printed "!= armed" on every SETCRTC; async-address bit lets the
+	 * arm land without waiting for a vblank that never comes.
+	 */
+	dspcntr |= (1u << 9);
 	igen_w32(sc, HSW_DSPCNTR(0), dspcntr);
 
 	/*

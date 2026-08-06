@@ -720,6 +720,56 @@ igen_sysctl_fb_scan(SYSCTL_HANDLER_ARGS)
 	return (0);
 }
 
+/*
+ * fill_scanout=<u32>: paint LIVE scanout fb's obj->pages[] with a solid
+ * color via PHYS_TO_DMAP.  Verifies display DMA really reads
+ * obj->pages[i] — panel shows the color → GTT+PLANE_SURF chain OK,
+ * Xorg's zero-content is the XRender-writes-not-reaching-pages bug.
+ * Panel stays dark → GTT/PLANE binding is wrong.
+ */
+static int
+igen_sysctl_fill_scanout(SYSCTL_HANDLER_ARGS)
+{
+	struct igen_softc *sc = arg1;
+	unsigned int color = 0;
+	int error = sysctl_handle_int(oidp, &color, 0, req);
+	struct drm_framebuffer *fb;
+	struct drm_gem_object *obj;
+	size_t i, j;
+
+	if (error || req->newptr == NULL)
+		return (error);
+
+	sx_xlock(&sc->scanout_lock);
+	fb = sc->last_scanout_fb;
+	if (fb != NULL)
+		kms_mode_object_get(&fb->base);
+	sx_xunlock(&sc->scanout_lock);
+	if (fb == NULL)
+		return (ENOENT);
+
+	obj = fb->gem_objs[0];
+	if (obj == NULL || obj->pages == NULL || obj->npages == 0) {
+		kms_mode_object_put(&fb->base);
+		return (EINVAL);
+	}
+	for (i = 0; i < obj->npages; i++) {
+		vm_paddr_t pa = VM_PAGE_TO_PHYS(obj->pages[i]);
+		uint32_t *p = (uint32_t *)PHYS_TO_DMAP(pa);
+		for (j = 0; j < PAGE_SIZE / 4; j++)
+			p[j] = color;
+		if ((i & 0x3f) == 0x3f)
+			maybe_yield();
+	}
+	pmap_invalidate_cache_pages(obj->pages, obj->npages);
+	__asm__ volatile ("sfence" ::: "memory");
+	device_printf(sc->dev,
+	    "fill_scanout: painted %zu pages of fb %u with 0x%08x\n",
+	    obj->npages, fb->base.id, color);
+	kms_mode_object_put(&fb->base);
+	return (0);
+}
+
 /* igen_sysctl_edid_read_b lives in igen_gmbus.c. */
 static int	igen_sysctl_vbt_dump(SYSCTL_HANDLER_ARGS);
 /* igen_sysctl_hpd_dump lives in igen_hpd.c. */
