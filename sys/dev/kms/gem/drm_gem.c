@@ -249,6 +249,18 @@ retry_alloc:
 		pmap_page_set_memattr(m, VM_MEMATTR_WRITE_COMBINING);
 #endif
 		obj->pages[i] = m;
+		/*
+		 * Force-zero via PHYS_TO_DMAP.  VM_ALLOC_ZERO skips the
+		 * pmap_zero_page call for pages already flagged PG_ZERO,
+		 * but on x86 the EFI-fb backing pages get flagged clean by
+		 * the boot-time page pool even though they still hold the
+		 * loader logo image.  Result: the very first Xorg fb=23
+		 * shows the FreeBSD loader menu until Xorg overwrites, and
+		 * on the Apple eDP handoff where XRender writes don't
+		 * currently reach obj->pages, that "until" is forever.
+		 * Verified 2026-08-06 fbsdmac panel capture.
+		 */
+		bzero((void *)PHYS_TO_DMAP(VM_PAGE_TO_PHYS(m)), PAGE_SIZE);
 	}
 
 	/*

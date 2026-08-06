@@ -556,8 +556,19 @@ igen_hsw_panel_on(struct igen_softc *sc)
 	 * from i915kms is TILED (userspace-fb-format-dependent) — everything
 	 * else must match.
 	 */
-	dspcntr &= ~((0xfu << DSPCNTR_FORMAT_SHIFT) | DSPCNTR_TILED);
+	dspcntr &= ~((0xfu << DSPCNTR_FORMAT_SHIFT) | DSPCNTR_TILED |
+	    DSPCNTR_GAMMA_ENABLE);
 	dspcntr |= DSPCNTR_ENABLE | DSPCNTR_FORMAT_BGRX8888;
+	/*
+	 * i915 on this MBP verified DSPACNTR=0x98000400 with GAMMA off.
+	 * Firmware leaves GAMMA bit 30 set + gamma LUT programmed for the
+	 * EFI-fb 2880x1800 image which is X-tiled; when we point the plane
+	 * at our LINEAR fb, the firmware-programmed gamma LUT scrambles
+	 * per-scanline colors → the striated multicolor bands observed on
+	 * the panel.  Clearing GAMMA gives the plane straight-through
+	 * pixel data.  Same commit family as the async-address bit
+	 * (bc50821).
+	 */
 	/*
 	 * DSPCNTR bit 9 = ASYNC_ADDRESS_UPDATE_ENABLE.  Normally PLANE_SURF
 	 * writes latch on PIPE_A vblank, but we intentionally keep PIPE_A
