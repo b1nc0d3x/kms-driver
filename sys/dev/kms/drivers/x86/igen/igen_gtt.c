@@ -169,13 +169,24 @@ igen_gtt_write(struct igen_softc *sc, uint32_t entry_idx,
 	}
 	off = igen_gtt_base(sc) + entry_idx * igen_gtt_pte_size(sc);
 	if (sc->gen == IGEN_GEN_HSW) {
-		/* Gen 7 PTE is 32-bit: PFN[31:12] | cache[2:1] | VALID[0].
-		 * pte from caller may have the gen8 WRITEABLE bit (1<<1);
-		 * for HSW that bit is bits[2:1] cache — clearing it selects
-		 * uncached, which is fine (LLC-shared iGPU still sees CPU
-		 * writes through LLC).  Strip cache-select to 0 for now. */
-		uint32_t pfn_valid =
-		    (uint32_t)(pte & 0xfffff000ULL) | GTT_PTE_VALID;
+		/* Gen 7 GTT PTE is 32-bit with a split-encoded 40-bit phys:
+		 *   PTE[31:12] = addr[31:12]   (low  20 bits of PFN)
+		 *   PTE[11:4]  = addr[39:32]   (high 8 bits of phys, i.e.
+		 *                               shifted right by 28 into
+		 *                               [11:4])
+		 *   PTE[3:2]   = cache-select  (0 = UC, fine for LLC iGPU)
+		 *   PTE[0]     = VALID
+		 * Matches Linux i915 gen6_pte_encode:
+		 *   ((addr) & ~BIT_ULL(40)) | (((addr) >> 28) & 0xff0)
+		 *
+		 * Prior code only kept (pte & 0xfffff000ULL) so any phys addr
+		 * above 4 GiB got truncated — on fbsdmac obj->pages[0] at
+		 * 0x3bb000000 became 0xbb000000, display DMA scanned wrong
+		 * memory, panel showed multi-color striations (2026-08-06).
+		 */
+		uint64_t addr = pte & ~0xfffULL;
+		uint32_t pfn_valid = (uint32_t)((addr & ~(1ULL << 40)) |
+		    (((addr) >> 28) & 0xff0ULL)) | GTT_PTE_VALID;
 		igen_w32(sc, off, pfn_valid);
 		return;
 	}
@@ -1038,10 +1049,17 @@ igen_sysctl_gtt_dump(SYSCTL_HANDLER_ARGS)
 	if (error || req->newptr == NULL || trigger == 0)
 		return (error);
 
+	uint32_t start = (uint32_t)trigger;
+	uint32_t count = 2048;
+	if (start >= 0x80000)
+		start = 0;
+	if (start + count > 0x80000)
+		count = 0x80000 - start;
+
 	uint32_t valid_count = 0, last_pfn = 0, runs = 0;
 	uint64_t first_pfn = 0;
-	for (uint32_t i = 0; i < 2048; i++) {	/* first 8 MiB of GTT */
-		uint64_t pte = igen_gtt_read(sc, i);
+	for (uint32_t i = 0; i < count; i++) {
+		uint64_t pte = igen_gtt_read(sc, start + i);
 		if (pte & GTT_PTE_VALID) {
 			uint64_t pfn = (pte >> 12);
 			if (valid_count == 0)
@@ -1053,18 +1071,18 @@ igen_sysctl_gtt_dump(SYSCTL_HANDLER_ARGS)
 		}
 	}
 	device_printf(sc->dev,
-	    "gtt: in first 2048 PTEs: %u valid, %u contiguous runs,"
+	    "gtt: PTEs [0x%x..0x%x): %u valid, %u contiguous runs,"
 	    " first PFN=0x%llx (phys 0x%llx)\n",
-	    valid_count, runs,
+	    start, start + count, valid_count, runs,
 	    (unsigned long long)first_pfn,
 	    (unsigned long long)(first_pfn << 12));
 
 	/* Pretty-print the first 8 PTEs verbatim. */
 	for (uint32_t i = 0; i < 8; i++) {
-		uint64_t pte = igen_gtt_read(sc, i);
+		uint64_t pte = igen_gtt_read(sc, start + i);
 		device_printf(sc->dev,
-		    "  GTT[%u] = 0x%016llx  %s%s  PFN=0x%llx\n",
-		    i, (unsigned long long)pte,
+		    "  GTT[0x%x] = 0x%016llx  %s%s  PFN=0x%llx\n",
+		    start + i, (unsigned long long)pte,
 		    (pte & GTT_PTE_VALID) ? "V" : "-",
 		    (pte & GTT_PTE_WRITEABLE) ? "W" : "-",
 		    (unsigned long long)(pte >> 12));
