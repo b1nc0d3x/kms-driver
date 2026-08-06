@@ -305,6 +305,7 @@ struct igen_softc {
 #define	PLANE_STRIDE(p)		(0x70188 + (p) * 0x1000)
 #define	PLANE_SIZE(p)		(0x70190 + (p) * 0x1000)
 #define	PLANE_SURF(p)		(0x7019c + (p) * 0x1000)
+#define	PLANE_SURFLIVE(p)	(0x701ac + (p) * 0x1000)
 
 #define	CUR_CTL_A		0x70080
 #define	CUR_BASE_A		0x70084

@@ -2273,6 +2273,32 @@ igen_program_scanout(struct igen_softc *sc, struct drm_framebuffer *fb)
 		stride = fb->pitches[0] / 64;
 	igen_w32(sc, PLANE_STRIDE(0), stride);
 	igen_w32(sc, PLANE_SURF(0), surf);
+
+	/*
+	 * Verify PLANE_SURF latched.  On Apple HSW after EFI handoff we
+	 * see non-deterministic latch behaviour: sometimes our write
+	 * takes effect immediately, sometimes the display keeps scanning
+	 * the firmware-programmed EFI FB (DSPASURF=0x00000000) and Xorg's
+	 * writes to our GTT range never appear on-screen.  Read
+	 * PLANE_SURFLIVE — HW's currently-scanned surface address — and
+	 * warn + retry if it doesn't match what we armed.
+	 */
+	{
+		uint32_t live = igen_r32(sc, PLANE_SURFLIVE(0));
+		if (live != surf) {
+			device_printf(sc->dev,
+			    "program_scanout: PLANE_SURFLIVE=0x%08x != armed"
+			    " 0x%08x; re-arming\n", live, surf);
+			igen_w32(sc, PLANE_SURF(0), surf);
+			DELAY(20000);	/* wait for vblank */
+			live = igen_r32(sc, PLANE_SURFLIVE(0));
+			if (live != surf)
+				device_printf(sc->dev,
+				    "program_scanout: retry failed,"
+				    " PLANE_SURFLIVE=0x%08x still != 0x%08x\n",
+				    live, surf);
+		}
+	}
 	/*
 	 * Track the fb we just armed so blit_efi_fb can find the
 	 * currently-live source without trusting PLANE_SURF (which the
