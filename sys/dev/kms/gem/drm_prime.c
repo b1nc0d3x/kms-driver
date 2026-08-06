@@ -345,6 +345,7 @@ static void (*fgpu_unregister_dmabuf_ops_p)(void);
 static bool kms_bridge_registered;
 
 int kms_bridge_rearm(void);	/* forward decl — definition after SYSINIT */
+void kms_bridge_ack_fgpu_unload(void);	/* called by fgpu SYSUNINIT via kldsym */
 
 /*
  * linker_file_foreach predicate — checks whether `lf` exports both
@@ -405,6 +406,21 @@ kms_bridge_rearm(void)
 	kms_bridge_registered = true;
 	printf("kms: registered fgpu dmabuf bridge\n");
 	return (0);
+}
+
+/*
+ * Called by fgpu.ko's SYSUNINIT immediately before fgpu's text is freed.
+ * Clears our cached pointers into fgpu so that a subsequent
+ * kms_bridge_fgpu_fini (on kms unload) does not dispatch through
+ * freed text.  Public symbol; fgpu resolves via kldsym(9).
+ */
+void
+kms_bridge_ack_fgpu_unload(void)
+{
+
+	fgpu_register_dmabuf_ops_p = NULL;
+	fgpu_unregister_dmabuf_ops_p = NULL;
+	kms_bridge_registered = false;
 }
 
 static void

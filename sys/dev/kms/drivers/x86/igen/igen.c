@@ -776,6 +776,7 @@ static int	igen_sysctl_vbt_dump(SYSCTL_HANDLER_ARGS);
 static int	igen_sysctl_cap_dump(SYSCTL_HANDLER_ARGS);
 static int	igen_sysctl_paint_efi_fb(SYSCTL_HANDLER_ARGS);
 static int	igen_sysctl_blit_efi_fb(SYSCTL_HANDLER_ARGS);
+static int	igen_sysctl_fill_scanout(SYSCTL_HANDLER_ARGS);
 /* DPLL/WRPLL/pw1 sysctl handlers live in igen_dpll.c. */
 static int	igen_sysctl_current_mode(SYSCTL_HANDLER_ARGS);
 /* GTT / scanout playground sysctl handlers live in igen_gtt.c. */
@@ -897,6 +898,12 @@ igen_re_sysctls_init(struct igen_softc *sc)
 	    sc, 0, igen_sysctl_blit_efi_fb, "I",
 	    "Apple HSW: copy currently-armed PLANE_SURF fb into firmware"
 	    " EFI fb and restore DSPASURF=0x05100000 (write 1)");
+	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "fill_scanout",
+	    CTLTYPE_UINT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, igen_sysctl_fill_scanout, "IU",
+	    "paint LIVE scanout fb obj->pages[] with solid ARGB color"
+	    " (diagnostic — verifies GTT+PLANE routes to obj->pages)");
 	/* edid_read_b sysctl is owned by igen_gmbus.c. */
 	igen_gmbus_register_sysctls(sc);
 

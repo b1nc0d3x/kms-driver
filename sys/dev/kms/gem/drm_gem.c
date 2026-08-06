@@ -274,10 +274,9 @@ retry_alloc:
 	}
 
 	/*
-	 * Pre-insert pages into the cdev_pager keyed on the GEM object
-	 * pointer.  cdev_pager_allocate is idempotent on (handle, ops),
-	 * so the userspace mmap path that calls it again with the same
-	 * key gets back this same pager.
+	 * Create the cdev_pager keyed on the GEM object pointer.  Faults
+	 * dispatch through drm_gem_pager_fault which returns a fake page
+	 * carrying obj->pages[pindex]'s paddr (linuxkpi idiom).
 	 */
 	obj->pager = cdev_pager_allocate(obj, OBJT_MGTDEVICE,
 	    &drm_gem_pager_ops, size, 0, 0, NULL);
