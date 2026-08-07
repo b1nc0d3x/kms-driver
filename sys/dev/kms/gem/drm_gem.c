@@ -223,16 +223,17 @@ retry_alloc:
 	    VM_MEMATTR_UNCACHEABLE
 #else
 	    /*
-	     * x86 HSW+ (fbsdmac 2026-08-07): use WRITE_BACK.  WC on Apple
-	     * MBP11,4 leaves Xorg's mmap writes stranded in the per-CPU
-	     * WC combining buffer indefinitely — drains are unpredictable
-	     * without explicit SFENCE/CLFLUSH, and modesetting_drv issues
-	     * neither.  On HSW the iGPU display engine snoops LLC (both
-	     * stolen and system pages), so WB is coherent with plane DMA.
-	     * DIRTYFB below still CLFLUSHes the range in case the driver
-	     * wants belt-and-braces before scanout.
+	     * x86 HSW+ (fbsdmac 2026-08-07): use WRITE_THROUGH.  WC leaves
+	     * Xorg's mmap writes stranded in per-CPU WC combining buffers
+	     * indefinitely — modesetting_drv issues no SFENCE.  WB works
+	     * for cache-coherent iGPUs but HSW GT3e (Iris Pro 5200 with
+	     * Crystalwell eDRAM in the MBP11,4) routes plane DMA through
+	     * eDRAM/DRAM without snooping L1/L2/LLC — WB writes stay in
+	     * CPU cache, invisible to the display.  WT writes cache AND
+	     * bus at the same time: CPU reads are fast, display DMA sees
+	     * DRAM freshly every write.
 	     */
-	    VM_MEMATTR_WRITE_BACK
+	    VM_MEMATTR_WRITE_THROUGH
 #endif
 	    );
 	if (m == NULL) {
@@ -258,7 +259,7 @@ retry_alloc:
 #ifdef __aarch64__
 		pmap_page_set_memattr(m, VM_MEMATTR_UNCACHEABLE);
 #else
-		pmap_page_set_memattr(m, VM_MEMATTR_WRITE_BACK);
+		pmap_page_set_memattr(m, VM_MEMATTR_WRITE_THROUGH);
 #endif
 		obj->pages[i] = m;
 		/*
@@ -292,7 +293,7 @@ retry_alloc:
 			    "VM_MEMATTR_UNCACHEABLE\n");
 #else
 			printf("kms/gem: scanout pages tagged "
-			    "VM_MEMATTR_WRITE_COMBINING (needs PAT slot)\n");
+			    "VM_MEMATTR_WRITE_THROUGH\n");
 #endif
 		}
 	}
@@ -313,7 +314,7 @@ retry_alloc:
 #ifdef __aarch64__
 		vm_object_set_memattr(obj->pager, VM_MEMATTR_UNCACHEABLE);
 #else
-		vm_object_set_memattr(obj->pager, VM_MEMATTR_WRITE_BACK);
+		vm_object_set_memattr(obj->pager, VM_MEMATTR_WRITE_THROUGH);
 #endif
 	}
 	if (obj->pager == NULL) {
