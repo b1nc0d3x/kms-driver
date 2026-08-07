@@ -229,17 +229,23 @@ retry_alloc:
 	    VM_MEMATTR_UNCACHEABLE
 #else
 	    /*
-	     * x86 HSW+ (fbsdmac 2026-08-07): use WRITE_THROUGH.  WC leaves
-	     * Xorg's mmap writes stranded in per-CPU WC combining buffers
-	     * indefinitely — modesetting_drv issues no SFENCE.  WB works
-	     * for cache-coherent iGPUs but HSW GT3e (Iris Pro 5200 with
-	     * Crystalwell eDRAM in the MBP11,4) routes plane DMA through
-	     * eDRAM/DRAM without snooping L1/L2/LLC — WB writes stay in
-	     * CPU cache, invisible to the display.  WT writes cache AND
-	     * bus at the same time: CPU reads are fast, display DMA sees
-	     * DRAM freshly every write.
+	     * x86 HSW GT3e (fbsdmac 2026-08-07): use UNCACHEABLE.  WC leaves
+	     * Xorg's writes stranded in per-CPU combining buffers, WB stays
+	     * in CPU cache (plane DMA on HSW GT3e with Crystalwell eDRAM
+	     * doesn't snoop LLC), WT still gets partial visibility because
+	     * modesetting_drv's XRender fallback issues 128-bit MOVDQA and
+	     * MOVNTPS-style ops whose ordering wrt DRAM is fuzzier than
+	     * plain MOV.  UC bypasses all cache: every CPU write is a bus
+	     * transaction, DRAM updates synchronously, plane DMA sees the
+	     * freshest pixels on the very next scanout refresh.
+	     *
+	     * User-observed pattern was "cursor visible, wallpaper black" --
+	     * cursor plane is HW-independent (uses its own GTT'd cursor bo)
+	     * so its content path is orthogonal to the scanout fb pager.
+	     * Only the primary fb was affected: real-page pager delivered
+	     * the correct phys mapping but WT PTE didn't keep DRAM in sync.
 	     */
-	    VM_MEMATTR_WRITE_THROUGH
+	    VM_MEMATTR_UNCACHEABLE
 #endif
 	    );
 	if (m == NULL) {
@@ -265,7 +271,7 @@ retry_alloc:
 #ifdef __aarch64__
 		pmap_page_set_memattr(m, VM_MEMATTR_UNCACHEABLE);
 #else
-		pmap_page_set_memattr(m, VM_MEMATTR_WRITE_THROUGH);
+		pmap_page_set_memattr(m, VM_MEMATTR_UNCACHEABLE);
 #endif
 		obj->pages[i] = m;
 		/*
@@ -299,7 +305,7 @@ retry_alloc:
 			    "VM_MEMATTR_UNCACHEABLE\n");
 #else
 			printf("kms/gem: scanout pages tagged "
-			    "VM_MEMATTR_WRITE_THROUGH\n");
+			    "VM_MEMATTR_UNCACHEABLE\n");
 #endif
 		}
 	}
@@ -320,7 +326,7 @@ retry_alloc:
 #ifdef __aarch64__
 		vm_object_set_memattr(obj->pager, VM_MEMATTR_UNCACHEABLE);
 #else
-		vm_object_set_memattr(obj->pager, VM_MEMATTR_WRITE_THROUGH);
+		vm_object_set_memattr(obj->pager, VM_MEMATTR_UNCACHEABLE);
 #endif
 	}
 	if (obj->pager == NULL) {
