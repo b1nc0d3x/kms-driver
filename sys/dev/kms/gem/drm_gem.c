@@ -223,15 +223,16 @@ retry_alloc:
 	    VM_MEMATTR_UNCACHEABLE
 #else
 	    /*
-	     * x86: WRITE_COMBINING is the standard scanout memory
-	     * attribute (what Linux i915 uses for stolen + system scanout
-	     * pages) and matches what modesetting_drv's XRender fallback
-	     * expects — writes flush through the WC combining buffer on
-	     * SFENCE/read.  WB is also correct architecturally but modeset
-	     * driver's fbCompositeGeneral loop may issue MOVNTPS or
-	     * similar streaming stores that only make sense on WC pages.
+	     * x86 HSW+ (fbsdmac 2026-08-07): use WRITE_BACK.  WC on Apple
+	     * MBP11,4 leaves Xorg's mmap writes stranded in the per-CPU
+	     * WC combining buffer indefinitely — drains are unpredictable
+	     * without explicit SFENCE/CLFLUSH, and modesetting_drv issues
+	     * neither.  On HSW the iGPU display engine snoops LLC (both
+	     * stolen and system pages), so WB is coherent with plane DMA.
+	     * DIRTYFB below still CLFLUSHes the range in case the driver
+	     * wants belt-and-braces before scanout.
 	     */
-	    VM_MEMATTR_WRITE_COMBINING
+	    VM_MEMATTR_WRITE_BACK
 #endif
 	    );
 	if (m == NULL) {
@@ -257,7 +258,7 @@ retry_alloc:
 #ifdef __aarch64__
 		pmap_page_set_memattr(m, VM_MEMATTR_UNCACHEABLE);
 #else
-		pmap_page_set_memattr(m, VM_MEMATTR_WRITE_COMBINING);
+		pmap_page_set_memattr(m, VM_MEMATTR_WRITE_BACK);
 #endif
 		obj->pages[i] = m;
 		/*
@@ -312,7 +313,7 @@ retry_alloc:
 #ifdef __aarch64__
 		vm_object_set_memattr(obj->pager, VM_MEMATTR_UNCACHEABLE);
 #else
-		vm_object_set_memattr(obj->pager, VM_MEMATTR_WRITE_COMBINING);
+		vm_object_set_memattr(obj->pager, VM_MEMATTR_WRITE_BACK);
 #endif
 	}
 	if (obj->pager == NULL) {
