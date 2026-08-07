@@ -696,61 +696,6 @@ igen_hsw_panel_on(struct igen_softc *sc)
 	return (0);
 }
 
-/*
- * HSW Panel Fitter (PF) — hardware scaler.  On MBP11,4 the eDP panel is
- * a fixed 2880x1800; PF lets Xorg render at a smaller PIPESRC (e.g.
- * 1920x1200, 1440x900) which the fitter upscales to native for the
- * panel.  macOS uses this for the "Scaled" resolution picker.
- *
- * Register set (HSW gen 7.5, pipe A):
- *   PFA_CTL_1     = 0x68080  bit 31 ENABLE, bit 30 PIPE_SEL_IVB (0=A),
- *                            bits 22:20 FILTER_MODE (0 = 5x5 adaptive)
- *   PFA_WIN_POS   = 0x68070  destination top-left (x<<16 | y), 0 for
- *                            full-panel scaling
- *   PFA_WIN_SIZE  = 0x68074  destination size on panel (w<<16 | h),
- *                            = native panel (2880 << 16 | 1800) for
- *                            fullscreen upscale
- *
- * Enable: program POS + SIZE first, then CTL bit 31.  Disable: clear
- * CTL bit 31 (POS/SIZE preserved for next enable).
- *
- * When PF is on, PIPESRC drives the pipe's rendered rectangle; when off,
- * PIPESRC must equal the transcoder timing (native).  Caller supplies
- * src_w/src_h and MUST also program PIPESRC to match — done by
- * igen_legacy_set_config on mode-change.
- */
-#define	HSW_PFA_WIN_POS		0x00068070u
-#define	HSW_PFA_WIN_SIZE	0x00068074u
-#define	HSW_PFA_CTL_1		0x00068080u
-#define	  HSW_PF_ENABLE		(1u << 31)
-#define	  HSW_PF_FILTER_5X5	(0u << 20)
-
-void
-igen_hsw_pf_configure(struct igen_softc *sc, uint32_t src_w, uint32_t src_h,
-    uint32_t dst_w, uint32_t dst_h)
-{
-	if (sc->gen != IGEN_GEN_HSW)
-		return;
-
-	/*
-	 * PIPESRC == transcoder size (native) means no scaling; disable
-	 * PF to avoid a wasteful pass-through cycle.
-	 */
-	if (src_w == dst_w && src_h == dst_h) {
-		igen_w32(sc, HSW_PFA_CTL_1, 0);
-		device_printf(sc->dev,
-		    "hsw_pf: disabled (source == panel %ux%u)\n", src_w, src_h);
-		return;
-	}
-
-	igen_w32(sc, HSW_PFA_WIN_POS, 0);
-	igen_w32(sc, HSW_PFA_WIN_SIZE, (dst_w << 16) | dst_h);
-	igen_w32(sc, HSW_PFA_CTL_1, HSW_PF_ENABLE | HSW_PF_FILTER_5X5);
-	device_printf(sc->dev,
-	    "hsw_pf: enabled %ux%u -> %ux%u (5x5 filter)\n",
-	    src_w, src_h, dst_w, dst_h);
-}
-
 static int
 igen_sysctl_hsw_panel_on(SYSCTL_HANDLER_ARGS)
 {

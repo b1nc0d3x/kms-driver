@@ -1767,52 +1767,6 @@ igen_publish_edid(struct igen_softc *sc, const uint8_t *edid, size_t len)
 	 */
 	if (len >= 256 && edid[126] >= 1)
 		igen_publish_cea_extension(sc, edid + 128, &published);
-
-	/*
-	 * HSW panel-fitter synthetic modes: for eDP panels EDID typically
-	 * lists only the native DTD, but the HSW hardware scaler can
-	 * upscale smaller PIPESRC rectangles to native.  Expose common
-	 * lower resolutions so xrandr and Xorg see real options; the
-	 * legacy_set_config path enables PF when a non-native mode lands.
-	 * Only add stock modes ≤ native to avoid downscaling (unsupported).
-	 */
-	if (sc->gen == IGEN_GEN_HSW &&
-	    (sc->quirks & IGEN_QUIRK_APPLE_EDP_HANDOFF) != 0 &&
-	    published > 0) {
-		uint16_t nat_w = 2880, nat_h = 1800;
-		static const struct {
-			uint16_t w, h, hz;
-		} scaled[] = {
-			{ 1920, 1200, 60 },
-			{ 1920, 1080, 60 },
-			{ 1680, 1050, 60 },
-			{ 1440,  900, 60 },
-			{ 1280,  800, 60 },
-			{ 1024,  768, 60 },
-		};
-		for (size_t i = 0; i < nitems(scaled); i++) {
-			const struct igen_stock_mode *sm;
-			struct drm_display_mode *m;
-
-			if (scaled[i].w >= nat_w || scaled[i].h >= nat_h)
-				continue;
-			sm = igen_stock_lookup(scaled[i].w, scaled[i].h,
-			    scaled[i].hz);
-			if (sm == NULL)
-				continue;
-			m = kms_mode_create();
-			if (m == NULL)
-				break;
-			igen_stock_to_mode(sm, m);
-			kms_connector_add_mode(&sc->connector, m);
-			published++;
-			device_printf(sc->dev,
-			    "edid: added PF scaled mode %ux%u@%u -> %ux%u\n",
-			    scaled[i].w, scaled[i].h, scaled[i].hz,
-			    nat_w, nat_h);
-		}
-	}
-
 	(void)kms_connector_update_edid(&sc->connector, edid, len);
 	/*
 	 * NOTE: kms_connector_hotplug tried here 2026-07-17 and wedged the
@@ -2504,29 +2458,6 @@ igen_legacy_set_config(struct drm_mode_set *set)
 	if (sc->gen == IGEN_GEN_HSW &&
 	    (sc->quirks & IGEN_QUIRK_APPLE_EDP_HANDOFF) != 0) {
 		(void)igen_hsw_panel_on(sc);
-
-		/*
-		 * HSW panel fitter: pipe rendered rectangle (PIPESRC) tracks
-		 * the caller's mode, while the transcoder keeps native panel
-		 * timing.  PF upscales PIPESRC → panel.  igen_hsw_panel_on
-		 * left PIPESRC at native (from EDID DTD); if the caller wants
-		 * a smaller logical resolution, override here and enable PF.
-		 */
-		uint32_t native_w = 2880, native_h = 1800;
-		uint32_t src_w = set->mode->hdisplay;
-		uint32_t src_h = set->mode->vdisplay;
-
-		if (src_w != 0 && src_h != 0 &&
-		    (src_w != native_w || src_h != native_h)) {
-			/* HSW_PIPE_SRCSZ pipe A = 0x0007001c */
-			igen_w32(sc, 0x0007001cu,
-			    ((src_w - 1) << 16) | (src_h - 1));
-			igen_hsw_pf_configure(sc, src_w, src_h,
-			    native_w, native_h);
-		} else {
-			igen_hsw_pf_configure(sc, native_w, native_h,
-			    native_w, native_h);
-		}
 	}
 
 	crtc->mode = *set->mode;

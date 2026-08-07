@@ -449,9 +449,6 @@ void	igen_gtt_detach(struct igen_softc *sc);
  * call it unconditionally.
  */
 int	igen_hsw_panel_on(struct igen_softc *sc);
-void	igen_hsw_pf_configure(struct igen_softc *sc,
-	    uint32_t src_w, uint32_t src_h,
-	    uint32_t dst_w, uint32_t dst_h);
 int	igen_gen9_panel_on(struct igen_softc *sc,
 	    const struct drm_display_mode *m);
 int	igen_gen9_full_bringup(struct igen_softc *sc,
