@@ -720,6 +720,36 @@ igen_hsw_panel_on(struct igen_softc *sc)
 		    " stride=0x%08x\n",
 		    sc->last_scanout_surf, sc->last_scanout_stride);
 	}
+
+	/*
+	 * Force PCH eDP backlight to max on every mode-set (fbsdmac 2026-08-07).
+	 * Something in the userland session transition (SDDM → user Xorg via
+	 * xfce4-power-manager, or modesetting_drv's DPMS handoff) writes 0 to
+	 * the PCH_PWM duty-cycle register when the user logs in, so the panel
+	 * goes dark even though scanout, plane, TRANS_EDP and DDI_A are all
+	 * live and obj->pages carries the XFCE frontbuffer.  Take control at
+	 * the KMS driver level: on every hsw_panel_on we re-program
+	 * BLC_PWM_PCH_CTL2 with duty = period so the backlight stays lit
+	 * regardless of what userland does.
+	 *
+	 * PCH_CTL1 (0xC8250) high bits (enable + polarity) are left untouched
+	 * because they were already 0xC0000000 at the EFI/loader handoff.
+	 * PCH_CTL2 (0xC8254) format: [31:16] period, [15:0] duty.  Read period
+	 * back and mirror it into the duty field to guarantee 100%.
+	 */
+	{
+		uint32_t ctl2 = igen_r32(sc, 0xC8254);
+		uint32_t period = ctl2 >> 16;
+		if (period != 0) {
+			uint32_t forced = (period << 16) | period;
+			if (forced != ctl2) {
+				igen_w32(sc, 0xC8254, forced);
+				device_printf(sc->dev,
+				    "hsw_panel_on: forced PCH backlight duty=period=0x%04x"
+				    " (was 0x%08x)\n", period, ctl2);
+			}
+		}
+	}
 	return (0);
 }
 
