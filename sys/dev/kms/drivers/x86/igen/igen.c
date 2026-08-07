@@ -680,6 +680,82 @@ igen_sysctl_pmap_probe(SYSCTL_HANDLER_ARGS)
 }
 
 /*
+ * pa_scan: read arbitrary phys address via PHYS_TO_DMAP and dump 32 dwords
+ * + first-scanline pixel counts + FNV-1a hash of pa_scan_len bytes.  Pairs
+ * with pmap_probe to answer "does the OLD obj->pages phys have content
+ * matching Xorg's writes?" — if yes, obj->pages was replaced under Xorg
+ * without invalidating Xorg's PTE (mmap alias bug at pager level).
+ *
+ * Usage:
+ *   sysctl dev.igen.0.re.pa_scan_addr=0x1b000000
+ *   sysctl dev.igen.0.re.pa_scan_len=0x2d00     # one scanline
+ *   sysctl dev.igen.0.re.pa_scan=1
+ *   dmesg | grep pa_scan
+ *
+ * Doubles as a memory-range monitor (CLAUDE.md reverse-eng technique):
+ * repeatedly triggering and diffing FNV-1a hash tells you when a range
+ * stops being written to.
+ */
+static int
+igen_sysctl_pa_scan(SYSCTL_HANDLER_ARGS)
+{
+	struct igen_softc *sc = arg1;
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+	uint32_t *p;
+	uint32_t nonzero, black, white, i;
+	uint32_t row_px, hash;
+	size_t bytes;
+
+	if (error || req->newptr == NULL || trigger == 0)
+		return (error);
+	if (sc->pa_scan_addr == 0 || sc->pa_scan_len == 0) {
+		device_printf(sc->dev,
+		    "pa_scan: set pa_scan_addr and pa_scan_len first\n");
+		return (EINVAL);
+	}
+
+	p = (uint32_t *)PHYS_TO_DMAP((vm_paddr_t)sc->pa_scan_addr);
+	bytes = sc->pa_scan_len;
+
+	/*
+	 * Flush any cached WB view so we read from DRAM.  Xorg's WC writes
+	 * hit DRAM on SFENCE+CLFLUSH; our DMAP view is WB, so a stale WB
+	 * line from initial zeroing would otherwise hide the writes.
+	 */
+	pmap_invalidate_cache_range((vm_offset_t)p,
+	    (vm_offset_t)p + bytes);
+
+	device_printf(sc->dev,
+	    "pa_scan pa=0x%llx len=0x%zx dw[0..15]:"
+	    " %08x %08x %08x %08x %08x %08x %08x %08x"
+	    " %08x %08x %08x %08x %08x %08x %08x %08x\n",
+	    (long long)sc->pa_scan_addr, bytes,
+	    p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
+	    p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
+
+	row_px = bytes / 4;
+	if (row_px > 4096)
+		row_px = 4096;
+	nonzero = white = black = 0;
+	for (i = 0; i < row_px; i++) {
+		if (p[i] == 0) black++;
+		else if ((p[i] & 0x00ffffff) == 0x00ffffff) white++;
+		else nonzero++;
+	}
+	/* FNV-1a over the whole range for memory-monitor diff. */
+	hash = 0x811c9dc5u;
+	for (i = 0; i < bytes; i++) {
+		hash ^= ((const uint8_t *)p)[i];
+		hash *= 0x01000193u;
+	}
+	device_printf(sc->dev,
+	    "  first %u px: %u black, %u white, %u other  fnv1a=0x%08x\n",
+	    row_px, black, white, nonzero, hash);
+	return (0);
+}
+
+/*
  * fb_scan: dump the first 32 dwords of every currently-bound user fb's
  * page 0, plus count non-zero and white (0xffffffff) pixels in the
  * first scanline.  For diagnosing "is Xorg actually writing to the fb"
@@ -961,6 +1037,17 @@ igen_re_sysctls_init(struct igen_softc *sc)
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
 	    sc, 0, igen_sysctl_pmap_probe, "I",
 	    "write 1 to probe pid/va -> phys via pmap_extract");
+	SYSCTL_ADD_U64(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "pa_scan_addr", CTLFLAG_RW,
+	    &sc->pa_scan_addr, 0, "pa_scan target physical address");
+	SYSCTL_ADD_U64(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "pa_scan_len", CTLFLAG_RW,
+	    &sc->pa_scan_len, 0, "pa_scan length in bytes");
+	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "pa_scan",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, igen_sysctl_pa_scan, "I",
+	    "write 1 to dump content + FNV-1a hash at pa_scan_addr");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "paint_efi_fb",
 	    CTLTYPE_UINT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,

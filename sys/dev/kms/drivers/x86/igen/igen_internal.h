@@ -223,6 +223,8 @@ struct igen_softc {
 	uint32_t		 last_scanout_stride;
 	int			 pmap_probe_pid;	/* target process */
 	uint64_t		 pmap_probe_va;	/* target virt addr */
+	uint64_t		 pa_scan_addr;		/* pa_scan target */
+	uint64_t		 pa_scan_len;		/* pa_scan length */
 
 	/*
 	 * Serializes atomic_commit and cursor_move.  Both touch pipe A

@@ -199,8 +199,19 @@ retry_alloc:
 	 * need IOMMU scatter-gather.  Zeroed so userspace doesn't see
 	 * old kernel data.
 	 */
+	/*
+	 * Constrain scanout allocation to phys < 4 GiB (2026-08-07 fbsdmac).
+	 * Above 4 GiB, WC PAT on Apple MBP11,4 HSW misbehaves: Xorg's user
+	 * WC writes stay in CPU cache, never drain to DRAM (kernel PHYS_TO_DMAP
+	 * reads see zero, plane DMA scans zero → dark panel).  Kernel-side
+	 * WB writes via PHYS_TO_DMAP still reach DRAM (fill_scanout paints
+	 * the panel), and Xorg reads back its own writes from cache (xwd
+	 * sees pixels).  Verified by pmap_probe + fb_scan side-by-side.
+	 * Constraining phys to < 4 GiB brings the alloc into the address
+	 * range where WC PAT slot is proven to work (kms XFCE live 2026-08-06).
+	 */
 	m = vm_page_alloc_noobj_contig(VM_ALLOC_WIRED | VM_ALLOC_ZERO,
-	    npages, 0, ~0UL, PAGE_SIZE, 0,
+	    npages, 0, (1ULL << 32) - 1, PAGE_SIZE, 0,
 #ifdef __aarch64__
 	    /*
 	     * arm64 aliases VM_MEMATTR_WRITE_COMBINING to WRITE_THROUGH
@@ -225,7 +236,7 @@ retry_alloc:
 	    );
 	if (m == NULL) {
 		if (tries++ < 3) {
-			vm_page_reclaim_contig(0, npages, 0, ~0UL,
+			vm_page_reclaim_contig(0, npages, 0, (1ULL << 32) - 1,
 			    PAGE_SIZE, 0);
 			goto retry_alloc;
 		}
