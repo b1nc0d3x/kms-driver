@@ -693,6 +693,33 @@ igen_hsw_panel_on(struct igen_softc *sc)
 	    igen_r32(sc, 0x6f040u), igen_r32(sc, 0x6f044u),
 	    igen_r32(sc, HSW_PIPEASRC),
 	    igen_r32(sc, HSW_WM_LINETIME_A));
+
+	/*
+	 * Re-arm the primary plane to the last known user fb.  Between our
+	 * program_scanout writing PLANE_SURF and the next hsw_panel_on call,
+	 * something (SDDM/Xorg VT switch, session cycling) is silently
+	 * zeroing HSW_DSPSURF on Apple eDP handoff.  Reload it from
+	 * last_scanout_fb so the panel resumes scanning our fb instead of
+	 * the EFI firmware zeros — otherwise user sees a plain light-blue
+	 * screen after login even though XFCE is drawing correctly to its
+	 * mmap (project_kms_xfce_live 2026-08-07 follow-up).
+	 */
+	if (sc->last_scanout_surf != 0) {
+		/*
+		 * Use the cached u32 surf + stride so we survive after Xorg
+		 * RmFB's the drm_framebuffer and file_free NULLs
+		 * last_scanout_fb (H1 review path).  Cached surf is still a
+		 * valid GTT address until the underlying GEM pages are freed,
+		 * which happens after the next program_scanout binds a new fb
+		 * — by which point our re-arm is stale anyway.
+		 */
+		igen_w32(sc, HSW_DSPSTRIDE(0), sc->last_scanout_stride);
+		igen_w32(sc, HSW_DSPSURF(0), sc->last_scanout_surf);
+		device_printf(sc->dev,
+		    "hsw_panel_on: re-armed cached surf=0x%08x"
+		    " stride=0x%08x\n",
+		    sc->last_scanout_surf, sc->last_scanout_stride);
+	}
 	return (0);
 }
 

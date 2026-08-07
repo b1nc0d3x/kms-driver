@@ -29,6 +29,7 @@
 #include <sys/lock.h>
 #include <sys/malloc.h>
 #include <sys/module.h>
+#include <sys/mutex.h>
 #include <sys/proc.h>
 #include <sys/rman.h>
 #include <sys/sx.h>
@@ -39,6 +40,7 @@
 
 #include <vm/vm.h>
 #include <vm/pmap.h>
+#include <vm/vm_map.h>
 
 #include <dev/pci/pcireg.h>
 #include <dev/pci/pcivar.h>
@@ -623,6 +625,61 @@ igen_sysctl_blit_efi_fb(SYSCTL_HANDLER_ARGS)
 }
 
 /*
+ * pmap_probe: resolve a target process's user virt address to a
+ * physical address via pmap_extract().  Answers definitively whether
+ * Xorg's mmap of a scanout dumb bo lands on the same phys pages that
+ * obj->pages[] carries — or somewhere else, which would explain the
+ * "obj->pages read as zero but Xorg is writing" symptom.
+ *
+ * Usage from userland:
+ *   sysctl dev.igen.0.re.pmap_probe_pid=$(pgrep Xorg)
+ *   sysctl dev.igen.0.re.pmap_probe_va=0x838000000
+ *   sysctl dev.igen.0.re.pmap_probe=1     # trigger; result via dmesg
+ *
+ * Prints the pmap_extract result for va and va+0x1000 (page 1) so you
+ * can spot single-page vs contig-array bugs.
+ */
+static int
+igen_sysctl_pmap_probe(SYSCTL_HANDLER_ARGS)
+{
+	struct igen_softc *sc = arg1;
+	int trigger = 0;
+	int error = sysctl_handle_int(oidp, &trigger, 0, req);
+	struct proc *p;
+	vm_paddr_t pa0, pa1;
+
+	if (error || req->newptr == NULL || trigger == 0)
+		return (error);
+	if (sc->pmap_probe_pid <= 0 || sc->pmap_probe_va == 0) {
+		device_printf(sc->dev,
+		    "pmap_probe: set pmap_probe_pid and pmap_probe_va first\n");
+		return (EINVAL);
+	}
+	sx_slock(&allproc_lock);
+	p = pfind_any_locked(sc->pmap_probe_pid);
+	sx_sunlock(&allproc_lock);
+	if (p == NULL || p->p_vmspace == NULL) {
+		device_printf(sc->dev,
+		    "pmap_probe: pid %d not found or exiting\n",
+		    sc->pmap_probe_pid);
+		if (p != NULL)
+			PROC_UNLOCK(p);
+		return (ESRCH);
+	}
+	pa0 = pmap_extract(&p->p_vmspace->vm_pmap,
+	    (vm_offset_t)sc->pmap_probe_va);
+	pa1 = pmap_extract(&p->p_vmspace->vm_pmap,
+	    (vm_offset_t)(sc->pmap_probe_va + 0x1000));
+	PROC_UNLOCK(p);
+	device_printf(sc->dev,
+	    "pmap_probe: pid=%d va=0x%llx -> pa[0]=0x%llx pa[1]=0x%llx\n",
+	    sc->pmap_probe_pid,
+	    (unsigned long long)sc->pmap_probe_va,
+	    (unsigned long long)pa0, (unsigned long long)pa1);
+	return (0);
+}
+
+/*
  * fb_scan: dump the first 32 dwords of every currently-bound user fb's
  * page 0, plus count non-zero and white (0xffffffff) pixels in the
  * first scanline.  For diagnosing "is Xorg actually writing to the fb"
@@ -893,6 +950,17 @@ igen_re_sysctls_init(struct igen_softc *sc)
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
 	    sc, 0, igen_sysctl_fb_scan, "I",
 	    "write 1 to dump user fb page contents (row 0 + samples)");
+	SYSCTL_ADD_INT(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "pmap_probe_pid", CTLFLAG_RW,
+	    &sc->pmap_probe_pid, 0, "target pid for pmap_probe");
+	SYSCTL_ADD_U64(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "pmap_probe_va", CTLFLAG_RW,
+	    &sc->pmap_probe_va, 0, "target virt addr for pmap_probe");
+	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
+	    "pmap_probe",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
+	    sc, 0, igen_sysctl_pmap_probe, "I",
+	    "write 1 to probe pid/va -> phys via pmap_extract");
 	SYSCTL_ADD_PROC(&sc->re_sysctl_ctx, children, OID_AUTO,
 	    "paint_efi_fb",
 	    CTLTYPE_UINT | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_NEEDGIANT,
@@ -2383,6 +2451,7 @@ igen_program_scanout(struct igen_softc *sc, struct drm_framebuffer *fb)
 		kms_mode_object_get(&fb->base);
 	sc->last_scanout_fb = fb;
 	sc->last_scanout_surf = surf;
+	sc->last_scanout_stride = fb->pitches[0];
 	sx_xunlock(&sc->scanout_lock);
 	device_printf(sc->dev,
 	    "program_scanout: fb %u (%ux%u pitch=%u) -> PLANE_SURF=0x%08x"

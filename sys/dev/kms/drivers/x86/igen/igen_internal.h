@@ -220,6 +220,9 @@ struct igen_softc {
 	 * may hold older cached bindings). */
 	struct drm_framebuffer	*last_scanout_fb;
 	uint32_t		 last_scanout_surf;
+	uint32_t		 last_scanout_stride;
+	int			 pmap_probe_pid;	/* target process */
+	uint64_t		 pmap_probe_va;	/* target virt addr */
 
 	/*
 	 * Serializes atomic_commit and cursor_move.  Both touch pipe A
