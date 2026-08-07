@@ -68,19 +68,25 @@ struct drm_gem_handle {
 /* ----- pager callbacks ----- */
 
 /*
- * Return a fake (PG_FICTITIOUS) page pointing at the phys addr of the
- * real managed page we allocated for this offset.  Mirrors linuxkpi's
- * linux_cdev_pager_fault (see linux_compat.c:448).
+ * Return the REAL obj->pages[pidx] page so Xorg's mmap PTE points at the
+ * same phys + memattr that fill_scanout writes via PHYS_TO_DMAP.  Fake
+ * pages (PG_FICTITIOUS) were used previously (linuxkpi idiom) but they
+ * bypass FreeBSD's per-page memattr tracking on x86 — pmap_enter for a
+ * fake page uses the vm_object's memattr, which our WC/WB/WT experiments
+ * showed does NOT reliably propagate to the actual PTE cache-attribute
+ * bits.  Meanwhile fill_scanout writes via PHYS_TO_DMAP have always
+ * worked (kernel WB alias flushes to DRAM through CPU cache, plane DMA
+ * reads DRAM after eviction, panel lights up).
  *
- * We used to pre-insert obj->pages[i] into the pager pctrie and return
- * VM_PAGER_FAIL here, trusting the fault-fast path to find them.  That
- * worked for drm_test2 / write_dumb (single-shot linear write) but the
- * write-fault path from Xorg's mmap evicted our real managed page and
- * inserted a fresh zeroed anonymous page — so Xorg's XRender writes
- * landed on a shadow that never reached obj->pages[].  Fake pages sit
- * outside the pager pctrie and just carry the paddr, so pmap_enter
- * always targets obj->pages[i]'s DRAM directly.  Verified on fbsdmac
- * MBP11,4 2026-08-05 via a canary experiment.
+ * By handing back the real page, Xorg's mmap gets a PTE with the same
+ * cache attribute the kernel DMAP uses (WB).  Same phys, same memattr,
+ * same coherency guarantees as fill_scanout.  Xorg writes → CPU cache
+ * line dirty → eviction → DRAM.  Plane DMA reads DRAM → sees pixels.
+ *
+ * The 2026-08-05 canary comment about "write-fault evicted our real
+ * managed page and inserted a fresh zeroed anonymous page" no longer
+ * applies because we don't pre-insert into the pctrie any more.  The
+ * fault handler is the ONE and only inserter, via *mres = m + valid.
  */
 static int
 drm_gem_pager_fault(vm_object_t vm_obj, vm_ooffset_t offset, int prot __unused,
@@ -88,24 +94,23 @@ drm_gem_pager_fault(vm_object_t vm_obj, vm_ooffset_t offset, int prot __unused,
 {
 	struct drm_gem_object *obj = vm_obj->handle;
 	vm_pindex_t pidx = OFF_TO_IDX(offset);
-	vm_paddr_t paddr;
-	vm_page_t page;
+	vm_page_t m;
 
 	if (obj == NULL || pidx >= obj->npages || obj->pages[pidx] == NULL)
 		return (VM_PAGER_FAIL);
-	paddr = VM_PAGE_TO_PHYS(obj->pages[pidx]);
+	m = obj->pages[pidx];
 
-	if (((*mres)->flags & PG_FICTITIOUS) != 0) {
-		page = *mres;
-		vm_page_updatefake(page, paddr, vm_obj->memattr);
+	/*
+	 * If a placeholder page was preallocated by the fault machinery,
+	 * replace it with the real one; otherwise stash m into *mres.
+	 */
+	if (*mres != NULL && *mres != m) {
+		vm_page_replace(m, vm_obj, pidx, *mres);
 	} else {
-		VM_OBJECT_WUNLOCK(vm_obj);
-		page = vm_page_getfake(paddr, vm_obj->memattr);
-		VM_OBJECT_WLOCK(vm_obj);
-		vm_page_replace(page, vm_obj, (*mres)->pindex, *mres);
-		*mres = page;
+		vm_page_insert(m, vm_obj, pidx);
 	}
-	vm_page_valid(page);
+	*mres = m;
+	vm_page_valid(m);
 	return (VM_PAGER_OK);
 }
 
@@ -134,9 +139,10 @@ drm_gem_pager_dtor(void *handle)
 	size_t i;
 
 	/*
-	 * Our real managed pages were never inserted into the pager's
-	 * pctrie (only fake pages carry the paddr into userspace PTEs),
-	 * so no page-off-the-pager step is needed.  Just unwire + free.
+	 * Real pages are now inserted into the pager's vm_object on fault
+	 * (see drm_gem_pager_fault).  vm_pager_deallocate has already
+	 * removed them from the pctrie by the time cdev_pg_dtor fires, so
+	 * we just unwire + free the underlying vm_page for each slot.
 	 */
 	for (i = 0; i < obj->npages; i++) {
 		if (obj->pages[i] == NULL)
